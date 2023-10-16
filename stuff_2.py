@@ -115,3 +115,6 @@ def main(filename):
 if __name__ == '__main__':
     import sys
     main(sys.argv[1])
+    """
+    pip install pandas numpy scikit-learn xgboost lightgbm feather-format
+    """
