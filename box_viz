@@ -46,6 +46,23 @@ def update_graph(selected_time):
             name=f'Object {i+1}'
         )
         data.append(rect)
+
+        # Orientation line calculation
+        # This line extends from the center of the box in the direction of its orientation
+        center_x = distX[i] + (length[i] / 2) * cos(orientation[i]) - (width[i] / 2) * sin(orientation[i])
+        center_y = distY[i] + (length[i] / 2) * sin(orientation[i]) + (width[i] / 2) * cos(orientation[i])
+        end_x = center_x + 5 * cos(orientation[i])  # Extend the line 5 units in the direction of orientation
+        end_y = center_y + 5 * sin(orientation[i])
+        
+        orientation_line = go.Scatter(
+            x=[center_x, end_x],
+            y=[center_y, end_y],
+            mode='lines+markers',
+            marker=dict(size=3),
+            line=dict(color='red'),  # Make the orientation line red for visibility
+            name=f'Orientation {i+1}'
+        )
+        data.append(orientation_line)
     
     figure = {
         'data': data,
