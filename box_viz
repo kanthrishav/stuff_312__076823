@@ -97,3 +97,83 @@ def update_graph(selected_time):
 
 if __name__ == '__main__':
     app.run_server(debug=True)
+
+
+
+
+
+###
+from math import cos, sin
+import plotly.graph_objects as go
+
+def compute_objects(selected_time):
+    data = []  # This will store plot elements for the current timestamp
+    
+    # Extract data for the current timestamp
+    distX = df.iloc[selected_time]['distX']
+    distY = df.iloc[selected_time]['distY']
+    orientation = df.iloc[selected_time]['orientation']
+    length = df.iloc[selected_time]['length']
+    width = df.iloc[selected_time]['width']
+    
+    for i in range(100):  # Assuming 100 objects
+        # Calculate corners of the rectangle for each object
+        rect = go.Scatter(
+            x=[distX[i], distX[i] + length[i] * cos(orientation[i]), distX[i] + length[i] * cos(orientation[i]) - width[i] * sin(orientation[i]), distX[i] - width[i] * sin(orientation[i]), distX[i]],
+            y=[distY[i], distY[i] + length[i] * sin(orientation[i]), distY[i] + length[i] * sin(orientation[i]) + width[i] * cos(orientation[i]), distY[i] + width[i] * cos(orientation[i]), distY[i]],
+            mode='lines',
+            name=f'Object {i+1}'
+        )
+        data.append(rect)
+        
+        # Add a point for the position of the object
+        point = go.Scatter(
+            x=[distX[i]],
+            y=[distY[i]],
+            mode='markers',
+            marker=dict(size=5),
+            name=f'Position {i+1}'
+        )
+        data.append(point)
+        
+        # Orientation line calculation
+        center_x = distX[i] + (length[i] / 2) * cos(orientation[i]) - (width[i] / 2) * sin(orientation[i])
+        center_y = distY[i] + (length[i] / 2) * sin(orientation[i]) + (width[i] / 2) * cos(orientation[i])
+        end_x = center_x + 5 * cos(orientation[i])  # Extend the line 5 units in the direction of orientation
+        end_y = center_y + 5 * sin(orientation[i])
+        
+        orientation_line = go.Scatter(
+            x=[center_x, end_x],
+            y=[center_y, end_y],
+            mode='lines+markers',
+            marker=dict(size=3),
+            line=dict(color='red'),
+            name=f'Orientation {i+1}'
+        )
+        data.append(orientation_line)
+    
+    return data
+
+# Pre-compute data for each timestamp and store in a dictionary
+precomputed_data = {i: compute_objects(i) for i in range(len(df))}
+
+
+
+
+###
+
+@app.callback(
+    Output('point-cloud-visualization', 'figure'),
+    [Input('time-slider', 'value')]
+)
+def update_graph(selected_time):
+    data = precomputed_data[selected_time]  # Retrieve precomputed data
+    
+    figure = {
+        'data': data,
+        'layout': go.Layout(
+            # Your layout configuration here
+        )
+    }
+    
+    return figure
