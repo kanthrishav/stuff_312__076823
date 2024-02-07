@@ -1,0 +1,63 @@
+import dash
+from dash import dcc, html, Input, Output
+import plotly.graph_objects as go
+import pandas as pd
+
+# Sample DataFrame loading step
+# df = pd.read_csv('your_data.csv') # Load your DataFrame here
+
+app = dash.Dash(__name__)
+
+# Assuming 'timestamp' is a column in your DataFrame for slider marks
+slider_marks = {i: str(df.iloc[i].timestamp) for i in range(len(df))}
+
+app.layout = html.Div([
+    dcc.Graph(id='point-cloud-visualization'),
+    dcc.Slider(
+        id='time-slider',
+        min=0,
+        max=len(df)-1,
+        value=0,
+        marks=slider_marks,
+        step=None
+    )
+])
+
+@app.callback(
+    Output('point-cloud-visualization', 'figure'),
+    [Input('time-slider', 'value')]
+)
+def update_graph(selected_time):
+    data = []  # This will hold the data for all objects
+    
+    # Assuming each row in your DataFrame has lists for distX, distY, orientation, length, width for 100 objects
+    distX = df.iloc[selected_time]['distX']
+    distY = df.iloc[selected_time]['distY']
+    orientation = df.iloc[selected_time]['orientation']
+    length = df.iloc[selected_time]['length']
+    width = df.iloc[selected_time]['width']
+    
+    for i in range(100):  # Assuming 100 objects
+        # Calculate corners of the rectangle for each object based on its position, dimensions, and orientation
+        rect = go.Scatter(
+            x=[distX[i], distX[i] + length[i] * cos(orientation[i]), distX[i] + length[i] * cos(orientation[i]) - width[i] * sin(orientation[i]), distX[i] - width[i] * sin(orientation[i]), distX[i]],
+            y=[distY[i], distY[i] + length[i] * sin(orientation[i]), distY[i] + length[i] * sin(orientation[i]) + width[i] * cos(orientation[i]), distY[i] + width[i] * cos(orientation[i]), distY[i]],
+            mode='lines',
+            name=f'Object {i+1}'
+        )
+        data.append(rect)
+    
+    figure = {
+        'data': data,
+        'layout': go.Layout(
+            title='Point Cloud Objects Visualization',
+            xaxis={'title': 'distX'},
+            yaxis={'title': 'distY'},
+            hovermode='closest'
+        )
+    }
+    
+    return figure
+
+if __name__ == '__main__':
+    app.run_server(debug=True)
