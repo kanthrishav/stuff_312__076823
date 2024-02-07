@@ -70,7 +70,26 @@ def update_graph(selected_time):
             title='Point Cloud Objects Visualization',
             xaxis={'title': 'distX'},
             yaxis={'title': 'distY'},
-            hovermode='closest'
+            hovermode='closest',
+            annotations=[
+                dict(
+                    x=0.01,  # Position of the text (x-axis), adjust as needed
+                    y=0.99,  # Position of the text (y-axis), adjust as needed
+                    xref='paper',  # Use 'paper' for relative positioning
+                    yref='paper',
+                    text=f'Counter: {counter}',  # Text content
+                    showarrow=False,  # No arrow pointing to the text
+                    font=dict(
+                        size=14,  # Font size, adjust as needed
+                        color='black'  # Text color
+                    ),
+                    align='left',  # Text alignment
+                    bgcolor='white',  # Background color for better readability
+                    borderpad=4,  # Padding around the text
+                    bordercolor='black',
+                    borderwidth=1
+                )
+            ]
         )
     }
     
