@@ -1,0 +1,57 @@
+import os
+import subprocess
+import pydot
+
+def generate_tags(directory):
+    """Generate tags file for the given directory."""
+    subprocess.run(['ctags', '-R', directory])
+
+def parse_tags_file(tags_file):
+    """Parse the tags file to extract call graph information."""
+    calls = {}
+    with open(tags_file, 'r') as f:
+        for line in f:
+            if line.startswith('!_'):
+                continue
+            parts = line.strip().split('\t')
+            if len(parts) < 3:
+                continue
+            tag, _, path = parts[:3]
+            if tag.endswith('F'):
+                function_name = tag.split(':')[0]
+                calls[function_name] = []
+                with open(path, 'r') as file:
+                    for line in file:
+                        if function_name + '(' in line:
+                            called_function = line.strip().split('(')[0].split()[-1]
+                            calls[function_name].append(called_function)
+    return calls
+
+def create_call_map(calls, split_function=None):
+    """Create call map using Graphviz."""
+    graph = pydot.Dot(graph_type='digraph')
+    for caller, callees in calls.items():
+        if split_function and caller == split_function:
+            break
+        graph.add_node(pydot.Node(caller))
+        for callee in callees:
+            graph.add_node(pydot.Node(callee))
+            graph.add_edge(pydot.Edge(caller, callee))
+    return graph
+
+def save_call_map(graph, filename):
+    """Save call map as PNG file."""
+    graph.write_png(filename)
+
+def main(directory, output_file, split_function=None):
+    generate_tags(directory)
+    tags_file = os.path.join(directory, 'tags')
+    calls = parse_tags_file(tags_file)
+    call_map = create_call_map(calls, split_function)
+    save_call_map(call_map, output_file)
+
+if __name__ == "__main__":
+    directory = input("Enter the directory containing C and header files: ")
+    output_file = input("Enter the output PNG file name: ")
+    split_function = input("Enter the function name to split the call map (leave empty for no split): ")
+    main(directory, output_file, split_function)
