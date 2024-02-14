@@ -1,57 +1,42 @@
-import os
-import subprocess
-import pydot
+import graphviz
 
-def generate_tags(directory):
-    """Generate tags file for the given directory."""
-    subprocess.run(['ctags', '-R', directory])
+def generate_call_hierarchy_graph(call_hierarchy, head_nodes, output_prefix):
+    for i, head_node in enumerate(head_nodes, 1):
+        dot = graphviz.Digraph(format='png', graph_attr={'size': '8000,6000', 'dpi': '300'})
 
-def parse_tags_file(tags_file):
-    """Parse the tags file to extract call graph information."""
-    calls = {}
-    with open(tags_file, 'r') as f:
-        for line in f:
-            if line.startswith('!_'):
-                continue
-            parts = line.strip().split('\t')
-            if len(parts) < 3:
-                continue
-            tag, _, path = parts[:3]
-            if tag.endswith('F'):
-                function_name = tag.split(':')[0]
-                calls[function_name] = []
-                with open(path, 'r') as file:
-                    for line in file:
-                        if function_name + '(' in line:
-                            called_function = line.strip().split('(')[0].split()[-1]
-                            calls[function_name].append(called_function)
-    return calls
+        # Traverse the tree starting from the head node
+        visited = set()
+        queue = [head_node]
+        while queue:
+            node = queue.pop(0)
+            if node not in visited:
+                dot.node(node, shape='oval')
+                visited.add(node)
+                for callee in call_hierarchy.get(node, []):
+                    dot.node(callee, shape='oval')
+                    dot.edge(node, callee)
+                    queue.append(callee)
 
-def create_call_map(calls, split_function=None):
-    """Create call map using Graphviz."""
-    graph = pydot.Dot(graph_type='digraph')
-    for caller, callees in calls.items():
-        if split_function and caller == split_function:
-            break
-        graph.add_node(pydot.Node(caller))
-        for callee in callees:
-            graph.add_node(pydot.Node(callee))
-            graph.add_edge(pydot.Edge(caller, callee))
-    return graph
+        # Render and save the graph
+        output_file = f"{output_prefix}_{i}.png"
+        dot.render(output_file, cleanup=True)
 
-def save_call_map(graph, filename):
-    """Save call map as PNG file."""
-    graph.write_png(filename)
+# Example call hierarchy dictionary
+call_hierarchy = {
+    'function1': ['function2', 'function3'],
+    'function2': ['function4'],
+    'function3': ['function5', 'function6'],
+    'function4': ['function7'],
+    'function5': ['function8'],
+    'function6': ['function9'],
+    'function10': ['function11', 'function12'],
+    'function11': ['function13'],
+    'function12': ['function14', 'function15'],
+    'function15': ['function16'],
+}
 
-def main(directory, output_file, split_function=None):
-    generate_tags(directory)
-    tags_file = os.path.join(directory, 'tags')
-    calls = parse_tags_file(tags_file)
-    call_map = create_call_map(calls, split_function)
-    save_call_map(call_map, output_file)
+# Example head nodes for three trees
+head_nodes = ['function1', 'function10']
 
-if __name__ == "__main__":
-    directory = input("Enter the directory containing C and header files: ")
-    output_file = input("Enter the output PNG file name: ")
-    split_function = input("Enter the function name to split the call map (leave empty for no split): ")
-    main(directory, output_file, split_function)
+# Generate graphs for each tree
+generate_call_hierarchy_graph(call_hierarchy, head_nodes, 'call_hierarchy')
