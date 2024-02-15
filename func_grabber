@@ -1,0 +1,35 @@
+import os
+import re
+import json
+
+def extract_function_signatures(file_path):
+    function_signatures = []
+    with open(file_path, 'r') as file:
+        content = file.read()
+        # Regular expression to match function signatures
+        pattern = r'\b((?:[\w_]+\s+)+)\s*[\w_]+\s*\([^;]*\)'
+        matches = re.findall(pattern, content)
+        for match in matches:
+            function_signatures.append(match.strip())
+    return function_signatures
+
+def collect_function_signatures(directory):
+    function_signatures = {}
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(('.c', '.h')):
+                file_path = os.path.join(root, file)
+                signatures = extract_function_signatures(file_path)
+                if signatures:
+                    function_signatures[file] = signatures
+    return function_signatures
+
+def save_to_json(data, output_file):
+    with open(output_file, 'w') as json_file:
+        json.dump(data, json_file, indent=4)
+
+if __name__ == "__main__":
+    directory = "your_directory_path_here"  # Replace with the directory containing your .c and .h files
+    output_file = "function_signatures.json"
+    function_signatures = collect_function_signatures(directory)
+    save_to_json(function_signatures, output_file)
