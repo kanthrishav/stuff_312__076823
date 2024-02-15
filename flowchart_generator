@@ -1,0 +1,41 @@
+import os
+import re
+from pyflowchart import Flowchart
+
+
+def extract_function_bodies(file_path):
+    function_bodies = {}
+    with open(file_path, 'r') as file:
+        content = file.read()
+        # Regular expression to match function definitions
+        pattern = r'(\b[\w]+\s+[\w]+\s*\([^;]*\)\s*\{(?:[^{}]*|(?R))*\})'
+        matches = re.findall(pattern, content, re.DOTALL)
+        for match in matches:
+            function_name = re.search(r'\b[\w]+\s+([\w]+)\s*\([^;]*\)', match).group(1)
+            function_bodies[function_name] = match.strip()
+    return function_bodies
+
+
+def generate_flowchart(function_bodies, output_directory):
+    for function_name, body in function_bodies.items():
+        flowchart = Flowchart.from_code(body)
+        output_file = os.path.join(output_directory, f"{function_name}_flowchart.png")
+        flowchart.render(output_file)
+
+
+def process_files(directory, output_directory):
+    function_bodies = {}
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(('.c', '.h')):
+                file_path = os.path.join(root, file)
+                bodies = extract_function_bodies(file_path)
+                function_bodies.update(bodies)
+    generate_flowchart(function_bodies, output_directory)
+
+
+if __name__ == "__main__":
+    input_directory = "your_input_directory_path_here"  # Replace with the directory containing your .c and .h files
+    output_directory = "output_flowcharts"  # Output directory for flowchart images
+    os.makedirs(output_directory, exist_ok=True)
+    process_files(input_directory, output_directory)
