@@ -1,0 +1,84 @@
+#include <stdio.h>
+#include <math.h>
+
+// Function to check if a point is inside an arbitrarily oriented rectangle
+int is_point_in_rectangle(double px, double py, double cx, double cy, double theta,
+                          double lf, double wl, double lr, double wr) {
+    // Translate point to the rectangle's center
+    double translated_x = px - cx;
+    double translated_y = py - cy;
+    
+    // Rotate point to the rectangle's local coordinate system
+    double cos_theta = cos(theta);
+    double sin_theta = sin(theta);
+    double local_x = translated_x * cos_theta + translated_y * sin_theta;
+    double local_y = -translated_x * sin_theta + translated_y * cos_theta;
+    
+    // Rectangle bounds in local coordinate system
+    double min_x = -wl;
+    double max_x = wr;
+    double min_y = -lr;
+    double max_y = lf;
+    
+    // Check if the point is within bounds
+    return (local_x >= min_x && local_x <= max_x && local_y >= min_y && local_y <= max_y);
+}
+
+// Function to rotate a point around the origin
+void rotate_point(double* x, double* y, double theta) {
+    double cos_theta = cos(theta);
+    double sin_theta = sin(theta);
+    double x_new = *x * cos_theta - *y * sin_theta;
+    double y_new = *x * sin_theta + *y * cos_theta;
+    *x = x_new;
+    *y = y_new;
+}
+
+// Consolidated function to check if any corner of one rectangle falls inside another
+int is_any_corner_in_rectangle(double cx1, double cy1, double theta1, double lf1, double wl1, double lr1, double wr1,
+                               double cx2, double cy2, double theta2, double lf2, double wl2, double lr2, double wr2) {
+    // Define the corners of the first rectangle in its local coordinate system
+    double corners[4][2] = {
+        {-wl1, -lr1},
+        {wr1, -lr1},
+        {wr1, lf1},
+        {-wl1, lf1}
+    };
+    
+    // Transform these corners to the global coordinate system
+    for (int i = 0; i < 4; i++) {
+        double x = corners[i][0];
+        double y = corners[i][1];
+        // Rotate corner around the center
+        rotate_point(&x, &y, theta1);
+        // Translate corner to the global coordinate system
+        x += cx1;
+        y += cy1;
+        // Check if this corner is inside the second rectangle
+        if (is_point_in_rectangle(x, y, cx2, cy2, theta2, lf2, wl2, lr2, wr2)) {
+            return 1; // At least one corner is inside the second rectangle
+        }
+    }
+    return 0; // No corners are inside the second rectangle
+}
+
+int main() {
+    // Define the first rectangle
+    double cx1 = 0.0, cy1 = 0.0, theta1 = M_PI / 4; // 45 degrees
+    double lf1 = 1.0, wl1 = 1.0, lr1 = 1.0, wr1 = 1.0;
+    
+    // Define the second rectangle
+    double cx2 = 1.0, cy2 = 1.0, theta2 = -M_PI / 4; // -45 degrees
+    double lf2 = 1.0, wl2 = 1.0, lr2 = 1.0, wr2 = 1.0;
+    
+    // Check if any corner of the first rectangle is inside the second rectangle
+    int overlap = is_any_corner_in_rectangle(cx1, cy1, theta1, lf1, wl1, lr1, wr1,
+                                             cx2, cy2, theta2, lf2, wl2, lr2, wr2);
+    if (overlap) {
+        printf("At least one corner of the first rectangle is inside the second rectangle\n");
+    } else {
+        printf("No corners of the first rectangle are inside the second rectangle\n");
+    }
+    
+    return 0;
+}
