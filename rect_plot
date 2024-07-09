@@ -1,0 +1,151 @@
+import math
+from numpy import deg2rad
+import plotly.graph_objects as go
+
+def transform_point(x, y, cx, cy, angle):
+    """Transform a point (x, y) by translating to (cx, cy) and rotating by angle."""
+    x_new = cx + x * math.cos(angle) - y * math.sin(angle)
+    y_new = cy + x * math.sin(angle) + y * math.cos(angle)
+    return x_new, y_new
+
+def plot_rectangles():
+    # Define the rectangles
+    rect1 = {
+        'cx': 2, 'cy': 3, 'angle': deg2rad(0), 
+        'corners': [
+            (-1, 1), (-1, -1),  (1, -1), (1, 1),(-1, 1)  # (front left, front right, rear left, rear right)
+        ]
+    }
+    rect2 = {
+        'cx': 8, 'cy': 5, 'angle': deg2rad(0),
+        'corners': [
+            (-2, 1), (-2, -1), (2, -1), (2, 1), (-2, 1)  # (front left, front right, rear left, rear right)
+        ]
+    }
+
+    fig = go.Figure()
+
+    # Plot corners in local coordinate system
+    fig.add_trace(go.Scatter(
+        x=[rect1['cx']], y=[rect1['cy']], mode='markers+lines', name=f'Rect1C',
+        line=dict(color='red')
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=[rect2['cx']], y=[rect2['cy']], mode='markers+lines', name=f'Rect2C',
+        line=dict(color='red')
+    ))
+
+    for i, rect in enumerate([rect1, rect2], 1):
+        x_local, y_local = zip(*rect['corners'])
+        fig.add_trace(go.Scatter(
+            x=x_local, y=y_local, mode='markers+lines', name=f'Rect {i} Local',
+            line=dict(color='blue' if i == 1 else 'green')
+        ))
+
+    # Transform and plot corners in global coordinate system
+    for i, rect in enumerate([rect1, rect2], 1):
+        x_global = []
+        y_global = []
+        for x, y in rect['corners']:
+            x_new, y_new = transform_point(x, y, rect['cx'], rect['cy'], rect['angle'])
+            x_global.append(x_new)
+            y_global.append(y_new)
+        fig.add_trace(go.Scatter(
+            x=x_global, y=y_global, mode='markers+lines', name=f'Rect {i} Global',
+            line=dict(color='red' if i == 1 else 'orange')
+        ))
+
+    # Transform the corners of rect1 into rect2's coordinate system
+    transformed_points = []
+    sumX = 0
+    sumY = 0
+    count = 0
+    for x, y in rect1['corners']:
+        # First, transform to the global coordinate system
+        x_global, y_global = transform_point(x, y, rect1['cx'], rect1['cy'], rect1['angle'])
+        # Then, transform to rect2's local coordinate system
+        x_rel = x_global - rect2['cx']
+        y_rel = y_global - rect2['cy']
+        x_new = x_rel *  math.cos(rect2['angle']) + y_rel * math.sin(rect2['angle'])
+        y_new = x_rel * -math.sin(rect2['angle']) + y_rel * math.cos(rect2['angle'])
+        if(count < 4):
+            sumX += x_new
+            sumY += y_new
+        count+=1
+        transformed_points.append((x_new, y_new))
+    cxNew = sumX/4
+    cyNew = sumY/4
+    fig.add_trace(go.Scatter(
+        x=[cxNew], y=[cyNew], mode='markers', name='Rect1To2C',
+        line=dict(color='purple')
+    ))
+
+    x_transformed, y_transformed = zip(*transformed_points)
+    fig.add_trace(go.Scatter(
+        x=x_transformed, y=y_transformed, mode='markers+lines', name='With_Rect1 in Rect2',
+        line=dict(color='purple')
+    ))
+
+    # Without
+        # Transform the corners of rect1 into rect2's coordinate system
+    transformed_points = []
+    sumX = 0
+    sumY = 0
+    count = 0
+    for x, y in rect1['corners']:
+        # First, transform to the global coordinate system
+        x_global, y_global = x,y
+        # Then, transform to rect2's local coordinate system
+        x_rel = x_global - rect2['cx']
+        y_rel = y_global - rect2['cy']
+        x_new = x_rel *  math.cos(rect2['angle']) + y_rel * math.sin(rect2['angle'])
+        y_new = x_rel * -math.sin(rect2['angle']) + y_rel * math.cos(rect2['angle'])
+        if(count < 4):
+            sumX += x_new
+            sumY += y_new
+        count+=1
+        transformed_points.append((x_new, y_new))
+    cxNew = sumX/4
+    cyNew = sumY/4
+    fig.add_trace(go.Scatter(
+        x=[cxNew], y=[cyNew], mode='markers', name='Rect1To2C',
+        line=dict(color='magenta')
+    ))
+
+    x_transformed, y_transformed = zip(*transformed_points)
+    fig.add_trace(go.Scatter(
+        x=x_transformed, y=y_transformed, mode='markers+lines', name='Without_Rect1 in Rect2',
+        line=dict(color='magenta')
+    ))
+
+
+    # Add annotations for corner points
+    for i, (x, y) in enumerate(rect1['corners']):
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y], mode='text', text=[f'Rect1 Local {i}'], textposition="top center",
+            showlegend=False
+        ))
+
+    for i, (x, y) in enumerate(rect2['corners']):
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y], mode='text', text=[f'Rect2 Local {i}'], textposition="top center",
+            showlegend=False
+        ))
+
+    for i, (x, y) in enumerate(zip(x_transformed, y_transformed)):
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y], mode='text', text=[f'Transformed {i}'], textposition="top center",
+            showlegend=False
+        ))
+
+    fig.update_layout(
+        title='Rectangles and Transformed Points',
+        xaxis_title='X',
+        yaxis_title='Y',
+        showlegend=True
+    )
+
+    fig.write_html("rectangles_plot.html")
+
+plot_rectangles()
