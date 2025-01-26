@@ -1,0 +1,95 @@
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.io as pio
+import plotly.graph_objects as go
+
+# Constants
+NUM_SIMULATIONS = 1000
+DETECTION_COUNT_RANGE = (1, 50)
+PFD_MEAN = 70
+PFD_STD = 60
+PFD_MAX = 100
+
+# Helper function to generate PFD values
+def generate_pfd_values(num_detections):
+    pfd_values = np.random.normal(PFD_MEAN, PFD_STD, num_detections)
+    pfd_values = np.clip(pfd_values, 0, PFD_MAX) / 100  # Normalize to [0, 1]
+    return pfd_values
+
+# Approaches for calculating PFD_cluster
+def approach_1_total_probability(pfd_values):
+    return np.mean(pfd_values)
+
+def approach_2_probability_all_false(pfd_values):
+    return np.prod(pfd_values)
+
+def approach_3_adaptive_averaging(pfd_values):
+    n = len(pfd_values)
+    weight = 1 / (1 + np.exp(-0.1 * (n - 10)))  # Adaptive weight based on count
+    avg_pfd = np.mean(pfd_values)
+    return weight * avg_pfd + (1 - weight) * np.min(pfd_values)
+
+def approach_4_minimum_plus_coverage(pfd_values):
+    n = len(pfd_values)
+    min_pfd = np.min(pfd_values)
+    coverage = 1 - 1 / (n + 1)
+    return min_pfd * coverage
+
+# Monte Carlo Simulation Results
+results = []
+
+for _ in range(NUM_SIMULATIONS):
+    num_detections = np.random.randint(*DETECTION_COUNT_RANGE)
+    pfd_values = generate_pfd_values(num_detections)
+
+    # Calculate PFD_cluster for each approach
+    pfd_cluster_1 = approach_1_total_probability(pfd_values)
+    pfd_cluster_2 = approach_2_probability_all_false(pfd_values)
+    pfd_cluster_3 = approach_3_adaptive_averaging(pfd_values)
+    pfd_cluster_4 = approach_4_minimum_plus_coverage(pfd_values)
+
+    # Store results
+    results.append({
+        "num_detections": num_detections,
+        "mean_pfd": np.mean(pfd_values),
+        "min_pfd": np.min(pfd_values),
+        "max_pfd": np.max(pfd_values),
+        "pfd_cluster_1": pfd_cluster_1,
+        "pfd_cluster_2": pfd_cluster_2,
+        "pfd_cluster_3": pfd_cluster_3,
+        "pfd_cluster_4": pfd_cluster_4
+    })
+
+# Convert results to DataFrame
+results_df = pd.DataFrame(results)
+
+# Plotting
+plots = []
+
+# Sensitivity to mean PFD
+fig1 = px.scatter(results_df, x="mean_pfd", y=["pfd_cluster_1", "pfd_cluster_2", "pfd_cluster_3", "pfd_cluster_4"],
+                  labels={"value": "PFD_cluster", "mean_pfd": "Mean PFD"},
+                  title="Sensitivity to Mean PFD")
+fig1.update_layout(legend_title="Approach", xaxis_title="Mean PFD", yaxis_title="PFD_cluster")
+plots.append(fig1)
+
+# Sensitivity to number of detections
+fig2 = px.scatter(results_df, x="num_detections", y=["pfd_cluster_1", "pfd_cluster_2", "pfd_cluster_3", "pfd_cluster_4"],
+                  labels={"value": "PFD_cluster", "num_detections": "Number of Detections"},
+                  title="Sensitivity to Number of Detections")
+fig2.update_layout(legend_title="Approach", xaxis_title="Number of Detections", yaxis_title="PFD_cluster")
+plots.append(fig2)
+
+# Sensitivity to minimum PFD (outliers)
+fig3 = px.scatter(results_df, x="min_pfd", y=["pfd_cluster_1", "pfd_cluster_2", "pfd_cluster_3", "pfd_cluster_4"],
+                  labels={"value": "PFD_cluster", "min_pfd": "Minimum PFD"},
+                  title="Sensitivity to Minimum PFD")
+fig3.update_layout(legend_title="Approach", xaxis_title="Minimum PFD", yaxis_title="PFD_cluster")
+plots.append(fig3)
+
+# Save plots to HTML
+for i, fig in enumerate(plots):
+    pio.write_html(fig, file=f"pfd_cluster_plot_{i+1}.html", auto_open=False)
+
+print("Plots saved as HTML files.")
