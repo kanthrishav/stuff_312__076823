@@ -1,0 +1,203 @@
+import dash
+from dash import dcc, html, Input, Output, State
+import numpy as np
+import plotly.graph_objs as go
+import os
+
+# Initialize the Dash app
+app = dash.Dash(__name__)
+app.title = "Monte Carlo Sensitivity Analysis"
+
+# Define layout
+app.layout = html.Div(
+    style={"backgroundColor": "#d3d3d3", "fontFamily": "Arial", "fontSize": "16px"},
+    children=[
+        html.Div(
+            style={"width": "25%", "backgroundColor": "#00ffff", "padding": "10px", "float": "left", "height": "100vh"},
+            children=[
+                html.H2("Inputs", style={"fontSize": "20px"}),
+                html.Label("Simulation count"),
+                dcc.Input(id="sim_count", type="number", value=1000, min=1),
+                html.Br(),
+                html.Label("Min POE"),
+                dcc.Input(id="min_poe", type="number", value=0, min=0, max=100),
+                html.Br(),
+                html.Label("Max POE"),
+                dcc.Input(id="max_poe", type="number", value=100, min=0, max=100),
+                html.Br(),
+                html.Label("Mean POE"),
+                dcc.Input(id="mean_poe", type="number", value=70, min=0, max=100),
+                html.Br(),
+                html.Label("Std Dev POE"),
+                dcc.Input(id="std_poe", type="number", value=60, min=0, max=100),
+                html.Br(),
+                html.Label("Min Dets"),
+                dcc.Input(id="min_dets", type="number", value=1, min=1, max=50),
+                html.Br(),
+                html.Label("Max Dets"),
+                dcc.Input(id="max_dets", type="number", value=50, min=1, max=50),
+                html.Br(),
+                html.Label("Mean Dets"),
+                dcc.Input(id="mean_dets", type="number", value=25, min=1, max=50),
+                html.Br(),
+                html.Label("Std Dev Dets"),
+                dcc.Input(id="std_dets", type="number", value=10, min=1, max=50),
+                html.Br(),
+                html.Label("Distribution for detections"),
+                dcc.Dropdown(
+                    id="dets_dist",
+                    options=[
+                        {"label": "Uniform", "value": "uniform"},
+                        {"label": "Gaussian", "value": "gaussian"}
+                    ],
+                    value="uniform"
+                ),
+                html.Br(),
+                html.Label("Distribution for POE"),
+                dcc.Dropdown(
+                    id="poe_dist",
+                    options=[
+                        {"label": "Uniform", "value": "uniform"},
+                        {"label": "Gaussian", "value": "gaussian"}
+                    ],
+                    value="gaussian"
+                ),
+                html.Br(),
+                html.Label("Epsilon"),
+                dcc.Input(id="epsilon", type="number", value=0.01, min=0),
+                html.Br(),
+                html.Label("Scatter size"),
+                dcc.Input(id="scatter_size", type="number", value=8, min=1),
+                html.Br(),
+                html.Label("X-axis parameter"),
+                dcc.Dropdown(
+                    id="x_axis_param",
+                    options=[
+                        {"label": "Min POE", "value": "min_poe"},
+                        {"label": "Max POE", "value": "max_poe"},
+                        {"label": "Mean POE", "value": "mean_poe"},
+                        {"label": "Detection count", "value": "detection_count"}
+                    ],
+                    value="mean_poe"
+                ),
+                html.Br(),
+                html.Button("Run Simulation", id="run_simulation", n_clicks=0),
+                html.Br(), html.Br(),
+                html.Button("Download Plot", id="download_plot", n_clicks=0)
+            ]
+        ),
+        html.Div(
+            style={"width": "75%", "backgroundColor": "#f8f8ff", "padding": "10px", "float": "left", "height": "100vh"},
+            children=[
+                dcc.Graph(id="output_graph")
+            ]
+        )
+    ]
+)
+
+# Helper functions for approaches
+def calculate_total_probability(pfd_values):
+    return np.mean(pfd_values)
+
+def calculate_geometric_mean(pfd_values):
+    return np.prod(pfd_values) ** (1 / len(pfd_values))
+
+def calculate_am_gm_combined(pfd_values, epsilon, detection_count):
+    gm = calculate_geometric_mean(pfd_values)
+    am = calculate_total_probability(pfd_values)
+    alpha = epsilon / detection_count
+    return alpha * gm + (1 - alpha) * am
+
+def calculate_min_coverage(pfd_values, threshold, detection_count):
+    min_pfd = np.min(pfd_values)
+    coverage = np.sum(pfd_values > threshold) / detection_count
+    return min_pfd * (1 + coverage)
+
+def calculate_min_coverage_n2(pfd_values, threshold, detection_count):
+    min_pfd = np.min(pfd_values)
+    coverage = np.sum(pfd_values > threshold) / (detection_count * detection_count)
+    return min_pfd * (1 + coverage)
+
+@app.callback(
+    Output("output_graph", "figure"),
+    Input("run_simulation", "n_clicks"),
+    State("sim_count", "value"),
+    State("min_poe", "value"),
+    State("max_poe", "value"),
+    State("mean_poe", "value"),
+    State("std_poe", "value"),
+    State("min_dets", "value"),
+    State("max_dets", "value"),
+    State("mean_dets", "value"),
+    State("std_dets", "value"),
+    State("dets_dist", "value"),
+    State("poe_dist", "value"),
+    State("epsilon", "value"),
+    State("scatter_size", "value"),
+    State("x_axis_param", "value")
+)
+def run_simulation(n_clicks, sim_count, min_poe, max_poe, mean_poe, std_poe, min_dets, max_dets, mean_dets, std_dets, dets_dist, poe_dist, epsilon, scatter_size, x_axis_param):
+    if n_clicks == 0:
+        return go.Figure()
+
+    # Generate number of detections
+    if dets_dist == "uniform":
+        detections = np.random.randint(min_dets, max_dets + 1, sim_count)
+    elif dets_dist == "gaussian":
+        detections = np.clip(np.random.normal(mean_dets, std_dets, sim_count), min_dets, max_dets).astype(int)
+
+    # Generate POE values
+    if poe_dist == "uniform":
+        poe_values = np.random.uniform(min_poe, max_poe, (sim_count, max(detections)))
+    elif poe_dist == "gaussian":
+        poe_values = np.clip(np.random.normal(mean_poe, std_poe, (sim_count, max(detections))), min_poe, max_poe)
+
+    # Convert POE to PFD
+    pfd_values = 1 - (poe_values / 100)
+
+    results = {"Total Probability": [], "Geometric Mean": [], "AM-GM Combined": [], "Min+CoverageN1 (0.6)": [],
+               "Min+CoverageN1 (0.7)": [], "Min+CoverageN1 (0.8)": [], "Min+CoverageN1 (0.9)": [],
+               "Min+CoverageN2 (0.6)": [], "Min+CoverageN2 (0.7)": [], "Min+CoverageN2 (0.8)": [], "Min+CoverageN2 (0.9)": []}
+
+    for i in range(sim_count):
+        det_count = detections[i]
+        pfd_cluster = pfd_values[i, :det_count]
+
+        # Calculate PFD_cluster for each approach
+        results["Total Probability"].append(calculate_total_probability(pfd_cluster))
+        results["Geometric Mean"].append(calculate_geometric_mean(pfd_cluster))
+        results["AM-GM Combined"].append(calculate_am_gm_combined(pfd_cluster, epsilon, det_count))
+        for threshold in [0.6, 0.7, 0.8, 0.9]:
+            results[f"Min+CoverageN1 ({threshold})"].append(calculate_min_coverage(pfd_cluster, threshold, det_count))
+            results[f"Min+CoverageN2 ({threshold})"].append(calculate_min_coverage_n2(pfd_cluster, threshold, det_count))
+
+    # Prepare x-axis values
+    if x_axis_param == "min_poe":
+        x_values = np.min(poe_values[:, :detections.max()], axis=1) / 100
+    elif x_axis_param == "max_poe":
+        x_values = np.max(poe_values[:, :detections.max()], axis=1) / 100
+    elif x_axis_param == "mean_poe":
+        x_values = np.mean(poe_values[:, :detections.max()], axis=1) / 100
+    elif x_axis_param == "detection_count":
+        x_values = detections / detections.max()
+
+    # Create plot
+    fig = go.Figure()
+    for approach, values in results.items():
+        fig.add_trace(go.Scatter(
+            x=x_values, y=values, mode="markers", name=approach,
+            marker=dict(size=scatter_size)
+        ))
+
+    fig.update_layout(
+        title="Monte Carlo Sensitivity Analysis",
+        xaxis_title=x_axis_param.replace("_", " ").title(),
+        yaxis_title="PFD Cluster",
+        template="plotly_white",
+        legend_title="Approaches"
+    )
+
+    return fig
+
+if __name__ == "__main__":
+    app.run_server(debug=True)
