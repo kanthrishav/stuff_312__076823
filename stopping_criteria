@@ -1,0 +1,108 @@
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from sklearn.metrics import mean_squared_error
+
+# Define functions for calculating stopping criteria
+
+def calculate_confidence_interval(data, confidence_level=0.95):
+    """
+    Calculate the confidence interval of the mean.
+    """
+    mean = np.mean(data)
+    std = np.std(data, ddof=1)  # Sample standard deviation
+    n = len(data)
+    z = norm.ppf(1 - (1 - confidence_level) / 2)  # Z-score for the confidence level
+    ci_half_width = z * (std / np.sqrt(n))
+    return mean, ci_half_width
+
+def calculate_variance_change(new_variance, old_variance):
+    """
+    Calculate the relative change in variance.
+    """
+    return abs(new_variance - old_variance) / old_variance if old_variance != 0 else np.inf
+
+def calculate_sensitivity_plot_mse(old_plot, new_plot):
+    """
+    Calculate the Mean Squared Error (MSE) between two sensitivity plots.
+    """
+    return mean_squared_error(old_plot, new_plot)
+
+def check_stopping_criteria(data, old_variance, old_plot, new_plot, ci_threshold=0.05, var_threshold=0.01, mse_threshold=0.01):
+    """
+    Check if the stopping criteria for the simulation are met.
+    """
+    # Confidence Interval Criterion
+    mean, ci_half_width = calculate_confidence_interval(data)
+    ci_relative_width = ci_half_width / mean if mean != 0 else np.inf
+
+    # Variance Change Criterion
+    new_variance = np.var(data, ddof=1)
+    variance_change = calculate_variance_change(new_variance, old_variance)
+
+    # Sensitivity Plot MSE Criterion
+    plot_mse = calculate_sensitivity_plot_mse(old_plot, new_plot)
+
+    # Return metrics and whether criteria are met
+    criteria_met = (
+        ci_relative_width < ci_threshold and
+        variance_change < var_threshold and
+        plot_mse < mse_threshold
+    )
+
+    return {
+        "ci_relative_width": ci_relative_width,
+        "variance_change": variance_change,
+        "plot_mse": plot_mse,
+        "criteria_met": criteria_met
+    }
+
+# Example Monte Carlo simulation loop
+def monte_carlo_simulation(max_simulations=10000, ci_threshold=0.05, var_threshold=0.01, mse_threshold=0.01):
+    np.random.seed(42)  # For reproducibility
+
+    # Initialize variables
+    all_pfd_cluster = []
+    old_variance = None
+    old_plot = None
+
+    for i in range(1, max_simulations + 1):
+        # Generate random inputs (Number of detections and PFD values)
+        num_detections = np.random.randint(1, 51)  # 1 to 50 detections
+        pfd_values = np.random.uniform(0, 1, num_detections)  # PFD values between 0 and 1
+
+        # Example PFD_cluster calculation (e.g., mean of PFD values)
+        pfd_cluster = np.mean(pfd_values)
+        all_pfd_cluster.append(pfd_cluster)
+
+        # Check stopping criteria every 100 simulations
+        if i % 100 == 0:
+            new_plot = np.histogram(all_pfd_cluster, bins=10, range=(0, 1), density=True)[0]
+
+            if old_plot is None:
+                old_plot = new_plot
+
+            metrics = check_stopping_criteria(
+                data=all_pfd_cluster,
+                old_variance=old_variance if old_variance is not None else np.var(all_pfd_cluster, ddof=1),
+                old_plot=old_plot,
+                new_plot=new_plot,
+                ci_threshold=ci_threshold,
+                var_threshold=var_threshold,
+                mse_threshold=mse_threshold
+            )
+
+            # Print progress and metrics
+            print(f"Iteration {i}: {metrics}")
+
+            # If criteria are met, stop simulation
+            if metrics["criteria_met"]:
+                print(f"Stopping criteria met at iteration {i}.")
+                break
+
+            # Update old variance and plot
+            old_variance = np.var(all_pfd_cluster, ddof=1)
+            old_plot = new_plot
+
+# Run the simulation
+monte_carlo_simulation()
