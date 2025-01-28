@@ -1,0 +1,61 @@
+import numpy as np
+from scipy.stats import pearsonr
+from sklearn.metrics import mean_squared_error
+
+# Simulated POE values and Total Probability (Mean) PFD_cluster calculation
+np.random.seed(42)
+poe_values = np.random.rand(100)  # 100 random POE values between 0 and 1
+pfd_cluster = np.mean(poe_values)  # Total Probability (Mean)
+
+# Benchmarks
+threshold_high_poe = 0.7
+threshold_low_poe = 0.6
+benchmark_pfd_high = 0.5
+
+# Metrics Calculation
+def sensitivity_to_extremes(poe_values, pfd_cluster, threshold=threshold_high_poe):
+    delta_poe = np.abs(poe_values - threshold)
+    delta_pfd = np.abs(pfd_cluster - benchmark_pfd_high)
+    sensitivity = delta_pfd / delta_poe.mean()
+    return sensitivity
+
+def impact_ratio(poe_values, threshold=threshold_high_poe):
+    high_poe_mean = np.mean(poe_values[poe_values > threshold])
+    total_poe_mean = np.mean(poe_values)
+    return high_poe_mean / total_poe_mean
+
+def sobol_indices(poe_values, pfd_cluster):
+    total_variance = np.var(poe_values)
+    min_variance = np.var(poe_values.min())
+    sobol_index = min_variance / total_variance
+    return sobol_index
+
+def partial_derivatives(poe_values, pfd_cluster):
+    gradients = np.gradient(poe_values, edge_order=2)
+    return gradients.mean(), gradients.max()
+
+def bias_towards_extremes(poe_values, pfd_cluster, threshold=threshold_high_poe):
+    extreme_pfd = np.mean(poe_values[poe_values > threshold])
+    overall_pfd = np.mean(poe_values)
+    bias = extreme_pfd / overall_pfd
+    return bias
+
+def correlation_analysis(poe_values, pfd_cluster):
+    correlation, _ = pearsonr(poe_values, [pfd_cluster] * len(poe_values))
+    return correlation
+
+# Compute Metrics
+sensitivity = sensitivity_to_extremes(poe_values, pfd_cluster)
+impact = impact_ratio(poe_values)
+sobol = sobol_indices(poe_values, pfd_cluster)
+grad_mean, grad_max = partial_derivatives(poe_values, pfd_cluster)
+bias = bias_towards_extremes(poe_values, pfd_cluster)
+correlation = correlation_analysis(poe_values, pfd_cluster)
+
+# Display Results
+print(f"Sensitivity to Extremes: {sensitivity}")
+print(f"Impact Ratio: {impact}")
+print(f"Sobol Index: {sobol}")
+print(f"Partial Derivatives (Mean, Max): {grad_mean}, {grad_max}")
+print(f"Bias Towards Extremes: {bias}")
+print(f"Correlation Analysis: {correlation}")
