@@ -482,3 +482,172 @@ def main():
 if __name__ == '__main__':
     main()
 
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+
+def polar_to_cartesian(r, theta):
+    """
+    Convert polar coordinates (r, theta) to Cartesian (x, y).
+    r: scalar or numpy array (range)
+    theta: scalar or numpy array (azimuth in radians)
+    Returns: tuple (x, y)
+    """
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+    return x, y
+
+def visualize_alignment_interactive(gt_df, radar_df, output_html='alignment_interactive.html'):
+    """
+    Creates an interactive Plotly HTML plot to visualize alignment between ground truth
+    and radar points.
+    
+    - In "Single Cycle" mode (default), a slider at the bottom lets you select a sensor cycle.
+      The plot displays the ground truth point (blue marker) and radar points (red markers)
+      corresponding to that cycle.
+    - A toggle button ("Show All Cycles") allows you to display data from all cycles at once.
+      In that mode, the ground truth points are shown as both a scatter and a connecting line,
+      while radar detections are shown as scatter points.
+      
+    Parameters:
+        gt_df (pd.DataFrame): Corrected ground truth DataFrame with columns: 'cycle_no', 'distX', 'distY'
+        radar_df (pd.DataFrame): Radar DataFrame with column 'radar_cycle_no'. It should either have
+                                 'x' and 'y' columns or (if not) have 'RadialRange' and 'azimuth_angle' for conversion.
+        output_html (str): Filename for the output HTML file.
+    """
+    # Ensure ground truth is sorted by cycle_no.
+    gt_df = gt_df.sort_values('cycle_no').reset_index(drop=True)
+    
+    # Ensure radar_df is sorted by radar_cycle_no.
+    radar_df = radar_df.sort_values('radar_cycle_no').reset_index(drop=True)
+    
+    # Check if radar_df has 'x' and 'y'; if not, compute from 'RadialRange' and 'azimuth_angle'.
+    if 'x' not in radar_df.columns or 'y' not in radar_df.columns:
+        if 'RadialRange' in radar_df.columns and 'azimuth_angle' in radar_df.columns:
+            x_vals, y_vals = polar_to_cartesian(radar_df['RadialRange'].values,
+                                                 radar_df['azimuth_angle'].values)
+            radar_df['x'] = x_vals
+            radar_df['y'] = y_vals
+        else:
+            raise ValueError("Radar DataFrame must have either 'x'/'y' or 'RadialRange'/'azimuth_angle' columns.")
+    
+    # Get unique cycles (common to ground truth and radar)
+    gt_cycles = gt_df['cycle_no'].unique()
+    
+    # Prepare frames for each cycle (for Single Cycle mode)
+    frames = []
+    for cycle in gt_cycles:
+        # Extract ground truth for this cycle (should be one row)
+        gt_row = gt_df[gt_df['cycle_no'] == cycle]
+        if gt_row.empty:
+            continue
+        gt_x = gt_row['distX'].values[0]
+        gt_y = gt_row['distY'].values[0]
+        
+        # Extract radar points for this cycle: rows in radar_df where radar_cycle_no == cycle.
+        radar_cycle = radar_df[radar_df['radar_cycle_no'] == cycle]
+        frame_data = [
+            # Ground truth marker for this cycle.
+            dict(type='scatter', 
+                 x=[gt_x], y=[gt_y],
+                 mode='markers',
+                 marker=dict(color='blue', size=12),
+                 name='Ground Truth'),
+            # Radar points for this cycle.
+            dict(type='scatter', 
+                 x=radar_cycle['x'].tolist(), 
+                 y=radar_cycle['y'].tolist(),
+                 mode='markers',
+                 marker=dict(color='red', size=8),
+                 name='Radar Points')
+        ]
+        frames.append(dict(name=str(cycle), data=frame_data))
+    
+    # Create traces for "All Cycles" mode.
+    # For ground truth: scatter and line connecting them.
+    gt_all = go.Scatter(
+        x=gt_df['distX'],
+        y=gt_df['distY'],
+        mode='lines+markers',
+        marker=dict(color='blue', size=8),
+        line=dict(color='blue', dash='dash'),
+        name='Ground Truth (All)'
+    )
+    # For radar: plot all radar points across all cycles.
+    radar_all = go.Scatter(
+        x=radar_df['x'],
+        y=radar_df['y'],
+        mode='markers',
+        marker=dict(color='red', size=6),
+        name='Radar Points (All)'
+    )
+    
+    # Create initial data: start with the first cycle's frame (Single Cycle mode).
+    first_cycle = str(gt_cycles[0])
+    initial_frame = [f for f in frames if f['name'] == first_cycle][0]['data']
+    
+    # Create the figure.
+    fig = go.Figure(
+        data=initial_frame,
+        layout=go.Layout(
+            title="Ground Truth vs. Radar Points - Single Cycle Mode",
+            xaxis=dict(title='X (m)'),
+            yaxis=dict(title='Y (m)'),
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="left",
+                    x=0.1,
+                    y=1.15,
+                    buttons=[
+                        dict(label="Single Cycle",
+                             method="update",
+                             args=[{"visible": [True, True] + [False]*2},
+                                   {"title": "Ground Truth vs. Radar Points - Single Cycle Mode",
+                                    "showlegend": True}]),
+                        dict(label="Show All Cycles",
+                             method="update",
+                             args=[{"visible": [False, False, True, True]},
+                                   {"title": "Ground Truth vs. Radar Points - All Cycles Mode",
+                                    "showlegend": True}])
+                    ],
+                    pad={"r": 10, "t": 10},
+                    showactive=True
+                )
+            ],
+            sliders=[dict(
+                active=0,
+                currentvalue={"prefix": "Cycle: "},
+                pad={"t": 50},
+                steps=[
+                    dict(label=str(cycle),
+                         method="animate",
+                         args=[[str(cycle)],
+                               {"frame": {"duration": 300, "redraw": True},
+                                "mode": "immediate"}])
+                    for cycle in gt_cycles
+                ]
+            )]
+        ),
+        frames=frames
+    )
+    
+    # Add traces for "All Cycles" mode (they will initially be hidden).
+    fig.add_trace(gt_all)
+    fig.add_trace(radar_all)
+    
+    # Set initial visibility: show only first cycle traces (the first two traces), hide all cycles traces.
+    fig.data[0].visible = True
+    fig.data[1].visible = True
+    fig.data[2].visible = False  # gt_all
+    fig.data[3].visible = False  # radar_all
+    
+    # Save the figure as HTML.
+    fig.write_html(output_html)
+    print(f"Interactive alignment plot saved as {output_html}")
+
+# Example usage:
+# Assuming gt_df and radar_df are already corrected DataFrames loaded from your dataset.
+# visualize_alignment_interactive(corrected_gt_df, corrected_radar_df, output_html='alignment_interactive.html')
+
