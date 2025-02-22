@@ -1,0 +1,313 @@
+import os
+import numpy as np
+import pandas as pd
+from scipy.signal import correlate
+import plotly.graph_objects as go
+
+# -----------------------------
+# Step 1: Data Loading & Preprocessing
+# -----------------------------
+def load_data_from_folder(testcase_folder):
+    """
+    Load radar, ego, and ground truth data from a given test case folder.
+    Expects files in: <testcase_folder>/ftr/gnd.ftr, ego.ftr, and radar.ftr.
+    For optimization, we read only needed columns from radar.ftr.
+    """
+    ftr_dir = os.path.join(testcase_folder, 'ftr')
+    radar_path = os.path.join(ftr_dir, 'radar.ftr')
+    ego_path   = os.path.join(ftr_dir, 'ego.ftr')
+    gnd_path   = os.path.join(ftr_dir, 'gnd.ftr')
+    
+    # For radar, read only necessary columns to save memory.
+    radar_df = pd.read_feather(radar_path, columns=['radar_cycle_no', 'RadialRange', 'azimuth_angle', 'SNR'])
+    ego_df   = pd.read_feather(ego_path)
+    ground_df = pd.read_feather(gnd_path)
+    return radar_df, ego_df, ground_df
+
+def convert_ground_truth_to_polar(ground_df):
+    """
+    Convert ground truth Cartesian coordinates (distX, distY) into polar coordinates.
+    Assumes ground_df has columns: 'distX', 'distY', and a 'cycle_no' column.
+    """
+    ground_df = ground_df.copy()
+    ground_df['Range_GT'] = np.sqrt(ground_df['distX']**2 + ground_df['distY']**2)
+    ground_df['Azimuth_GT'] = np.arctan2(ground_df['distY'], ground_df['distX'])
+    return ground_df
+
+# -----------------------------
+# Step 2: Gating / Candidate Selection (Optimized)
+# -----------------------------
+def prepare_radar_index(radar_df, cycle_col='radar_cycle_no'):
+    """
+    Pre-sort the radar DataFrame by cycle number and return the sorted DataFrame and the sorted array of cycle numbers.
+    """
+    radar_df_sorted = radar_df.sort_values(cycle_col).reset_index(drop=True)
+    radar_cycles = radar_df_sorted[cycle_col].values
+    return radar_df_sorted, radar_cycles
+
+def gate_radar_candidates_fast(radar_df_sorted, radar_cycles, ground_df, time_window=15):
+    """
+    For each ground truth cycle, use np.searchsorted on the pre-sorted radar_cycles
+    to quickly extract radar detections within [cycle - time_window, cycle + time_window].
+    Returns a dictionary: {cycle: candidate_radar_df}.
+    """
+    candidates = {}
+    # Get ground truth cycles as a sorted array
+    gt_cycles = ground_df['cycle_no'].values
+    for cycle in gt_cycles:
+        low_bound = cycle - time_window
+        high_bound = cycle + time_window
+        start_idx = np.searchsorted(radar_cycles, low_bound, side='left')
+        end_idx = np.searchsorted(radar_cycles, high_bound, side='right')
+        # Slice the pre-sorted radar dataframe
+        candidates[cycle] = radar_df_sorted.iloc[start_idx:end_idx].copy()
+    return candidates
+
+def apply_spatial_gate(candidates, ground_df, range_tolerance=5.0):
+    """
+    For each cycle, filter candidate radar detections by comparing radar's 'RadialRange'
+    with the ground truth 'Range_GT'. Only keep detections where the absolute difference 
+    is <= range_tolerance.
+    Returns a dictionary {cycle: gated_radar_df}.
+    """
+    gated_candidates = {}
+    for idx, row in ground_df.iterrows():
+        cycle = row['cycle_no']
+        gt_range = row['Range_GT']
+        if cycle in candidates:
+            df_candidates = candidates[cycle]
+            gated = df_candidates[np.abs(df_candidates['RadialRange'] - gt_range) <= range_tolerance].copy()
+            gated_candidates[cycle] = gated
+    return gated_candidates
+
+# -----------------------------
+# Step 3: Temporal Alignment via Cross-Correlation
+# -----------------------------
+def compute_representative_radar_range(gated_candidates, method='mean'):
+    """
+    For each cycle in gated_candidates, compute a representative radar range.
+    Options: 'mean' (average of candidate RadialRange) or 'best' (detection with highest SNR).
+    Returns a dictionary: {cycle: representative_range}.
+    """
+    rep_ranges = {}
+    for cycle, df in gated_candidates.items():
+        if df.empty:
+            continue
+        if method == 'mean':
+            rep = df['RadialRange'].mean()
+        elif method == 'best':
+            best_row = df.loc[df['SNR'].idxmax()]
+            rep = best_row['RadialRange']
+        else:
+            rep = df['RadialRange'].mean()
+        rep_ranges[cycle] = rep
+    return rep_ranges
+
+def construct_time_series(ground_df, rep_ranges):
+    """
+    Construct two time series:
+      - ground_range: from ground_df['Range_GT'] using cycle_no.
+      - radar_range: from rep_ranges dictionary.
+    Returns sorted arrays: cycles, ground_range, radar_range.
+    """
+    cycles = ground_df['cycle_no'].values
+    ground_range = []
+    radar_range = []
+    valid_cycles = []
+    for cycle in cycles:
+        if cycle in rep_ranges:
+            valid_cycles.append(cycle)
+            ground_range.append(ground_df.loc[ground_df['cycle_no'] == cycle, 'Range_GT'].values[0])
+            radar_range.append(rep_ranges[cycle])
+    return np.array(valid_cycles), np.array(ground_range), np.array(radar_range)
+
+def estimate_time_lag(ground_signal, radar_signal):
+    """
+    Compute the cross-correlation between ground_signal and radar_signal and return 
+    the lag (in number of cycles) that maximizes the correlation.
+    """
+    ground_signal = ground_signal - np.mean(ground_signal)
+    radar_signal = radar_signal - np.mean(radar_signal)
+    corr = correlate(radar_signal, ground_signal, mode='full')
+    lags = np.arange(-len(ground_signal)+1, len(ground_signal))
+    best_lag = lags[np.argmax(corr)]
+    return best_lag, corr, lags
+
+# -----------------------------
+# Step 4: Temporal Correction
+# -----------------------------
+def shift_ground_truth(ground_df, lag):
+    """
+    Shift the ground truth data by the estimated lag.
+    For positive lag, shift ground truth forward (i.e., assign cycle n -> n+lag).
+    Returns a new DataFrame with updated 'cycle_no'.
+    """
+    gt_shifted = ground_df.copy()
+    gt_shifted['cycle_no'] = gt_shifted['cycle_no'] + lag
+    return gt_shifted
+
+# -----------------------------
+# Step 5: Spatial Alignment via ICP-like Procedure
+# -----------------------------
+def select_best_radar_candidate(gated_candidates, ground_df):
+    """
+    For each cycle in ground_df, select the radar detection among the gated candidates 
+    that is closest (in range) to the ground truth.
+    Returns two arrays of points (Cartesian coordinates):
+      - radar_points: from radar detections (converted from polar).
+      - gt_points: from ground truth (distX, distY).
+    Assumes ground_df has columns 'distX' and 'distY'; radar detections have 'RadialRange' and 'azimuth_angle'.
+    """
+    radar_points = []
+    gt_points = []
+    for idx, row in ground_df.iterrows():
+        cycle = row['cycle_no']
+        if cycle not in gated_candidates:
+            continue
+        df_candidates = gated_candidates[cycle]
+        if df_candidates.empty:
+            continue
+        gt_range = row['Range_GT']
+        df_candidates = df_candidates.copy()
+        df_candidates['range_diff'] = np.abs(df_candidates['RadialRange'] - gt_range)
+        best_candidate = df_candidates.sort_values('range_diff').iloc[0]
+        r = best_candidate['RadialRange']
+        theta = best_candidate['azimuth_angle']
+        x_radar = r * np.cos(theta)
+        y_radar = r * np.sin(theta)
+        radar_points.append([x_radar, y_radar])
+        gt_points.append([row['distX'], row['distY']])
+    return np.array(radar_points), np.array(gt_points)
+
+def compute_rigid_transform(A, B):
+    """
+    Compute the optimal rigid transformation (rotation R and translation t)
+    that aligns A (Nx2) to B (Nx2) using SVD.
+    Returns R (2x2) and t (2,).
+    """
+    assert A.shape == B.shape
+    centroid_A = np.mean(A, axis=0)
+    centroid_B = np.mean(B, axis=0)
+    AA = A - centroid_A
+    BB = B - centroid_B
+    H = AA.T @ BB
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[1,:] *= -1
+        R = Vt.T @ U.T
+    t = centroid_B - R @ centroid_A
+    return R, t
+
+def apply_transformation(points, R, t):
+    """
+    Apply the rigid transformation defined by R and t to points (Nx2).
+    Returns transformed points.
+    """
+    return (R @ points.T).T + t
+
+# -----------------------------
+# Step 6: Visualization using Plotly
+# -----------------------------
+def visualize_alignment(gt_points, radar_points_aligned, output_html='alignment.html'):
+    """
+    Create an interactive scatter plot with Plotly:
+      - Ground truth points in blue.
+      - Aligned radar candidate points in red.
+    Save the plot as an HTML file.
+    """
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=gt_points[:,0],
+        y=gt_points[:,1],
+        mode='markers',
+        marker=dict(size=8, color='blue'),
+        name='Ground Truth'
+    ))
+    fig.add_trace(go.Scatter(
+        x=radar_points_aligned[:,0],
+        y=radar_points_aligned[:,1],
+        mode='markers',
+        marker=dict(size=8, color='red'),
+        name='Aligned Radar'
+    ))
+    fig.update_layout(title='Ground Truth vs. Aligned Radar Points',
+                      xaxis_title='X (m)',
+                      yaxis_title='Y (m)',
+                      legend=dict(x=0, y=1))
+    fig.write_html(output_html)
+    print(f'Visualization saved as {output_html}')
+
+# -----------------------------
+# Processing Function for a Single Test Case
+# -----------------------------
+def process_testcase(testcase_folder):
+    print(f"Processing test case: {testcase_folder}")
+    radar_df, ego_df, ground_df = load_data_from_folder(testcase_folder)
+    
+    # Convert ground truth to polar coordinates.
+    ground_df = convert_ground_truth_to_polar(ground_df)
+    
+    # Pre-sort radar data for fast candidate selection.
+    radar_df_sorted, radar_cycles = prepare_radar_index(radar_df, cycle_col='radar_cycle_no')
+    
+    # Step 2: Gating/Candidate Selection.
+    candidates = gate_radar_candidates_fast(radar_df_sorted, radar_cycles, ground_df, time_window=15)
+    gated_candidates = apply_spatial_gate(candidates, ground_df, range_tolerance=5.0)
+    
+    # Step 3: Temporal Alignment via Cross-Correlation.
+    rep_ranges = compute_representative_radar_range(gated_candidates, method='mean')
+    cycles, ground_range_ts, radar_range_ts = construct_time_series(ground_df, rep_ranges)
+    
+    if len(ground_range_ts) == 0 or len(radar_range_ts) == 0:
+        print("Insufficient data for temporal alignment.")
+        return None, None, None
+    
+    lag, corr, lags = estimate_time_lag(ground_range_ts, radar_range_ts)
+    print(f'Estimated time lag (in cycles): {lag}')
+    
+    # Step 4: Temporal Correction.
+    ground_df_aligned = shift_ground_truth(ground_df, lag)
+    
+    # Step 5: Spatial Alignment via ICP-like procedure.
+    radar_points, gt_points = select_best_radar_candidate(gated_candidates, ground_df_aligned)
+    if len(radar_points) < 3:
+        print("Not enough point pairs for spatial alignment.")
+        return None, None, None
+    
+    R, t = compute_rigid_transform(radar_points, gt_points)
+    print("Computed rigid transformation:")
+    print("Rotation matrix R:")
+    print(R)
+    print("Translation vector t:")
+    print(t)
+    
+    radar_points_aligned = apply_transformation(radar_points, R, t)
+    
+    return gt_points, radar_points_aligned, lag
+
+# -----------------------------
+# Main Function for Multiple Test Cases
+# -----------------------------
+def main():
+    root_dir = './testcases'  # Root folder containing test case folders.
+    output_root = './outputs'
+    os.makedirs(output_root, exist_ok=True)
+    
+    # Iterate over each test case folder inside the root folder.
+    for testcase in sorted(os.listdir(root_dir)):
+        testcase_folder = os.path.join(root_dir, testcase)
+        if not os.path.isdir(testcase_folder):
+            continue
+        
+        gt_points, radar_points_aligned, lag = process_testcase(testcase_folder)
+        if gt_points is None or radar_points_aligned is None:
+            print(f"Skipping test case: {testcase} due to insufficient data.")
+            continue
+        
+        output_html = os.path.join(output_root, f"{testcase}_alignment.html")
+        visualize_alignment(gt_points, radar_points_aligned, output_html=output_html)
+        print(f"Test case {testcase} processed with time lag {lag} cycles.\n")
+
+if __name__ == '__main__':
+    main()
