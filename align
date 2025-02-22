@@ -311,3 +311,174 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import numpy as np
+import pandas as pd
+
+# -----------------------------
+# Utility Functions: Polar <-> Cartesian Conversion
+# -----------------------------
+def polar_to_cartesian(r, theta):
+    """
+    Convert polar coordinates (r, theta) to Cartesian (x, y).
+    :param r: range (scalar or numpy array)
+    :param theta: azimuth in radians (scalar or numpy array)
+    :return: tuple (x, y)
+    """
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+    return x, y
+
+# -----------------------------
+# Data Loading Functions
+# -----------------------------
+def load_data(testcase_folder):
+    """
+    Load radar and ground truth data from the specified testcase folder.
+    Assumes:
+      - Ground truth file is located at <testcase_folder>/ftr/gnd.ftr and has columns:
+         'cycle_no', 'distX', 'distY'
+      - Radar file is located at <testcase_folder>/ftr/radar.ftr and has columns:
+         'radar_cycle_no', 'RadialRange', 'azimuth_angle'
+    Returns: radar_df, gnd_df (as pandas DataFrames)
+    """
+    ftr_dir = os.path.join(testcase_folder, 'ftr')
+    gnd_path = os.path.join(ftr_dir, 'gnd.ftr')
+    radar_path = os.path.join(ftr_dir, 'radar.ftr')
+    
+    # Load only needed columns for memory efficiency
+    gnd_df = pd.read_feather(gnd_path)  # must contain 'cycle_no', 'distX', 'distY'
+    radar_df = pd.read_feather(radar_path, columns=['radar_cycle_no', 'RadialRange', 'azimuth_angle'])
+    
+    return radar_df, gnd_df
+
+# -----------------------------
+# ICP Registration (Closed-Form)
+# -----------------------------
+def icp_registration(radar_df, gnd_df):
+    """
+    Performs a closed-form ICP registration. For each sensor cycle, it pairs each radar candidate point
+    with the ground truth point of that cycle. All radar points (in Cartesian coordinates) are aggregated,
+    and each is associated with its corresponding ground truth (replicated as many times as there are radar points).
+    
+    Then the rigid transformation (rotation R and translation t) is computed to minimize:
+    
+        E(R, t) = sum_{all pairs} || R*q + t - p ||^2
+    
+    where q is a ground truth point (from gnd.ftr) and p is a radar detection point (from radar.ftr).
+    
+    The function returns the computed rotation R and translation t, and also returns the corrected ground truth data.
+    """
+    # First, aggregate data cycle by cycle.
+    # We'll assume gnd_df has 'cycle_no', 'distX', 'distY'
+    # and radar_df has 'radar_cycle_no', 'RadialRange', 'azimuth_angle'
+    
+    radar_points_list = []
+    gt_points_list = []
+    
+    # Build dictionaries keyed by cycle for faster access.
+    # For ground truth, index by cycle.
+    gt_dict = {row['cycle_no']: (row['distX'], row['distY']) for _, row in gnd_df.iterrows()}
+    
+    # We assume radar.ftr may have many rows per cycle.
+    # Group radar detections by cycle:
+    radar_groups = radar_df.groupby('radar_cycle_no')
+    
+    # For each radar cycle that also exists in ground truth:
+    common_cycles = set(radar_df['radar_cycle_no'].unique()).intersection(set(gnd_df['cycle_no'].unique()))
+    if not common_cycles:
+        raise ValueError("No common cycles found between radar and ground truth!")
+    
+    for cycle in common_cycles:
+        if cycle not in gt_dict:
+            continue
+        gt_point = np.array(gt_dict[cycle])  # (distX, distY)
+        # Get all radar detections for this cycle.
+        group = radar_groups.get_group(cycle)
+        # Convert each radar detection from polar to Cartesian.
+        # Radar columns: 'RadialRange' and 'azimuth_angle'
+        r_vals = group['RadialRange'].values
+        theta_vals = group['azimuth_angle'].values
+        x_vals, y_vals = polar_to_cartesian(r_vals, theta_vals)
+        radar_pts = np.column_stack((x_vals, y_vals))
+        # For each radar point in this cycle, associate the same ground truth.
+        radar_points_list.append(radar_pts)
+        gt_points_list.append(np.tile(gt_point, (radar_pts.shape[0], 1)))
+    
+    # Concatenate all cycles.
+    P = np.vstack(radar_points_list)  # radar points, shape (M, 2)
+    Q = np.vstack(gt_points_list)       # ground truth points (repeated), shape (M, 2)
+    
+    # Compute centroids.
+    centroid_P = np.mean(P, axis=0)
+    centroid_Q = np.mean(Q, axis=0)
+    
+    # Center the points.
+    P_centered = P - centroid_P
+    Q_centered = Q - centroid_Q
+    
+    # Compute the cross-covariance matrix.
+    H = P_centered.T @ Q_centered  # shape (2,2)
+    
+    # Perform SVD of H.
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    # Ensure a proper rotation (determinant +1)
+    if np.linalg.det(R) < 0:
+        Vt[1,:] *= -1
+        R = Vt.T @ U.T
+        
+    t = centroid_Q - R @ centroid_P
+    
+    # The computed (R, t) is the transformation that maps radar points to ground truth points.
+    # Since we want to "correct" the ground truth, we apply this transformation to ground truth.
+    # That is, we compute: corrected_gt = R * original_gt + t.
+    corrected_gt = gnd_df.copy()
+    # Apply transformation to each ground truth point (distX, distY)
+    gt_xy = corrected_gt[['distX', 'distY']].values
+    corrected_xy = (R @ gt_xy.T).T + t
+    corrected_gt[['distX', 'distY']] = corrected_xy
+    
+    return R, t, corrected_gt
+
+# -----------------------------
+# Main Function for a Single Test Case
+# -----------------------------
+def main():
+    # Example: each test case is in its own folder under a root folder.
+    # For this example, we process a single test case.
+    # Adjust the path as necessary.
+    testcase_folder = './testcase_example'  # change this to your test case folder
+    radar_df, gnd_df = load_data(testcase_folder)
+    
+    # For ICP, we assume that the radar detections have been pre-filtered to include only the relevant target detections.
+    # If further gating is needed, that should be done before calling icp_registration.
+    
+    # Perform ICP registration to compute the rigid transformation.
+    R, t, corrected_gnd_df = icp_registration(radar_df, gnd_df)
+    
+    print("Computed rigid transformation:")
+    print("Rotation matrix R:")
+    print(R)
+    print("Translation vector t:")
+    print(t)
+    
+    # Save the corrected ground truth if needed.
+    corrected_gnd_df.to_feather(os.path.join(testcase_folder, 'ftr', 'gnd_corrected.ftr'))
+    print("Corrected ground truth saved as 'gnd_corrected.ftr' in the ftr folder.")
+
+if __name__ == '__main__':
+    main()
+
