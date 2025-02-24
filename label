@@ -492,3 +492,344 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+from scipy.spatial import ConvexHull
+import plotly.graph_objects as go
+
+def compute_convex_hull(xs, ys):
+    """
+    Given lists or arrays of x and y coordinates, compute the convex hull.
+    Returns the hull as a list of (x, y) pairs in order.
+    If there are fewer than 3 points, returns the points as-is.
+    """
+    points = np.column_stack((xs, ys))
+    if len(points) < 3:
+        return points.tolist()
+    try:
+        hull = ConvexHull(points)
+        hull_points = points[hull.vertices]
+        return hull_points.tolist()
+    except Exception as e:
+        # If convex hull fails (e.g., all points collinear), return all points.
+        return points.tolist()
+
+def visualize_segmentation_interactive_v2(dfRadar, dfGND, output_html='segmentation_interactive.html'):
+    """
+    Creates an interactive Plotly HTML plot with a slider for sensor cycles and buttons
+    to toggle among three views:
+      1. "InOut": Plots all detections (from all cycles) grouped into "inside" and "outside"
+         (freeform convex hulls drawn around each group).
+      2. "Segments": Plots all detections grouped by "cluster_labels" (each cluster gets its own freeform shape).
+      3. "Final Segments": Plots all detections grouped by the combination of "cluster_labels" and "InsideOutsideLabels".
+         In addition, in the cycle-by-cycle view, for detections that are inside and predicted as True Target 
+         (i.e. argmax(final_labels)==0), a thin line is drawn connecting the detections with the ground truth centroid.
+         
+    Coordinates are swapped: dfRadar['x'] is plotted on Y-axis and dfRadar['y'] on X-axis.
+    Similarly, for dfGND, distY is on X-axis and distX on Y-axis.
+    
+    The plot does not animate automatically; cycles change only when the user moves the slider.
+    All freeform shapes have opacity 0.1 and their boundary is drawn in the same color as the shape.
+    
+    Parameters:
+      dfRadar (pd.DataFrame): DataFrame with radar detections, with columns:
+         'cycle_no', 'x', 'y', 'InsideOutsideLabels', 'cluster_labels', 'final_labels'
+      dfGND (pd.DataFrame): DataFrame with ground truth points, with columns: 'cycle_no', 'distX', 'distY'
+      output_html (str): The output HTML file path.
+    """
+    # Sort dataframes by cycle
+    dfRadar = dfRadar.sort_values('cycle_no').reset_index(drop=True)
+    dfGND = dfGND.sort_values('cycle_no').reset_index(drop=True)
+    
+    # Get all unique cycles (assuming cycles are same in both, after alignment)
+    cycles = sorted(dfGND['cycle_no'].unique())
+    
+    # Pre-compute global freeform shapes for global (non-animated) views:
+    # 1. InOut view: Group by InsideOutsideLabels over all cycles.
+    in_mask = dfRadar['InsideOutsideLabels'] == 'inside'
+    out_mask = dfRadar['InsideOutsideLabels'] == 'outside'
+    # For plotting, swap coordinates: Plot X = y, Y = x.
+    in_x = dfRadar.loc[in_mask, 'y'].values
+    in_y = dfRadar.loc[in_mask, 'x'].values
+    out_x = dfRadar.loc[out_mask, 'y'].values
+    out_y = dfRadar.loc[out_mask, 'x'].values
+    hull_in = compute_convex_hull(in_x, in_y)
+    hull_out = compute_convex_hull(out_x, out_y)
+    
+    # 2. Segments view: Group by cluster_labels over all cycles.
+    unique_clusters = sorted(dfRadar['cluster_labels'].unique())
+    cluster_hulls = {}
+    for cl in unique_clusters:
+        mask = (dfRadar['cluster_labels'] == cl)
+        cl_x = dfRadar.loc[mask, 'y'].values
+        cl_y = dfRadar.loc[mask, 'x'].values
+        cluster_hulls[cl] = compute_convex_hull(cl_x, cl_y)
+    
+    # 3. Final Segments: Group by (InsideOutsideLabels, cluster_labels)
+    final_groups = dfRadar.groupby(['InsideOutsideLabels', 'cluster_labels'])
+    final_hulls = {}
+    for (io_label, cl), group in final_groups:
+        f_x = group['y'].values
+        f_y = group['x'].values
+        final_hulls[(io_label, cl)] = compute_convex_hull(f_x, f_y)
+    
+    # Define color maps for the classes. For simplicity, we define:
+    # Colors for InOut: "inside" = blue, "outside" = red.
+    color_inout = {'inside': 'blue', 'outside': 'red'}
+    # For clusters, assign a color per cluster.
+    cluster_color_map = {cl: color for cl, color in zip(unique_clusters, 
+                         ['green','orange','purple','brown','pink'])}
+    # For final, combine both keys:
+    final_color_map = {}
+    for key in final_hulls.keys():
+        io_label, cl = key
+        # Create a unique color by combining the two maps (for demonstration, concatenate names)
+        if io_label == 'inside':
+            # True target is assumed to be class 0 in final_labels.
+            final_color_map[key] = 'green' if cl==0 else cluster_color_map.get(cl, 'grey')
+        else:
+            final_color_map[key] = cluster_color_map.get(cl, 'grey')
+    
+    # Build frames for cycle-by-cycle visualization.
+    frames = []
+    for cycle in cycles:
+        # Get GT point for this cycle (swap: X axis=distY, Y axis=distX)
+        gt_row = dfGND[dfGND['cycle_no'] == cycle]
+        if gt_row.empty:
+            continue
+        gt_x = gt_row['distY'].values[0]
+        gt_y = gt_row['distX'].values[0]
+        
+        # Get radar detections for this cycle.
+        radar_cycle = dfRadar[dfRadar['cycle_no'] == cycle]
+        # Prepare traces for each view.
+        # For each view, we'll prepare a set of traces.
+        
+        # --- View 1: InOut (Inside/Outside)
+        # Plot detections with color according to InsideOutsideLabels.
+        trace_inout = go.Scatter(
+            x=radar_cycle['y'],  # y from df becomes x axis
+            y=radar_cycle['x'],  # x from df becomes y axis
+            mode='markers',
+            marker=dict(size=3, color=[color_inout[label] for label in radar_cycle['InsideOutsideLabels']]),
+            name='Radar InOut'
+        )
+        # Also add GT point.
+        trace_gt = go.Scatter(
+            x=[gt_x],
+            y=[gt_y],
+            mode='markers',
+            marker=dict(size=3, color='black', symbol='diamond'),
+            name='GT'
+        )
+        # Create freeform shapes for the global InOut view (will be toggled in button view, not cycle-specific).
+        shapes_inout = []
+        if len(hull_in) > 2:
+            hull_in = np.array(hull_in)
+            shapes_inout.append(dict(
+                type='path',
+                path='M ' + ' L '.join(f"{pt[0]},{pt[1]}" for pt in hull_in) + ' Z',
+                line=dict(color='blue'),
+                fillcolor='blue',
+                opacity=0.1
+            ))
+        if len(hull_out) > 2:
+            hull_out = np.array(hull_out)
+            shapes_inout.append(dict(
+                type='path',
+                path='M ' + ' L '.join(f"{pt[0]},{pt[1]}" for pt in hull_out) + ' Z',
+                line=dict(color='red'),
+                fillcolor='red',
+                opacity=0.1
+            ))
+        
+        # --- View 2: Segments (by cluster_labels)
+        segments_traces = []
+        shapes_segments = []
+        for cl in unique_clusters:
+            group = radar_cycle[radar_cycle['cluster_labels'] == cl]
+            if group.empty:
+                continue
+            trace = go.Scatter(
+                x=group['y'],
+                y=group['x'],
+                mode='markers',
+                marker=dict(size=3, color=cluster_color_map.get(cl, 'grey')),
+                name=f'Cluster {cl}'
+            )
+            segments_traces.append(trace)
+            # Compute convex hull for these detections in this cycle.
+            cl_x = group['y'].values
+            cl_y = group['x'].values
+            hull = compute_convex_hull(cl_x, cl_y)
+            if len(hull) >= 3:
+                hull = np.array(hull)
+                shapes_segments.append(dict(
+                    type='path',
+                    path='M ' + ' L '.join(f"{pt[0]},{pt[1]}" for pt in hull) + ' Z',
+                    line=dict(color=cluster_color_map.get(cl, 'grey')),
+                    fillcolor=cluster_color_map.get(cl, 'grey'),
+                    opacity=0.1
+                ))
+        
+        # --- View 3: Final Segments (by combination of cluster and InsideOutsideLabels)
+        final_traces = []
+        shapes_final = []
+        # Also, for each cycle, for detections that are inside and predicted as True Target (assume final_labels argmax == 0),
+        # we draw a thin line connecting them with the GT point.
+        # We'll assume that a detection’s final predicted class is np.argmax(final_labels).
+        inside_true_x = []
+        inside_true_y = []
+        for (io_label, cl), group in radar_cycle.groupby(['InsideOutsideLabels', 'cluster_labels']):
+            trace = go.Scatter(
+                x=group['y'],
+                y=group['x'],
+                mode='markers',
+                marker=dict(size=3, color=final_color_map.get((io_label, cl), 'grey')),
+                name=f'{io_label}-{cl}'
+            )
+            final_traces.append(trace)
+            # Compute freeform shape for the group.
+            pts_x = group['y'].values
+            pts_y = group['x'].values
+            hull = compute_convex_hull(pts_x, pts_y)
+            if len(hull) >= 3:
+                hull = np.array(hull)
+                shapes_final.append(dict(
+                    type='path',
+                    path='M ' + ' L '.join(f"{pt[0]},{pt[1]}" for pt in hull) + ' Z',
+                    line=dict(color=final_color_map.get((io_label, cl), 'grey')),
+                    fillcolor=final_color_map.get((io_label, cl), 'grey'),
+                    opacity=0.1
+                ))
+            # If group is "inside" and if the majority final label (argmax over final_labels) equals 0,
+            # then add these points to a separate list for drawing connecting lines.
+            # We compute argmax for each detection and take the mode.
+            preds = group['final_labels'].apply(lambda fl: np.argmax(fl)).values
+            if io_label == 'inside' and (preds == 0).sum() > 0.5 * len(preds):
+                inside_true_x.extend(group['y'].tolist())
+                inside_true_y.extend(group['x'].tolist())
+        
+        # For final view, add a thin line connecting the inside-true detections to GT (if any)
+        line_trace = None
+        if inside_true_x and inside_true_y:
+            # Draw line from GT to the mean of the inside_true detections.
+            mean_x = np.mean(inside_true_x)
+            mean_y = np.mean(inside_true_y)
+            line_trace = go.Scatter(
+                x=[gt_x, mean_x],
+                y=[gt_y, mean_y],
+                mode='lines',
+                line=dict(color='black', width=1),
+                name='Target Link'
+            )
+        
+        # Build a frame for this cycle: include all traces but set visibility later via buttons.
+        frame_data = [
+            # For view 1:
+            trace_inout, trace_gt,
+            # For view 2:
+            *segments_traces,
+            # For view 3:
+            *final_traces
+        ]
+        # We pack the freeform shapes for each view as custom properties in the frame.
+        frame_shapes = {
+            'inout': shapes_inout,
+            'segments': shapes_segments,
+            'final': shapes_final,
+            'final_line': [line_trace] if line_trace is not None else []
+        }
+        frames.append(dict(name=str(cycle), data=frame_data, customdata=frame_shapes))
+    
+    # Build slider steps
+    slider_steps = []
+    for cycle in cycles:
+        step = dict(label=str(cycle),
+                    method='animate',
+                    args=[[str(cycle)],
+                          {"frame": {"duration": 0, "redraw": True},
+                           "mode": "immediate"}])
+        slider_steps.append(step)
+    
+    # Create initial frame using first cycle.
+    init_frame = frames[0]
+    init_shapes = init_frame.get('customdata', {})
+    
+    # Create buttons to toggle among the three views.
+    # For each view, we will update the 'visible' property of traces and update layout.shapes.
+    updatemenus = [
+        dict(
+            type="buttons",
+            direction="left",
+            x=0.1,
+            y=1.15,
+            buttons=list([
+                dict(
+                    label="InOut",
+                    method="update",
+                    args=[{"visible": [True, True] + [False]*(len(init_frame['data'])-2)},
+                          {"title": "InOut View",
+                           "shapes": init_shapes.get('inout', [])}]
+                ),
+                dict(
+                    label="Segments",
+                    method="update",
+                    args=[{"visible": [False, True] + [True]*(len(init_frame['data'])-2)},
+                          {"title": "Segments View",
+                           "shapes": init_shapes.get('segments', [])}]
+                ),
+                dict(
+                    label="Final Segments",
+                    method="update",
+                    args=[{"visible": [False, True] + [True]*(len(init_frame['data'])-2)},
+                          {"title": "Final Segments View",
+                           "shapes": init_shapes.get('final', []) + (init_shapes.get('final_line', []))}]
+                )
+            ]),
+            pad={"r": 10, "t": 10},
+            showactive=True
+        )
+    ]
+    
+    # Build the overall layout.
+    layout = go.Layout(
+        title="Radar Segmentation Results",
+        xaxis=dict(title="X (m)"),  # Remember: X axis shows radar y-values
+        yaxis=dict(title="Y (m)"),  # Y axis shows radar x-values
+        updatemenus=updatemenus,
+        sliders=[dict(
+            active=0,
+            currentvalue={"prefix": "Cycle: "},
+            pad={"t": 50},
+            steps=slider_steps
+        )],
+        showlegend=True
+    )
+    
+    # Create the initial data for the first cycle.
+    fig = go.Figure(
+        data=init_frame['data'],
+        layout=layout,
+        frames=frames
+    )
+    
+    # Set initial layout shapes for the default view ("InOut")
+    fig.layout.shapes = init_shapes.get('inout', [])
+    
+    # Save the figure as HTML (do not call fig.show())
+    fig.write_html(output_html)
+    print(f"Interactive segmentation plot saved as {output_html}")
+
+# Example usage:
+# visualize_segmentation_interactive_v2(dfRadar, dfGND, output_html='my_segmentation.html')
+
