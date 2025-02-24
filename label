@@ -1,0 +1,494 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+import plotly.graph_objects as go
+
+##############################
+# Utility Functions
+##############################
+def polar_to_cartesian(r, theta):
+    """
+    Convert polar coordinates (r, theta) to Cartesian (x, y).
+    :param r: scalar or np.array (range)
+    :param theta: scalar or np.array (azimuth, in radians)
+    :return: tuple (x, y)
+    """
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+    return x, y
+
+##############################
+# Data Loading and Preprocessing
+##############################
+def load_data(testcase_folder):
+    """
+    Load radar.ftr, gnd.ftr and ego.ftr from the given test case folder.
+    Assumes:
+      - gnd.ftr contains columns: 'cycle_no', 'distX', 'distY', 'VrelX', 'VrelY'
+      - radar.ftr contains columns: 'radar_cycle_no', 'RadialRange', 'azimuth_angle', plus quality features
+      - ego.ftr is not used further (since kinematics are relative to ego).
+    """
+    ftr_dir = os.path.join(testcase_folder, 'ftr')
+    gnd_path = os.path.join(ftr_dir, 'gnd.ftr')
+    radar_path = os.path.join(ftr_dir, 'radar.ftr')
+    
+    gnd_df = pd.read_feather(gnd_path)
+    radar_df = pd.read_feather(radar_path)
+    
+    # For consistency, ensure cycle columns are named properly.
+    # (e.g., 'cycle_no' in gnd_df and 'radar_cycle_no' in radar_df)
+    return radar_df, gnd_df
+
+def compute_gt_bounding_box(gnd_df, target_type=None):
+    """
+    For each cycle, compute an elliptical bounding box around the GT centroid.
+    Here, we assume the GT centroid is given by (distX, distY).
+    The ellipse is defined by its major axis a and minor axis b.
+    In a real system, these could be learned from data.
+    For this prototype, we set them as follows:
+       - If target_type is provided, use a dictionary mapping type to (a, b).
+       - Otherwise, estimate a and b from the dispersion of radar detections relative to GT.
+       
+    For simplicity, we add two columns to gnd_df: 'a_bound' and 'b_bound'.
+    """
+    # Example fixed values for different target types.
+    target_bounds = {
+        'PED': (2.0, 1.0),         # Pedestrian: smaller ellipse
+        'BIC': (3.0, 1.5),         # Bicycle: slightly larger
+        'CAR': (5.0, 3.0),         # Car: larger ellipse
+        'MOTOBIKE': (4.0, 2.5),     # Motorbike
+        'MINIVAN': (6.0, 4.0)       # Minivan
+    }
+    
+    if target_type is not None and target_type in target_bounds:
+        a, b = target_bounds[target_type]
+        gnd_df['a_bound'] = a
+        gnd_df['b_bound'] = b
+    else:
+        # If not provided, use a default value.
+        gnd_df['a_bound'] = 5.0
+        gnd_df['b_bound'] = 3.0
+    return gnd_df
+
+def point_in_ellipse(point, center, a, b):
+    """
+    Check whether a 2D point is inside an ellipse.
+    Ellipse is centered at 'center' with major axis a and minor axis b, aligned with the axes.
+    Equation: ((x - x0)/a)^2 + ((y - y0)/b)^2 <= 1.
+    """
+    x, y = point
+    x0, y0 = center
+    return ((x - x0) / a)**2 + ((y - y0) / b)**2 <= 1
+
+##############################
+# Step 2B: Automated Label Generation
+##############################
+def rule_based_labeling(radar_df, gnd_df):
+    """
+    For each radar detection in each cycle, assign a set of soft scores for 5 classes:
+      1. True Target (TT)
+      2. Ground/Road Reflections (GR)
+      3. Stationary Structures/Vehicles (SS)
+      4. Clutter & Ghost Detections (CG)
+      5. Mirror Detections (M)
+      
+    We assume that:
+      - A dynamic elliptical bounding box (with parameters a_bound and b_bound) is defined for each cycle from gnd_df.
+      - We also have available kinematic features: radar detections have estimated velocity (which for this prototype we simulate as a column 'vel', if not, we assume it exists).
+      - Quality features (SNR, RCS, etc.) are available as part of the feature vector.
+      
+    This function computes, for each detection in radar_df, a soft label vector P = [P_TT, P_GR, P_SS, P_CG, P_M] using continuous penalty functions.
+    
+    For simplicity, we assume that:
+      - For detections inside the bounding box, the velocity difference relative to the GT (from gnd_df) is used.
+      - For detections outside, the spatial distance from the GT is used.
+      
+    We use a softmax over negative penalties to yield probabilities.
+    """
+    # Create an empty list to store label results.
+    # We assume radar_df has 'radar_cycle_no', and gnd_df has 'cycle_no', 'distX', 'distY', and the bounds 'a_bound', 'b_bound'.
+    labels = []
+    # Create a dictionary for quick GT lookup.
+    gt_dict = {row['cycle_no']: row for idx, row in gnd_df.iterrows()}
+    
+    # For each radar detection:
+    for idx, row in radar_df.iterrows():
+        cycle = row['radar_cycle_no']
+        if cycle not in gt_dict:
+            # If no GT exists for this cycle, assign uniform probabilities.
+            labels.append([0.2] * 5)
+            continue
+        
+        gt_row = gt_dict[cycle]
+        gt_center = np.array([gt_row['distX'], gt_row['distY']])
+        a_bound = gt_row['a_bound']
+        b_bound = gt_row['b_bound']
+        
+        # Convert radar detection from polar to Cartesian:
+        r_val = row['RadialRange']
+        theta_val = row['azimuth_angle']
+        x_radar, y_radar = polar_to_cartesian(r_val, theta_val)
+        radar_point = np.array([x_radar, y_radar])
+        # Compute spatial distance from GT:
+        dist = np.linalg.norm(radar_point - gt_center)
+        
+        # Assume that a soft velocity difference is available.
+        # For this prototype, assume radar_df has column 'vel' and GT has VrelX and VrelY.
+        if 'vel' in radar_df.columns:
+            radar_vel = row['vel']
+        else:
+            # If not available, use a placeholder value (e.g., 0)
+            radar_vel = 0.0
+        gt_vel = np.sqrt(gt_row['VrelX']**2 + gt_row['VrelY']**2)
+        vel_diff = abs(radar_vel - gt_vel)
+        
+        # Quality vector: assume radar_df has quality columns, e.g., 'SNR' and 'RCS'
+        quality_vec = np.array([row.get('SNR', 0.0), row.get('RCS', 0.0)])
+        # For simplicity, let the "ideal" quality for true target be the average quality of detections inside the bound
+        # (This would be computed from training data; here we use a dummy vector)
+        ideal_quality = np.array([20.0, 0.5])
+        quality_diff = np.linalg.norm(quality_vec - ideal_quality)
+        
+        # Now, define continuous penalty functions.
+        # For spatial penalty:
+        # We want a lower penalty if the detection is inside the ellipse.
+        inside_ellipse = point_in_ellipse(radar_point, gt_center, a_bound, b_bound)
+        if inside_ellipse:
+            spatial_penalty = dist / max(a_bound, b_bound)  # normalized distance
+        else:
+            spatial_penalty = (dist - max(a_bound, b_bound)) / max(a_bound, b_bound)
+        
+        # For velocity penalty: lower if radar velocity is close to GT velocity.
+        # We normalize by a learned scale sigma_v. Here we assume sigma_v is 1.0 for simplicity.
+        sigma_v = 1.0
+        vel_penalty = vel_diff / sigma_v
+        
+        # For quality penalty:
+        quality_penalty = quality_diff  # already a nonnegative number
+        
+        # Now, assign soft penalties for each class.
+        # For True Target (TT): low spatial penalty and low velocity penalty are desirable.
+        L_TT = spatial_penalty + vel_penalty + quality_penalty * 0.5
+        
+        # For Ground/Road Reflections (GR): these might be inside the box but with near-zero velocity.
+        L_GR = spatial_penalty + abs(radar_vel)  # if radar_vel is near zero, then this penalty is low.
+        
+        # For Stationary Structures/Vehicles (SS): these are likely to appear outside the tight bound,
+        # and their velocity is near zero, but quality might be typical.
+        L_SS = spatial_penalty + (1 - np.tanh(vel_penalty))
+        
+        # For Clutter & Ghost Detections (CG): these may have high variability in quality.
+        L_CG = quality_penalty + spatial_penalty * 0.5
+        
+        # For Mirror Detections (M): these mimic true target kinematics but are spatially offset.
+        L_M = abs(spatial_penalty - 0.5) + vel_penalty  # example: if spatial penalty is around 0.5, then L_M is low.
+        
+        # Combine penalties into a vector.
+        penalties = np.array([L_TT, L_GR, L_SS, L_CG, L_M])
+        # Convert to soft probabilities using a softmax over negative penalties.
+        probs = np.exp(-penalties) / np.sum(np.exp(-penalties))
+        labels.append(probs.tolist())
+    
+    # Add a new column to radar_df with the weak labels.
+    radar_df = radar_df.copy()
+    radar_df['weak_labels'] = labels  # each entry is a list of 5 probabilities.
+    return radar_df
+
+##############################
+# Latent Clustering Refinement (Optional)
+##############################
+def latent_clustering_refinement(radar_df, n_clusters=5):
+    """
+    Given the radar_df with the full feature vector per detection, perform latent clustering
+    using KMeans on the features. For demonstration, we use the following features:
+         [RadialRange, azimuth_angle, vel, SNR, RCS]
+    (If any are missing, they are replaced by 0.)
+    
+    The cluster assignments are then converted into a one-hot vector and then normalized
+    (as soft probabilities). This serves as an independent set of weak labels.
+    
+    Returns: a new column 'cluster_labels' in radar_df (list of probabilities).
+    """
+    features = []
+    for idx, row in radar_df.iterrows():
+        # Extract features, defaulting to 0 if not present.
+        f1 = row.get('RadialRange', 0.0)
+        f2 = row.get('azimuth_angle', 0.0)
+        f3 = row.get('vel', 0.0)
+        f4 = row.get('SNR', 0.0)
+        f5 = row.get('RCS', 0.0)
+        features.append([f1, f2, f3, f4, f5])
+    X = np.array(features)
+    
+    # Normalize features (zero mean, unit variance)
+    X_mean = np.mean(X, axis=0)
+    X_std = np.std(X, axis=0) + 1e-6
+    X_norm = (X - X_mean) / X_std
+    
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42).fit(X_norm)
+    cluster_assignments = kmeans.labels_
+    
+    # Convert cluster assignments to one-hot vectors, then smooth them as soft labels.
+    cluster_probs = []
+    for c in cluster_assignments:
+        one_hot = np.zeros(n_clusters)
+        one_hot[c] = 1.0
+        # For smoothing, we can add a small constant and renormalize.
+        smooth = one_hot + 0.1
+        smooth = smooth / smooth.sum()
+        cluster_probs.append(smooth.tolist())
+        
+    radar_df = radar_df.copy()
+    radar_df['cluster_labels'] = cluster_probs  # each is a list of length n_clusters.
+    return radar_df
+
+##############################
+# Combine Rule-Based and Latent Clustering Labels
+##############################
+def combine_labels(radar_df, gamma=0.7):
+    """
+    Combine the weak labels from rule-based labeling ('weak_labels') and from latent clustering ('cluster_labels').
+    For simplicity, we map the clustering labels (which are of length n_clusters) into our 5 target classes by a learned mapping.
+    Here, we assume a mapping matrix M of shape (n_clusters, 5) is learned (or fixed via cross-validation).
+    
+    For demonstration, we define M arbitrarily (in practice, one would learn M via a small validation set).
+    
+    Then the combined label is given by:
+       P_final = gamma * P_rule + (1 - gamma) * (M^T * P_cluster)
+       
+    Returns: radar_df with a new column 'final_labels'.
+    """
+    # Suppose n_clusters = 5 from latent clustering.
+    M = np.array([
+        [0.9, 0.05, 0.02, 0.02, 0.01],  # Cluster 0 is mostly True Target
+        [0.1, 0.7, 0.1, 0.05, 0.05],     # Cluster 1 is mostly Ground/Road Reflection
+        [0.05, 0.1, 0.7, 0.1, 0.05],     # Cluster 2 is mostly Stationary Structures/Vehicles
+        [0.05, 0.1, 0.1, 0.7, 0.05],     # Cluster 3 is mostly Clutter/Ghost
+        [0.05, 0.05, 0.05, 0.05, 0.8]    # Cluster 4 is mostly Mirror
+    ])  # shape (5,5)
+    
+    final_labels = []
+    for idx, row in radar_df.iterrows():
+        rule_label = np.array(row['weak_labels'])  # length 5
+        cluster_label = np.array(row['cluster_labels'])  # length 5 (n_clusters)
+        # Map cluster labels to our 5 classes:
+        mapped = M.T.dot(cluster_label)  # result is length 5.
+        # Combine:
+        combined = gamma * rule_label + (1 - gamma) * mapped
+        # Normalize:
+        combined = combined / np.sum(combined)
+        final_labels.append(combined.tolist())
+    
+    radar_df = radar_df.copy()
+    radar_df['final_labels'] = final_labels  # each entry is a list of 5 probabilities.
+    return radar_df
+
+##############################
+# Visualization Function
+##############################
+def visualize_segmentation(radar_df, gnd_df, output_html='segmentation_results.html'):
+    """
+    Create an interactive Plotly HTML plot that shows the segmentation results.
+    Four views are provided (switchable via buttons):
+      1. The segmentation into two segments (Inside vs. Outside the GT bounding box).
+      2. The rule-based labeling results.
+      3. The latent clustering results.
+      4. The final combined weak labels.
+      
+    A slider at the bottom allows you to move through sensor cycles.
+    Each plot shows radar detections and the GT centroid (from gnd_df) for that cycle.
+    
+    Assumes:
+       - gnd_df has columns: 'cycle_no', 'distX', 'distY'
+       - radar_df has 'radar_cycle_no', and Cartesian coordinates: 'x', 'y'
+       - The radar_df contains the columns: 'weak_labels', 'cluster_labels', 'final_labels'
+    """
+    # Ensure ground truth is sorted by cycle_no.
+    gnd_df = gnd_df.sort_values('cycle_no').reset_index(drop=True)
+    radar_df = radar_df.sort_values('radar_cycle_no').reset_index(drop=True)
+    
+    cycles = sorted(gnd_df['cycle_no'].unique())
+    
+    # Prepare frames for each cycle.
+    frames = []
+    for cycle in cycles:
+        # Ground truth for cycle
+        gt_row = gnd_df[gnd_df['cycle_no'] == cycle]
+        if gt_row.empty:
+            continue
+        gt_x = gt_row['distX'].values[0]
+        gt_y = gt_row['distY'].values[0]
+        # Radar detections for cycle:
+        radar_cycle = radar_df[radar_df['radar_cycle_no'] == cycle]
+        # For each view, we prepare different color coding:
+        # View 1: Inside vs. Outside segmentation
+        # We need to know for each radar detection whether it is inside the elliptical bound.
+        # For this demo, we assume that gnd_df has 'a_bound' and 'b_bound' columns.
+        inside_points_x, inside_points_y = [], []
+        outside_points_x, outside_points_y = [], []
+        for idx, r_row in radar_cycle.iterrows():
+            r_val = r_row['RadialRange']
+            theta_val = r_row['azimuth_angle']
+            x, y = polar_to_cartesian(r_val, theta_val)
+            point = np.array([x, y])
+            gt_center = np.array([gt_x, gt_y])
+            a_bound = gt_row['a_bound'].values[0] if 'a_bound' in gt_row.columns else 5.0
+            b_bound = gt_row['b_bound'].values[0] if 'b_bound' in gt_row.columns else 3.0
+            if point_in_ellipse(point, gt_center, a_bound, b_bound):
+                inside_points_x.append(x)
+                inside_points_y.append(y)
+            else:
+                outside_points_x.append(x)
+                outside_points_y.append(y)
+        
+        # View 2: Rule-based labeling: color each point by the highest probability class from 'weak_labels'
+        rule_colors = []
+        for idx, r_row in radar_cycle.iterrows():
+            probs = np.array(r_row['weak_labels'])
+            cls = np.argmax(probs)
+            # Define a color map for 5 classes:
+            color_map = ['green', 'orange', 'purple', 'brown', 'pink']
+            rule_colors.append(color_map[cls])
+        
+        # View 3: Latent clustering results: use cluster_labels
+        cluster_colors = []
+        for idx, r_row in radar_cycle.iterrows():
+            probs = np.array(r_row['cluster_labels'])
+            cls = np.argmax(probs)
+            color_map = ['green', 'orange', 'purple', 'brown', 'pink']
+            cluster_colors.append(color_map[cls])
+        
+        # View 4: Final combined weak labels:
+        final_colors = []
+        for idx, r_row in radar_cycle.iterrows():
+            probs = np.array(r_row['final_labels'])
+            cls = np.argmax(probs)
+            color_map = ['green', 'orange', 'purple', 'brown', 'pink']
+            final_colors.append(color_map[cls])
+        
+        # Prepare a frame with all views hidden initially; we will use buttons to toggle views.
+        frame_data = [
+            # View 1: Inside vs. Outside segmentation
+            dict(type='scatter', x=inside_points_x, y=inside_points_y,
+                 mode='markers', marker=dict(color='blue', size=2),
+                 name='Inside'),
+            dict(type='scatter', x=outside_points_x, y=outside_points_y,
+                 mode='markers', marker=dict(color='red', size=2),
+                 name='Outside'),
+            # View 2: Rule-based labels (use radar_cycle x,y and color by rule_colors)
+            dict(type='scatter', x=radar_cycle['x'].tolist(), y=radar_cycle['y'].tolist(),
+                 mode='markers', marker=dict(color=rule_colors, size=2),
+                 name='Rule-based'),
+            # View 3: Latent clustering labels
+            dict(type='scatter', x=radar_cycle['x'].tolist(), y=radar_cycle['y'].tolist(),
+                 mode='markers', marker=dict(color=cluster_colors, size=2),
+                 name='Clustering'),
+            # View 4: Final combined weak labels
+            dict(type='scatter', x=radar_cycle['x'].tolist(), y=radar_cycle['y'].tolist(),
+                 mode='markers', marker=dict(color=final_colors, size=2),
+                 name='Final Labels'),
+            # Ground Truth for cycle
+            dict(type='scatter', x=[gt_x], y=[gt_y],
+                 mode='markers', marker=dict(color='black', size=4, symbol='diamond'),
+                 name='Ground Truth')
+        ]
+        frames.append(dict(name=str(cycle), data=frame_data))
+    
+    # Build slider steps for each cycle.
+    steps = []
+    for cycle in cycles:
+        step = dict(label=str(cycle),
+                    method='animate',
+                    args=[[str(cycle)],
+                          {"frame": {"duration": 0, "redraw": True},
+                           "mode": "immediate"}])
+        steps.append(step)
+    
+    # Build updatemenus for toggling between views.
+    # We assume initially we show View 1 (Inside/Outside segmentation) plus GT.
+    updatemenus = [
+        dict(
+            type='buttons',
+            direction='left',
+            buttons=list([
+                dict(label="Inside/Outside",
+                     method="update",
+                     args=[{"visible": [True, True, False, False, False, True]},
+                           {"title": "Inside vs. Outside Segmentation"}]),
+                dict(label="Rule-Based",
+                     method="update",
+                     args=[{"visible": [False, False, True, False, False, True]},
+                           {"title": "Rule-Based Labeling"}]),
+                dict(label="Latent Clustering",
+                     method="update",
+                     args=[{"visible": [False, False, False, True, False, True]},
+                           {"title": "Latent Clustering Labels"}]),
+                dict(label="Final Labels",
+                     method="update",
+                     args=[{"visible": [False, False, False, False, True, True]},
+                           {"title": "Final Combined Labels"}])
+            ]),
+            pad={"r": 10, "t": 10},
+            showactive=True,
+            x=0.1,
+            xanchor="left",
+            y=1.15,
+            yanchor="top"
+        )
+    ]
+    
+    layout = go.Layout(
+        title="Radar Segmentation Results",
+        xaxis=dict(title="X (m)"),
+        yaxis=dict(title="Y (m)"),
+        updatemenus=updatemenus,
+        sliders=[dict(
+            active=0,
+            currentvalue={"prefix": "Cycle: "},
+            pad={"t": 50},
+            steps=steps
+        )],
+        showlegend=True
+    )
+    
+    fig = go.Figure(data=frames[0]['data'], layout=layout, frames=frames)
+    fig.write_html(output_html)
+    print(f"Segmentation visualization saved as {output_html}")
+
+##############################
+# Main Function to Execute Pipeline
+##############################
+def main():
+    # Assume a single test case folder for demonstration.
+    testcase_folder = './testcase_example'  # Adjust this path
+    radar_df, gnd_df = load_data(testcase_folder)
+    
+    # Compute dynamic bounding boxes for ground truth based on target type.
+    # For this example, assume target type is provided as 'CAR'
+    gnd_df = compute_gt_bounding_box(gnd_df, target_type='CAR')
+    
+    # Assume that radar detections have already been preprocessed and aligned.
+    # Convert radar detections from polar to Cartesian if not already done.
+    if 'x' not in radar_df.columns or 'y' not in radar_df.columns:
+        x_vals, y_vals = polar_to_cartesian(radar_df['RadialRange'].values, radar_df['azimuth_angle'].values)
+        radar_df['x'] = x_vals
+        radar_df['y'] = y_vals
+    
+    # Step 2B.1: Rule-Based Labeling to produce initial weak labels.
+    radar_df = rule_based_labeling(radar_df, gnd_df)
+    
+    # Step 2B.2: Latent Clustering Refinement (optional)
+    radar_df = latent_clustering_refinement(radar_df, n_clusters=5)
+    
+    # Step 2B.3: Combine the two sets of labels to produce final weak labels.
+    radar_df = combine_labels(radar_df, gamma=0.7)
+    
+    # Save final radar_df with weak labels back to file (if desired)
+    radar_df.to_feather(os.path.join(testcase_folder, 'ftr', 'radar_final_labels.ftr'))
+    
+    # Visualization: create interactive HTML plot
+    visualize_segmentation(radar_df, gnd_df, output_html='segmentation_results.html')
+
+if __name__ == '__main__':
+    main()
