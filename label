@@ -833,3 +833,172 @@ def visualize_segmentation_interactive_v2(dfRadar, dfGND, output_html='segmentat
 # Example usage:
 # visualize_segmentation_interactive_v2(dfRadar, dfGND, output_html='my_segmentation.html')
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+from scipy.spatial import ConvexHull
+import plotly.graph_objects as go
+
+def compute_convex_hull(x_coords, y_coords):
+    """
+    Compute the convex hull of points given by x_coords and y_coords.
+    Returns a list of (x, y) tuples representing the hull vertices in order.
+    If fewer than 3 points exist, returns the original points.
+    """
+    points = np.column_stack((x_coords, y_coords))
+    if len(points) < 3:
+        return points.tolist()
+    try:
+        hull = ConvexHull(points)
+        hull_points = points[hull.vertices]
+        return hull_points.tolist()
+    except Exception:
+        return points.tolist()
+
+def visualize_segments(dfRadar, dfGND, output_html='segments_view.html'):
+    """
+    Create an interactive Plotly HTML plot for the "Segments" view.
+    
+    Requirements:
+      - dfRadar must contain columns: 'cycle_no', 'x', 'y', 'cluster_labels'.
+      - dfGND must contain columns: 'cycle_no', 'distX', 'distY'.
+      - Coordinates are swapped: radar 'x' (from dfRadar) is plotted on the Y-axis and
+        radar 'y' on the X-axis; for GT, distY is on X-axis and distX on Y-axis.
+      - For each cycle, detections are grouped by 'cluster_labels'. For each cluster,
+        a freeform shape (convex hull) is drawn that contains only those points.
+      - A slider is provided to change cycles (no automatic animation).
+      - Scatter marker size is set to 3.
+      - The freeform shapes have opacity 0.1 and share their boundary color.
+      - Each frame shows both radar detections for that cycle (colored by cluster)
+        and the ground truth point.
+    
+    The function saves the plot as an HTML file.
+    """
+    # Ensure data is sorted by cycle_no
+    dfRadar = dfRadar.sort_values('cycle_no').reset_index(drop=True)
+    dfGND = dfGND.sort_values('cycle_no').reset_index(drop=True)
+    
+    # Get unique cycles (assuming dfGND and dfRadar use same cycle numbers)
+    cycles = sorted(dfGND['cycle_no'].unique())
+    
+    # Define a color map for clusters.
+    # Here we assume cluster_labels are integers; we map them to distinct colors.
+    unique_clusters = sorted(dfRadar['cluster_labels'].unique())
+    default_colors = ['green', 'orange', 'purple', 'brown', 'pink', 'cyan', 'magenta']
+    cluster_color_map = {cl: default_colors[i % len(default_colors)] for i, cl in enumerate(unique_clusters)}
+    
+    # Prepare frames: one frame per cycle.
+    frames = []
+    for cycle in cycles:
+        # Ground truth: for this cycle, get GT point from dfGND.
+        gt_row = dfGND[dfGND['cycle_no'] == cycle]
+        if gt_row.empty:
+            continue
+        # Swap axes: use distY for x-axis, distX for y-axis.
+        gt_x = gt_row['distY'].values[0]
+        gt_y = gt_row['distX'].values[0]
+        trace_gt = go.Scatter(
+            x=[gt_x],
+            y=[gt_y],
+            mode='markers',
+            marker=dict(color='black', size=3, symbol='diamond'),
+            name='Ground Truth'
+        )
+        
+        # Radar detections: select all rows in dfRadar for this cycle.
+        radar_cycle = dfRadar[dfRadar['cycle_no'] == cycle]
+        # For each unique cluster in this cycle, extract points and compute convex hull.
+        cluster_traces = []
+        shapes = []
+        for cl in unique_clusters:
+            group = radar_cycle[radar_cycle['cluster_labels'] == cl]
+            if group.empty:
+                continue
+            # Swap axes: radar 'y' goes to x-axis, radar 'x' goes to y-axis.
+            xs = group['y'].values
+            ys = group['x'].values
+            trace = go.Scatter(
+                x=xs,
+                y=ys,
+                mode='markers',
+                marker=dict(color=cluster_color_map[cl], size=3),
+                name=f'Cluster {cl}'
+            )
+            cluster_traces.append(trace)
+            # Compute convex hull for these points
+            hull_pts = compute_convex_hull(xs, ys)
+            if len(hull_pts) >= 3:
+                # Build SVG path string for freeform shape.
+                path = "M " + " L ".join(f"{pt[0]},{pt[1]}" for pt in hull_pts) + " Z"
+                shape = dict(
+                    type="path",
+                    path=path,
+                    line=dict(color=cluster_color_map[cl]),
+                    fillcolor=cluster_color_map[cl],
+                    opacity=0.1
+                )
+                shapes.append(shape)
+        
+        # Combine all traces for this cycle
+        frame_data = [trace_gt] + cluster_traces
+        frames.append(dict(name=str(cycle), data=frame_data, layout=dict(shapes=shapes)))
+    
+    # Create slider steps for each cycle.
+    slider_steps = []
+    for cycle in cycles:
+        step = dict(
+            label=str(cycle),
+            method="animate",
+            args=[[str(cycle)], {"frame": {"duration": 0, "redraw": True},
+                                 "mode": "immediate"}]
+        )
+        slider_steps.append(step)
+    
+    # Build layout (non-animated base view will be that of the first cycle).
+    initial_cycle = str(cycles[0])
+    initial_frame = frames[0]
+    layout = go.Layout(
+        title="Segments View (By Cluster)",
+        xaxis=dict(title="X (m)"),
+        yaxis=dict(title="Y (m)"),
+        sliders=[dict(
+            active=0,
+            currentvalue={"prefix": "Cycle: "},
+            pad={"t": 50},
+            steps=slider_steps
+        )],
+        showlegend=True
+    )
+    
+    fig = go.Figure(
+        data=initial_frame['data'],
+        layout=layout,
+        frames=frames
+    )
+    # Set initial shapes from the first cycle.
+    fig.layout.shapes = initial_frame['layout'].get('shapes', [])
+    
+    # Save figure to HTML (do not automatically show it)
+    fig.write_html(output_html)
+    print(f"Segments view visualization saved as {output_html}")
+
+# Example usage:
+# visualize_segments(dfRadar, dfGND, output_html='segments_view.html')
+
+
