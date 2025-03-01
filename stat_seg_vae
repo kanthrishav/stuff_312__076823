@@ -1,0 +1,195 @@
+import os
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import torch
+from torch import nn, optim
+from torch.distributions import Normal, Categorical
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from tqdm import tqdm
+
+#####################################
+# GMVAE MODEL DEFINITION
+#####################################
+class GMVAE(nn.Module):
+    def __init__(self, input_dim, latent_dim=5, num_components=2):
+        super(GMVAE, self).__init__()
+        self.latent_dim = latent_dim
+        self.num_components = num_components
+
+        # Encoder (Inference Network)
+        self.encoder_fc = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
+        self.mean_fc = nn.Linear(64, latent_dim)
+        self.logvar_fc = nn.Linear(64, latent_dim)
+        self.q_c = nn.Linear(64, num_components)  # Cluster assignment logits
+
+        # Decoder (Generative Network)
+        self.decoder_fc = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, input_dim)  # Output reconstructs original input
+        )
+
+        # Gaussian Mixture Prior Parameters
+        self.gmm = GaussianMixture(n_components=num_components, covariance_type='full')
+
+    def encode(self, x):
+        hidden = self.encoder_fc(x)
+        q_c_logits = self.q_c(hidden)
+        q_c = Categorical(logits=q_c_logits)
+        mean = self.mean_fc(hidden)
+        logvar = self.logvar_fc(hidden)
+        std = torch.exp(0.5 * logvar)
+        return mean, std, q_c
+
+    def decode(self, z):
+        return self.decoder_fc(z)
+
+    def reparameterize(self, mean, std):
+        eps = torch.randn_like(std)
+        return mean + eps * std
+
+    def loss_function(self, x, x_recon, mean, logvar, q_c):
+        recon_loss = nn.MSELoss()(x_recon, x)
+        kl_div = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
+        cat_loss = torch.sum(q_c.log_prob(q_c.probs))
+        return recon_loss + kl_div + cat_loss
+
+    def train_gmvae(self, X, epochs=50, lr=1e-3):
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+        X_tensor = torch.tensor(X, dtype=torch.float32)
+
+        for epoch in tqdm(range(epochs), desc="Training GMVAE"):
+            optimizer.zero_grad()
+            mean, std, q_c = self.encode(X_tensor)
+            z = self.reparameterize(mean, std)
+            X_recon = self.decode(z)
+            loss = self.loss_function(X_tensor, X_recon, mean, torch.log(std**2), q_c)
+            loss.backward()
+            optimizer.step()
+
+        # Fit a GMM on the learned latent space
+        with torch.no_grad():
+            latent, _, _ = self.encode(X_tensor)
+        self.gmm.fit(latent.numpy())
+
+    def predict(self, X):
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32)
+            latent, _, _ = self.encode(X_tensor)
+        return self.gmm.predict(latent.numpy())
+
+#####################################
+# GMVAE CLASSIFICATION FUNCTION
+#####################################
+def classify_se_g_detections(dfRadar):
+    """
+    Train a GMVAE model and classify SE_G detections as either SE (real stationary) or GS (false detection).
+    """
+    # Select only SE_G detections
+    se_g_detections = dfRadar[dfRadar['labels'] == "SE_G"]
+
+    # Extract feature columns for GMVAE input
+    feature_cols = [
+        "Range", "Azimuth", "VrelRad", "SNR", "RCS",
+        "aa", "bb", "cc", "dd", "ee", "ff", "gg",
+        "RangeVar", "Azimuth var", "VrelRad var"
+    ]
+    X = se_g_detections[feature_cols].values
+
+    # Normalize data
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Train GMVAE model
+    gmvae = GMVAE(input_dim=X_scaled.shape[1])
+    gmvae.train_gmvae(X_scaled)
+
+    # Predict clusters
+    predictions = gmvae.predict(X_scaled)
+
+    # Assign labels based on GMM clustering
+    se_g_detections.loc[:, "labels"] = np.where(predictions == 0, "SE", "GS")
+
+    # Update original dataframe
+    dfRadar.update(se_g_detections)
+
+    return dfRadar
+
+#####################################
+# PLOTTING FUNCTION
+#####################################
+def plot_detections(dfRadar, dfGND, output_html):
+    """
+    Create a scatter plot of detections colored by class and save as an HTML file.
+    """
+    # Count detections for legend
+    counts = dfRadar["labels"].value_counts().to_dict()
+
+    # Define color mapping
+    color_map = {"TT": "red", "SE": "cyan", "GS": "orange", "G": "grey"}
+    data = []
+
+    # Add radar detections
+    for label, color in color_map.items():
+        subset = dfRadar[dfRadar["labels"] == label]
+        data.append(go.Scatter(
+            x=subset["Azimuth"], y=subset["Range"],
+            mode='markers', marker=dict(size=2, color=color),
+            name=f"{label} ({counts.get(label, 0)})"
+        ))
+
+    # Add ground truth trajectory
+    data.append(go.Scatter(
+        x=dfGND["Azimuth"], y=dfGND["Range"],
+        mode='markers+lines',
+        marker=dict(size=2, color="magenta"),
+        line=dict(width=1, color="magenta"),
+        name="Ground Truth"
+    ))
+
+    # Create figure
+    fig = go.Figure(data=data)
+    fig.update_layout(title="Detection Classification",
+                      xaxis_title="Azimuth",
+                      yaxis_title="Range",
+                      showlegend=True)
+    fig.write_html(output_html)
+    print(f"Plot saved: {output_html}")
+
+#####################################
+# MAIN FUNCTION TO PROCESS MULTIPLE TESTCASES
+#####################################
+def process_testcases(root_folder):
+    """
+    Process all test cases in the root folder.
+    """
+    testcases = [d for d in os.listdir(root_folder) if os.path.isdir(os.path.join(root_folder, d))]
+
+    for testcase in testcases:
+        print(f"Processing {testcase}...")
+        ftr_dir = os.path.join(root_folder, testcase, "ftr")
+
+        # Load data
+        dfRadar = pd.read_feather(os.path.join(ftr_dir, "radar.ftr"))
+        dfGND = pd.read_feather(os.path.join(ftr_dir, "gnd.ftr"))
+
+        # Perform GMVAE classification
+        dfRadar = classify_se_g_detections(dfRadar)
+
+        # Save updated dataframe
+        dfRadar.to_feather(os.path.join(ftr_dir, "radar_labeled.ftr"))
+
+        # Generate plot
+        plot_detections(dfRadar, dfGND, os.path.join(ftr_dir, "detections_plot.html"))
+
+# Run process on all testcases in a given root folder
+process_testcases("./testcases_root")
