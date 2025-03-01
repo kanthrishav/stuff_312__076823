@@ -1,0 +1,368 @@
+import os
+import numpy as np
+import pandas as pd
+from scipy.linalg import inv, det
+from numpy.linalg import norm
+import plotly.graph_objects as go
+
+#####################################
+# UTILITY FUNCTIONS
+#####################################
+def polar_to_cartesian(r, theta):
+    """Convert polar coordinates (r, theta) to Cartesian (x, y)."""
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+    return x, y
+
+def measurement_function(x_state):
+    """
+    Measurement function h(x): maps a target state in Cartesian coordinates to radar measurement space.
+    Input:
+      x_state: [x, y, v_x, v_y] (numpy array of shape (4,))
+    Returns:
+      h: measurement vector [range, azimuth, radial_velocity] (numpy array of shape (3,))
+    """
+    x, y, v_x, v_y = x_state
+    r = np.sqrt(x**2 + y**2)
+    theta = np.arctan2(y, x)
+    # Avoid division by zero:
+    if r < 1e-6:
+        r = 1e-6
+    v_r = (x*v_x + y*v_y) / r
+    return np.array([r, theta, v_r])
+
+def measurement_jacobian(x_state):
+    """
+    Compute the Jacobian matrix H of the measurement function h(x) at state x_state.
+    Input:
+      x_state: [x, y, v_x, v_y] (numpy array of shape (4,))
+    Returns:
+      H: Jacobian matrix of shape (3,4)
+    """
+    x, y, v_x, v_y = x_state
+    r = np.sqrt(x**2 + y**2)
+    r2 = r**2
+    # Avoid division by zero:
+    if r < 1e-6:
+        r = 1e-6
+        r2 = 1e-12
+
+    # Derivatives for range:
+    dr_dx = x / r
+    dr_dy = y / r
+
+    # Derivatives for azimuth:
+    dtheta_dx = -y / r2
+    dtheta_dy = x / r2
+
+    # Derivatives for radial velocity:
+    # Let v_r = (x v_x + y v_y)/r
+    dv_r_dx = (v_x * r - (x*v_x + y*v_y) * (x/r)) / r**2
+    dv_r_dy = (v_y * r - (x*v_x + y*v_y) * (y/r)) / r**2
+    dv_r_dvx = x / r
+    dv_r_dvy = y / r
+
+    H = np.array([
+        [dr_dx, dr_dy, 0, 0],
+        [dtheta_dx, dtheta_dy, 0, 0],
+        [dv_r_dx, dv_r_dy, dv_r_dvx, dv_r_dvy]
+    ])
+    return H
+
+#####################################
+# JPDA ASSOCIATION FUNCTION
+#####################################
+def perform_jpda_association(dfRadar, dfGND, d_max=5.0, lambda_val=0.1, beta_thresh=0.5):
+    """
+    For each sensor cycle, associate TT detections with the ground truth track using JPDA.
+    The ground truth state is taken directly from dfGND (columns: 'distX', 'distY', 'VrelX', 'VrelY').
+    Only radar detections in class TT (dfRadar column "TT" equal to "TT") are processed.
+    For each detection, compute the Mahalanobis distance and likelihood.
+    Then compute association probabilities and if a detection’s probability exceeds beta_thresh,
+    label that detection as "CTT" by setting a new column "CTT" to True.
+    
+    Inputs:
+      - dfRadar: DataFrame containing radar detections. Must have columns:
+                 "cycle_no", "TT", "RadialRange", "azimuth_angle", "v_r".
+      - dfGND: DataFrame containing ground truth states. Must have columns:
+                 "cycle_no", "distX", "distY", "VrelX", "VrelY".
+      - d_max: Gating threshold on Mahalanobis distance.
+      - lambda_val: Clutter density parameter.
+      - beta_thresh: Threshold on association probability for confirming detection.
+      
+    Returns:
+      - dfRadar: Updated DataFrame with a new column "CTT" (True for confirmed target detections).
+    """
+    # Set up constants and tuning parameters:
+    # Assume track state covariance is very low:
+    P_x = np.diag([0.1, 0.1, 0.05, 0.05])  # 4x4
+    # Measurement noise covariance (for radar measurements: range, azimuth, radial velocity)
+    sigma_r = 1.0
+    sigma_theta = 0.05
+    sigma_vr = 0.2
+    R_mat = np.diag([sigma_r**2, sigma_theta**2, sigma_vr**2])  # 3x3
+    
+    # Create dictionary for ground truth per cycle:
+    gt_dict = {}
+    for _, row in dfGND.iterrows():
+        cycle = row['cycle_no']
+        # Define GT state as [distX, distY, VrelX, VrelY]
+        gt_state = np.array([row['distX'], row['distY'], row['VrelX'], row['VrelY']])
+        gt_dict[cycle] = gt_state
+    
+    # We will add a new column "CTT" to dfRadar.
+    dfRadar = dfRadar.copy()
+    CTT_flags = []  # List to store association flag for each detection.
+    
+    # Process each detection in dfRadar that belongs to class "TT".
+    # For efficiency, we can group by cycle.
+    grouped = dfRadar.groupby('cycle_no')
+    for idx, row in dfRadar.iterrows():
+        cycle = row['cycle_no']
+        if row['TT'] != "TT":
+            CTT_flags.append(False)
+            continue
+        # Check if GT exists for this cycle:
+        if cycle not in gt_dict:
+            CTT_flags.append(False)
+            continue
+        
+        # Ground truth state for this cycle:
+        x_gt = gt_dict[cycle]  # shape (4,)
+        # Compute expected measurement h(x_gt) and its Jacobian:
+        h_x = measurement_function(x_gt)  # shape (3,)
+        H_mat = measurement_jacobian(x_gt)  # shape (3,4)
+        # Compute innovation covariance:
+        S = H_mat @ P_x @ H_mat.T + R_mat  # shape (3,3)
+        
+        # Radar detection measurement z:
+        # z = [RadialRange, azimuth_angle, v_r]
+        z = np.array([row['RadialRange'], row['azimuth_angle'], row['v_r']])
+        # Innovation (residual):
+        y_innov = z - h_x  # shape (3,)
+        
+        # Mahalanobis distance:
+        try:
+            S_inv = inv(S)
+        except Exception as e:
+            S_inv = np.linalg.pinv(S)
+        d_sq = y_innov.T @ S_inv @ y_innov
+        d = np.sqrt(d_sq)
+        
+        # Gate the detection: if d > d_max, set low likelihood
+        if d > d_max:
+            L_i = 0.0
+        else:
+            # Likelihood:
+            L_i = np.exp(-0.5*d_sq) / np.sqrt((2*np.pi)**3 * det(S))
+        
+        # For a given cycle, assume we need to normalize over all detections in TT within the gate.
+        # Here, we process detection-by-detection: we can sum over all detections in the same cycle.
+        # We'll get all TT detections in the current cycle that satisfy the gate.
+        group = grouped.get_group(cycle)
+        # Filter only TT detections in the group:
+        group = group[group['TT'] == "TT"]
+        # Compute likelihoods for all detections in the group.
+        L_vals = []
+        for _, det in group.iterrows():
+            z_det = np.array([det['RadialRange'], det['azimuth_angle'], det['v_r']])
+            y_det = z_det - h_x
+            try:
+                d_det_sq = y_det.T @ S_inv @ y_det
+            except Exception:
+                d_det_sq = 1e6
+            d_det = np.sqrt(d_det_sq)
+            if d_det > d_max:
+                L_vals.append(0.0)
+            else:
+                L_vals.append(np.exp(-0.5*d_det_sq) / np.sqrt((2*np.pi)**3 * det(S)))
+        L_vals = np.array(L_vals)
+        # Compute association probability for the current detection:
+        prob = L_i / (np.sum(L_vals) + lambda_val)
+        
+        # If the probability exceeds the threshold, mark detection as "CTT".
+        if prob > beta_thresh:
+            CTT_flags.append(True)
+        else:
+            CTT_flags.append(False)
+    
+    # Add the new column "CTT" to dfRadar.
+    dfRadar["CTT"] = CTT_flags
+    return dfRadar
+
+#####################################
+# VISUALIZATION FUNCTIONS
+#####################################
+def plot_global_association(dfRadar, dfGND, output_html='global_association.html'):
+    """
+    Plot 1: Global (all cycles) visualization.
+    - Plot detections from dfRadar: those with CTT=True in one color (e.g., green),
+      and those with TT but not CTT in another color (e.g., red).
+    - Plot ground truth from dfGND (using a distinct marker, e.g., black diamond).
+    - Use scatter marker size 2.
+    - This is a static plot (all cycles at once).
+    """
+    # Ensure data is sorted by cycle_no.
+    dfRadar = dfRadar.sort_values('cycle_no').reset_index(drop=True)
+    dfGND = dfGND.sort_values('cycle_no').reset_index(drop=True)
+    
+    # For plotting, swap axes: use dfRadar['y'] as X and dfRadar['x'] as Y.
+    # For ground truth, use distY as X and distX as Y.
+    radar_ctt = dfRadar[(dfRadar['TT'] == "TT") & (dfRadar['CTT'] == True)]
+    radar_nonctt = dfRadar[(dfRadar['TT'] == "TT") & (dfRadar['CTT'] == False)]
+    
+    fig = go.Figure()
+    # Plot radar detections in CTT (green)
+    fig.add_trace(go.Scatter(
+        x=radar_ctt['y'], 
+        y=radar_ctt['x'], 
+        mode='markers',
+        marker=dict(size=2, color='green'),
+        name='CTT Detections'
+    ))
+    # Plot radar detections in TT but not in CTT (red)
+    fig.add_trace(go.Scatter(
+        x=radar_nonctt['y'], 
+        y=radar_nonctt['x'], 
+        mode='markers',
+        marker=dict(size=2, color='red'),
+        name='TT but not CTT'
+    ))
+    # Plot ground truth (black diamond)
+    fig.add_trace(go.Scatter(
+        x=dfGND['distY'],
+        y=dfGND['distX'],
+        mode='markers',
+        marker=dict(size=2, color='black', symbol='diamond'),
+        name='Ground Truth'
+    ))
+    
+    fig.update_layout(title='Global Association: CTT vs TT (All Cycles)',
+                      xaxis_title='X (m)',
+                      yaxis_title='Y (m)')
+    fig.write_html(output_html)
+    print(f"Global association plot saved as {output_html}")
+
+def plot_cycle_by_cycle_association(dfRadar, dfGND, output_html='cycle_association.html'):
+    """
+    Plot 2: Cycle-by-cycle plot using a slider.
+    For each cycle:
+      - Plot detections from class TT, differentiating those with CTT=True (e.g., green)
+        and those with TT but not CTT (e.g., red).
+      - Plot ground truth (black diamond).
+      - For each cycle, connect the ground truth point with each detection in CTT using a thin line.
+    Scatter size is 2.
+    """
+    dfRadar = dfRadar.sort_values('cycle_no').reset_index(drop=True)
+    dfGND = dfGND.sort_values('cycle_no').reset_index(drop=True)
+    cycles = sorted(dfGND['cycle_no'].unique())
+    
+    frames = []
+    for cycle in cycles:
+        # Ground truth for cycle:
+        gt_row = dfGND[dfGND['cycle_no'] == cycle]
+        if gt_row.empty:
+            continue
+        gt_x = gt_row['distX'].values[0]
+        gt_y = gt_row['distY'].values[0]
+        # Note: swap axes: ground truth: X-axis = distY, Y-axis = distX.
+        trace_gt = go.Scatter(
+            x=[gt_y],
+            y=[gt_x],
+            mode='markers',
+            marker=dict(size=2, color='black', symbol='diamond'),
+            name='GT'
+        )
+        # Radar detections for cycle:
+        radar_cycle = dfRadar[dfRadar['cycle_no'] == cycle]
+        # Separate those with CTT and those without:
+        radar_ctt = radar_cycle[radar_cycle['CTT'] == True]
+        radar_nonctt = radar_cycle[radar_cycle['CTT'] == False]
+        trace_ctt = go.Scatter(
+            x=radar_ctt['y'],
+            y=radar_ctt['x'],
+            mode='markers',
+            marker=dict(size=2, color='green'),
+            name='CTT'
+        )
+        trace_nonctt = go.Scatter(
+            x=radar_nonctt['y'],
+            y=radar_nonctt['x'],
+            mode='markers',
+            marker=dict(size=2, color='red'),
+            name='TT (non-CTT)'
+        )
+        # For each detection in CTT, draw a thin line connecting it to GT.
+        line_traces = []
+        for idx, row in radar_ctt.iterrows():
+            # Each line from GT (gt_y, gt_x) to detection (row['y'], row['x'])
+            line_traces.append(go.Scatter(
+                x=[gt_y, row['y']],
+                y=[gt_x, row['x']],
+                mode='lines',
+                line=dict(color='gray', width=1),
+                showlegend=False
+            ))
+        
+        frame_data = [trace_gt, trace_ctt, trace_nonctt] + line_traces
+        frames.append(dict(name=str(cycle), data=frame_data))
+    
+    # Create slider steps.
+    slider_steps = []
+    for cycle in cycles:
+        step = dict(
+            label=str(cycle),
+            method='animate',
+            args=[[str(cycle)], {"frame": {"duration": 0, "redraw": True},
+                                 "mode": "immediate"}]
+        )
+        slider_steps.append(step)
+    
+    layout = go.Layout(
+        title='Cycle-by-Cycle Association',
+        xaxis=dict(title='X (m)'),
+        yaxis=dict(title='Y (m)'),
+        sliders=[dict(
+            active=0,
+            currentvalue={"prefix": "Cycle: "},
+            pad={"t": 50},
+            steps=slider_steps
+        )],
+        showlegend=True
+    )
+    
+    # Use first cycle as initial frame.
+    initial_frame = frames[0]['data']
+    fig = go.Figure(data=initial_frame, layout=layout, frames=frames)
+    
+    fig.write_html(output_html)
+    print(f"Cycle-by-cycle association plot saved as {output_html}")
+
+#####################################
+# MAIN FUNCTION
+#####################################
+def main():
+    # Set the test case folder path (adjust as necessary)
+    testcase_folder = './testcase_example'
+    ftr_dir = os.path.join(testcase_folder, 'ftr')
+    
+    # Load data from files.
+    dfRadar = pd.read_feather(os.path.join(ftr_dir, 'radar.ftr'))
+    dfGND = pd.read_feather(os.path.join(ftr_dir, 'gnd.ftr'))
+    # For this example, we assume ego.ftr is not needed in JPDA.
+    
+    # Perform JPDA association on TT detections.
+    # Only consider detections with TT == "TT"
+    dfRadar = perform_jpda_association(dfRadar, dfGND, d_max=5.0, lambda_val=0.1, beta_thresh=0.5)
+    
+    # Save the updated radar file with new column "CTT"
+    dfRadar.to_feather(os.path.join(ftr_dir, 'radar_final_labels.ftr'))
+    
+    # Create Plot 1: Global view (all cycles together)
+    plot_global_association(dfRadar, dfGND, output_html='global_association.html')
+    
+    # Create Plot 2: Cycle-by-cycle view with connecting lines for CTT
+    plot_cycle_by_cycle_association(dfRadar, dfGND, output_html='cycle_association.html')
+
+if __name__ == '__main__':
+    main()
