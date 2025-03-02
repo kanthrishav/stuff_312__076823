@@ -1,0 +1,557 @@
+import os
+import json
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import torch
+from torch import nn, optim
+from torch.utils.data import TensorDataset, DataLoader
+from torch.distributions import Normal
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import BayesianGaussianMixture
+from tqdm import tqdm
+from scipy.stats import multivariate_normal
+
+#####################################
+# DEVICE CONFIGURATION
+#####################################
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+#####################################
+# DATA LOADING & PREPROCESSING
+#####################################
+def load_and_preprocess_data(test_path, radar_folder, gnd_folder):
+    """
+    Loads radar.ftr and gnd.ftr from a given test case folder.
+    Returns a PyTorch Dataset (of normalized feature data), list of feature columns,
+    optional artifact_labels (if present), and the mean and std arrays.
+    """
+    radar_file = os.path.join(test_path, radar_folder, "radar.ftr")
+    gnd_file = os.path.join(test_path, gnd_folder, "gnd.ftr")
+    
+    df_radar = pd.read_feather(radar_file)
+    df_gnd = pd.read_feather(gnd_file)
+    
+    # For simplicity, assume row-order correspondence between radar and ground truth.
+    # Extract only the necessary features from radar.ftr:
+    # Features: kinematics and quality signals
+    feature_cols = [
+        "Range", "Azimuth", "VrelRad", "SNR", "RCS",
+        "aa", "bb", "cc", "dd", "ee", "ff", "gg",
+        "RangeVar", "Azimuth var", "VrelRad var", "Elev Var",
+        "hh", "jj", "kk", "Elevation Angle", "beamforming model type"
+    ]
+    data = df_radar[feature_cols].values.astype(np.float32)
+    scaler = StandardScaler()
+    data_norm = scaler.fit_transform(data)
+    tensor_data = torch.tensor(data_norm, dtype=torch.float32)
+    dataset = TensorDataset(tensor_data)
+    
+    # If available, get existing coarse artifact labels (for hyperparameter tuning/analysis)
+    artifact_labels = None
+    if "coarse_class_labels" in df_radar.columns:
+        artifact_labels = df_radar["coarse_class_labels"].astype(str).fillna("").values
+    return dataset, feature_cols, artifact_labels, scaler.mean_, scaler.scale_, df_radar, df_gnd
+
+#####################################
+# VIB+VAE MODEL DEFINITION
+#####################################
+class VIBVAE(nn.Module):
+    def __init__(self, input_dim, latent_dim, hidden_dim=128):
+        super(VIBVAE, self).__init__()
+        # Encoder: two hidden layers then output latent mean and log-variance.
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_mean = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+        # Decoder: two hidden layers then reconstruct input.
+        self.fc_dec1 = nn.Linear(latent_dim, hidden_dim)
+        self.fc_dec2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, input_dim)
+    
+    def encode(self, x):
+        h = torch.relu(self.fc1(x))
+        h = torch.relu(self.fc2(h))
+        mu = self.fc_mean(h)
+        logvar = self.fc_logvar(h)
+        return mu, logvar
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def decode(self, z):
+        h = torch.relu(self.fc_dec1(z))
+        h = torch.relu(self.fc_dec2(h))
+        recon = self.fc_out(h)
+        return recon
+    
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z)
+        return recon, mu, logvar
+
+def vae_loss(x, recon, mu, logvar):
+    # Reconstruction loss: Mean Squared Error (sum over features)
+    recon_loss = nn.functional.mse_loss(recon, x, reduction='sum')
+    # KL Divergence loss between q(z|x) and p(z)=N(0,I)
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return recon_loss + kl_loss
+
+def train_vae(model, dataset, batch_size=1024, lr=1e-3, epochs=10, device=device):
+    model.to(device)
+    model.train()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+    for epoch in tqdm(range(epochs), desc="Training VAE on GPU"):
+        total_loss = 0.0
+        for batch in data_loader:
+            x = batch[0].to(device)
+            optimizer.zero_grad()
+            recon, mu, logvar = model(x)
+            loss = vae_loss(x, recon, mu, logvar)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        # Uncomment the next line to print epoch loss if desired
+        # print(f"Epoch {epoch+1}/{epochs}: Loss per sample = {total_loss/len(dataset):.4f}")
+    model.to('cpu')
+    return model
+
+#####################################
+# ENCODE DATA & DETECT OUTLIERS
+#####################################
+def encode_data_and_find_outliers(model, dataset, outlier_percentile=99):
+    """
+    Encodes data using the trained VAE and computes reconstruction errors.
+    Returns:
+      - latent_mu: latent representation (mean)
+      - recon_errors: per-sample reconstruction error (MSE)
+      - outlier_idx: indices of samples with reconstruction error above the threshold
+      - threshold: error threshold (e.g., 99th percentile)
+    """
+    model.eval()
+    data_loader = DataLoader(dataset, batch_size=1024, shuffle=False, pin_memory=True)
+    latent_mu_list = []
+    recon_error_list = []
+    with torch.no_grad():
+        for batch in data_loader:
+            x = batch[0]
+            recon, mu, logvar = model(x)
+            latent_mu_list.append(mu.numpy())
+            batch_error = ((recon.numpy() - x.numpy())**2).mean(axis=1)
+            recon_error_list.append(batch_error)
+    latent_mu = np.concatenate(latent_mu_list, axis=0)
+    recon_errors = np.concatenate(recon_error_list, axis=0)
+    threshold = np.percentile(recon_errors, outlier_percentile)
+    outlier_idx = np.where(recon_errors > threshold)[0]
+    return latent_mu, recon_errors, outlier_idx, threshold
+
+#####################################
+# DP-GMM CLUSTERING FUNCTION
+#####################################
+def dp_gmm_clustering(latent_mu, outlier_idx, alpha=1.0, max_components=20):
+    """
+    Clusters the latent space (excluding outliers) using BayesianGaussianMixture (DP-GMM).
+    Returns:
+      - labels_all: cluster assignment for each sample (outliers assigned a special cluster)
+      - n_clusters: total number of clusters including outlier cluster if present
+      - bgm: fitted BayesianGaussianMixture model
+    """
+    # Exclude outliers for clustering
+    if len(outlier_idx) > 0:
+        inlier_mask = np.ones(latent_mu.shape[0], dtype=bool)
+        inlier_mask[outlier_idx] = False
+        data_cluster = latent_mu[inlier_mask]
+    else:
+        data_cluster = latent_mu
+        inlier_mask = np.ones(latent_mu.shape[0], dtype=bool)
+    
+    bgm = BayesianGaussianMixture(
+        n_components=max_components, 
+        weight_concentration_prior=alpha,
+        weight_concentration_prior_type='dirichlet_process',
+        covariance_type='full',
+        init_params='kmeans',
+        max_iter=100,
+        random_state=0
+    )
+    labels_inliers = bgm.fit_predict(data_cluster)
+    unique_labels = np.unique(labels_inliers)
+    # Re-label clusters to be contiguous (0,1,...)
+    label_mapping = {old: new for new, old in enumerate(unique_labels)}
+    relabeled_inliers = np.array([label_mapping[l] for l in labels_inliers])
+    n_clusters = len(unique_labels)
+    labels_all = -1 * np.ones(latent_mu.shape[0], dtype=int)
+    labels_all[inlier_mask] = relabeled_inliers
+    # Assign outliers to an extra cluster
+    if len(outlier_idx) > 0:
+        labels_all[outlier_idx] = n_clusters
+        n_clusters += 1
+    return labels_all, n_clusters, bgm
+
+#####################################
+# CLUSTER STATISTICS & ARTIFACT PROBABILITY MAPPING
+#####################################
+artifact_types = [
+    "Azimuth Beamforming Error", "Multipath", "Multitarget", "Doppler Artifact",
+    "Azimuth Sidelobe", "Monopulse Error", "Elevation-Azimuth Coupling", "NACOM Error",
+    "Interference", "Absolute Clutter"
+]
+
+def analyze_clusters_and_label(df, labels_all, feature_cols, artifact_labels=None):
+    """
+    Computes statistics for each cluster and assigns an artifact label based on statistical analysis.
+    The analysis here is a placeholder: in practice, you would design detailed statistical tests.
+    This function returns a dictionary with cluster statistics.
+    """
+    df["cluster_id"] = labels_all
+    clusters = np.unique(labels_all)
+    cluster_stats = {}
+    
+    global_means = df[feature_cols].mean()
+    global_stds = df[feature_cols].std() + 1e-8
+    
+    for cid in clusters:
+        cluster_data = df[df["cluster_id"] == cid]
+        size = len(cluster_data)
+        if size == 0:
+            continue
+        feat_means = cluster_data[feature_cols].mean()
+        z_scores = (feat_means - global_means) / global_stds
+        # For demonstration, we consider the sum of absolute z-scores as a rough measure
+        score = z_scores.abs().sum()
+        # Map the score to an artifact type by taking modulo of the number of artifact types
+        artifact_index = int(score) % len(artifact_types)
+        assigned_artifact = artifact_types[artifact_index]
+        cluster_stats[int(cid)] = {
+            "size": int(size),
+            "feature_means": feat_means.to_dict(),
+            "feature_z_scores": z_scores.to_dict(),
+            "aggregate_z_score": float(score),
+            "assigned_artifact": assigned_artifact
+        }
+        df.loc[df["cluster_id"] == cid, "artifact_label"] = f"{df.loc[df['labels'].iloc[0][0]}{artifact_index+1}"
+    return cluster_stats
+
+#####################################
+# SAVE OUTPUTS
+#####################################
+def save_results(df, cluster_stats, test_name, output_radar_folder, output_stats_folder):
+    output_radar_path = os.path.join(output_radar_folder, f"{test_name}_radar.ftr")
+    df.to_feather(output_radar_path)
+    output_stats_path = os.path.join(output_stats_folder, f"{test_name}_cluster_stats.json")
+    with open(output_stats_path, 'w') as f:
+        json.dump(cluster_stats, f, indent=2)
+    print(f"Saved updated radar data to {output_radar_path}")
+    print(f"Saved cluster statistics to {output_stats_path}")
+
+#####################################
+# PLOTTING FUNCTION (CUMULATIVE SCATTER PLOT)
+#####################################
+def save_scatter_plot(df, test_name, output_plot_folder):
+    """
+    Creates a cumulative scatter plot of detections across all cycles.
+    Uses columns 'distX' and 'distY' from df for ground truth (with distX on y-axis, distY on x-axis).
+    Colors and markers are assigned per artifact label.
+    Legends are off by default.
+    Scatter size is 2 for all markers; ground truth uses scatter+lines (size 1, line width 1).
+    Saves the plot as an HTML file.
+    """
+    # Determine unique final labels from the coarse_class_labels column (which now includes "TT", "SE", "G1", ... "GS1", ...)
+    unique_labels = np.sort(df["coarse_class_labels"].unique())
+    # Define fixed colors for TT and SE; for others, use a palette.
+    fixed_colors = {"TT": "red", "SE": "grey"}
+    # Define palettes for G and GS
+    g_palette = ["orange", "darkorange", "tomato", "orangered", "coral",
+                 "sandybrown", "goldenrod", "peru", "chocolate", "darkgoldenrod"]
+    gs_palette = ["blue", "mediumblue", "royalblue", "dodgerblue", "deepskyblue",
+                  "cornflowerblue", "skyblue", "steelblue", "slateblue", "darkblue"]
+    
+    def get_color(label):
+        if label in fixed_colors:
+            return fixed_colors[label]
+        elif label.startswith("G"):
+            try:
+                idx = int(label[1:]) - 1
+            except:
+                idx = 0
+            return g_palette[idx % len(g_palette)]
+        elif label.startswith("GS"):
+            try:
+                idx = int(label[2:]) - 1
+            except:
+                idx = 0
+            return gs_palette[idx % len(gs_palette)]
+        else:
+            return "black"
+    
+    # Count detections per label
+    counts = df["coarse_class_labels"].value_counts().to_dict()
+    
+    traces = []
+    # Add radar detections for each artifact label
+    for label in unique_labels:
+        subset = df[df["coarse_class_labels"] == label]
+        color = get_color(label)
+        traces.append(go.Scatter(
+            x=subset["distY"],  # Use distY on x-axis
+            y=subset["distX"],  # Use distX on y-axis
+            mode='markers',
+            marker=dict(size=2, color=color),
+            name=f"{label} ({counts.get(label,0)})",
+            showlegend=False
+        ))
+    
+    # Add ground truth: assume df has columns "distX" and "distY"
+    gt_trace = go.Scatter(
+        x=df["distY"],
+        y=df["distX"],
+        mode='markers+lines',
+        marker=dict(size=1, color="magenta"),
+        line=dict(width=1, color="magenta"),
+        name=f"Ground Truth ({len(df)})",
+        showlegend=False
+    )
+    traces.append(gt_trace)
+    
+    fig = go.Figure(data=traces)
+    fig.update_layout(title=f"Artifact Subclassification Scatter Plot - {test_name}",
+                      xaxis_title="distY",
+                      yaxis_title="distX",
+                      showlegend=False)
+    output_plot_path = os.path.join(output_plot_folder, f"{test_name}_scatter.html")
+    fig.write_html(output_plot_path)
+    print(f"Scatter plot saved to {output_plot_path}")
+
+#####################################
+# PROCESS FUNCTION FOR CLASS "G" and "GS"
+#####################################
+def process_class(dfRadar, class_label):
+    """
+    Processes detections for class "G" or "GS" using VIB+DP-GMMVAE.
+    Returns a DataFrame with updated labels for that class.
+    """
+    df_class = dfRadar[dfRadar["labels"] == class_label].copy()
+    feature_cols = [
+        "Range", "Azimuth", "VrelRad", "SNR", "RCS",
+        "aa", "bb", "cc", "dd", "ee", "ff", "gg",
+        "RangeVar", "Azimuth var", "VrelRad var", "Elev Var",
+        "hh", "jj", "kk", "Elevation Angle", "beamforming model type"
+    ]
+    X = df_class[feature_cols].values.astype(np.float32)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    dataset = TensorDataset(torch.tensor(X_scaled, dtype=torch.float32))
+    
+    # Train VIB+VAE model on this class data (batch-wise training on GPU)
+    model = VIBVAE(input_dim=X_scaled.shape[1], latent_dim=16, hidden_dim=128)
+    model = train_vae(model, dataset, batch_size=1024, lr=1e-3, epochs=20, device=device)
+    
+    # Encode all data and compute reconstruction error for outlier detection
+    latent_mu, recon_errors, outlier_idx, thr = encode_data_and_find_outliers(model, dataset, outlier_percentile=99)
+    print(f"[{class_label}] Reconstruction error threshold: {thr:.4f}, outliers: {len(outlier_idx)}")
+    
+    # Cluster latent space using DP-GMM (DP-GMM will determine number of clusters)
+    # Use a tuned alpha parameter (here we set a default of 1.0, can be tuned via cross-validation)
+    labels_all, n_clusters, bgm_model = dp_gmm_clustering(latent_mu, outlier_idx, alpha=1.0, max_components=20)
+    print(f"[{class_label}] DP-GMM found {n_clusters} clusters (including outlier cluster).")
+    
+    # Update df_class with cluster labels (as string: e.g., if class is "G", label becomes "G{cluster_id+1}")
+    final_labels = [f"{class_label}{lab+1}" for lab in labels_all]
+    df_class.loc[:, "coarse_class_labels"] = final_labels
+    
+    # Perform statistical analysis on clusters and assign artifact label
+    cluster_stats = analyze_clusters_and_label(df_class, labels_all, feature_cols, artifact_labels=None)
+    # Save cluster statistics as JSON later in main pipeline
+    return df_class, cluster_stats
+
+#####################################
+# MAIN PROCESSING FUNCTION FOR MULTIPLE TESTCASES
+#####################################
+def process_testcases(root_folder, radar_folder, gnd_folder, output_radar_folder, output_stats_folder, output_plot_folder):
+    """
+    Processes all test cases in the root folder.
+    For each test case:
+      1. Load radar.ftr and gnd.ftr.
+      2. For detections with coarse labels "G" and "GS", apply VIB+DP-GMMVAE separately.
+      3. Merge the new labels with existing ones ("TT" and "SE" remain unchanged).
+      4. Save the updated radar.ftr and cluster statistics (as JSON) in the specified folders.
+      5. Generate a cumulative scatter plot of all detections.
+    """
+    testcases = [d for d in os.listdir(root_folder) if os.path.isdir(os.path.join(root_folder, d))]
+    for test_name in testcases:
+        print(f"Processing test case: {test_name}")
+        test_path = os.path.join(root_folder, test_name)
+        # Load data
+        dataset, feature_cols, artifact_labels, mean_arr, std_arr, dfRadar, dfGND = load_and_preprocess_data(test_path, radar_folder, gnd_folder)
+        
+        # Process class "G" and class "GS" separately
+        df_G, cluster_stats_G = process_class(dfRadar, "G")
+        df_GS, cluster_stats_GS = process_class(dfRadar, "GS")
+        
+        # Update original dfRadar with new labels for "G" and "GS"
+        dfRadar.update(df_G)
+        dfRadar.update(df_GS)
+        
+        # Save updated radar.ftr
+        output_radar_path = os.path.join(output_radar_folder, f"{test_name}_radar.ftr")
+        dfRadar.to_feather(output_radar_path)
+        print(f"Updated radar file saved to {output_radar_path}")
+        
+        # Save cluster statistics as JSON (combine both G and GS stats)
+        all_cluster_stats = {"G": cluster_stats_G, "GS": cluster_stats_GS}
+        output_stats_path = os.path.join(output_stats_folder, f"{test_name}_cluster_stats.json")
+        with open(output_stats_path, 'w') as f:
+            json.dump(all_cluster_stats, f, indent=2)
+        print(f"Cluster statistics saved to {output_stats_path}")
+        
+        # Generate cumulative scatter plot: use columns "distY" for x-axis and "distX" for y-axis (per requirements)
+        # Assume dfRadar now has a column "coarse_class_labels" for all detections.
+        save_scatter_plot(dfRadar, feature_cols, test_name, output_plot_folder)
+        # Clean up to free memory
+        del dfRadar, dfGND
+        torch.cuda.empty_cache()
+
+#####################################
+# PLOTTING FUNCTION (CUMULATIVE SCATTER)
+#####################################
+def save_scatter_plot(df, feature_cols, test_name, output_plot_folder):
+    """
+    Creates a cumulative scatter plot of detections across all cycles.
+    Plots using "distY" (x-axis) and "distX" (y-axis).
+    Detections are colored by "coarse_class_labels". Legends are off by default.
+    Ground truth points are plotted as markers+lines (magenta, marker size 1, line width 1).
+    Saves the plot as an HTML file.
+    """
+    # Define fixed colors for known classes "TT" and "SE"
+    fixed_colors = {"TT": "red", "SE": "grey"}
+    # Define palettes for G and GS; using 10 colors each.
+    g_palette = ["orange", "darkorange", "tomato", "orangered", "coral",
+                 "sandybrown", "goldenrod", "peru", "chocolate", "darkgoldenrod"]
+    gs_palette = ["blue", "mediumblue", "royalblue", "dodgerblue", "deepskyblue",
+                  "cornflowerblue", "skyblue", "steelblue", "slateblue", "darkblue"]
+    
+    def get_color(label):
+        if label in fixed_colors:
+            return fixed_colors[label]
+        elif label.startswith("G"):
+            try:
+                idx = int(label[1:]) - 1
+            except:
+                idx = 0
+            return g_palette[idx % len(g_palette)]
+        elif label.startswith("GS"):
+            try:
+                idx = int(label[2:]) - 1
+            except:
+                idx = 0
+            return gs_palette[idx % len(gs_palette)]
+        else:
+            return "black"
+    
+    # Count detections per label from "coarse_class_labels"
+    counts = df["coarse_class_labels"].value_counts().to_dict()
+    traces = []
+    unique_labels = np.sort(df["coarse_class_labels"].unique())
+    for label in unique_labels:
+        subset = df[df["coarse_class_labels"] == label]
+        color = get_color(label)
+        traces.append(go.Scatter(
+            x=subset["distY"],
+            y=subset["distX"],
+            mode='markers',
+            marker=dict(size=2, color=color),
+            name=f"{label} ({counts.get(label, 0)})",
+            showlegend=False  # legends off by default
+        ))
+    # Ground truth: Assume df has columns "distX" and "distY" from gnd.ftr merged into radar.ftr
+    gt_trace = go.Scatter(
+        x=df["distY"],
+        y=df["distX"],
+        mode='markers+lines',
+        marker=dict(size=1, color="magenta"),
+        line=dict(width=1, color="magenta"),
+        name=f"Ground Truth ({len(df)})",
+        showlegend=False
+    )
+    traces.append(gt_trace)
+    
+    fig = go.Figure(data=traces)
+    fig.update_layout(title=f"Cumulative Artifact Scatter Plot - {test_name}",
+                      xaxis_title="distY",
+                      yaxis_title="distX",
+                      showlegend=False)
+    output_plot_path = os.path.join(output_plot_folder, f"{test_name}_scatter.html")
+    fig.write_html(output_plot_path)
+    print(f"Scatter plot saved as {output_plot_path}")
+
+#####################################
+# MAIN FUNCTION
+#####################################
+def process_testcases(root_folder, radar_folder, gnd_folder, output_radar_folder, output_stats_folder, output_plot_folder):
+    """
+    Processes multiple test cases.
+    
+    Arguments:
+      - root_folder: path to the root folder containing test case folders.
+      - radar_folder: folder name (inside each test case) that contains radar.ftr.
+      - gnd_folder: folder name (inside each test case) that contains gnd.ftr.
+      - output_radar_folder: folder where updated radar.ftr files are saved.
+      - output_stats_folder: folder where cluster statistics JSON files are saved (one level up from output_radar_folder).
+      - output_plot_folder: folder where the cumulative scatter plots are saved.
+    """
+    os.makedirs(output_radar_folder, exist_ok=True)
+    os.makedirs(output_stats_folder, exist_ok=True)
+    os.makedirs(output_plot_folder, exist_ok=True)
+    
+    testcases = [d for d in os.listdir(root_folder) if os.path.isdir(os.path.join(root_folder, d))]
+    for test_name in testcases:
+        print(f"Processing test case: {test_name}")
+        test_path = os.path.join(root_folder, test_name)
+        dataset, feature_cols, artifact_labels, mean_arr, std_arr, dfRadar, dfGND = load_and_preprocess_data(test_path, radar_folder, gnd_folder)
+        
+        # Process detections for classes "G" and "GS" separately using VIB+DP-GMMVAE.
+        df_G, cluster_stats_G = process_class(dfRadar, "G")
+        df_GS, cluster_stats_GS = process_class(dfRadar, "GS")
+        
+        # Update original dfRadar with new labels for "G" and "GS".
+        dfRadar.update(df_G)
+        dfRadar.update(df_GS)
+        
+        # Save updated radar.ftr.
+        output_radar_path = os.path.join(output_radar_folder, f"{test_name}_radar.ftr")
+        dfRadar.to_feather(output_radar_path)
+        print(f"Updated radar file saved to: {output_radar_path}")
+        
+        # Combine cluster statistics for "G" and "GS" and save as JSON.
+        all_cluster_stats = {"G": cluster_stats_G, "GS": cluster_stats_GS}
+        output_stats_path = os.path.join(output_stats_folder, f"{test_name}_cluster_stats.json")
+        with open(output_stats_path, 'w') as f:
+            json.dump(all_cluster_stats, f, indent=2)
+        print(f"Cluster statistics saved to: {output_stats_path}")
+        
+        # Generate cumulative scatter plot (all cycles at once).
+        save_scatter_plot(dfRadar, feature_cols, test_name, output_plot_folder)
+        
+        # Free memory for this test case.
+        del dfRadar, dfGND
+        torch.cuda.empty_cache()
+
+#####################################
+# MAIN ENTRY POINT
+#####################################
+if __name__ == '__main__':
+    # Example input parameters (adjust paths accordingly)
+    root_folder = "./testcases_root"
+    radar_folder = "ftr"         # folder inside each test case containing radar.ftr
+    gnd_folder = "ftr"           # folder inside each test case containing gnd.ftr
+    output_radar_folder = "./updated_radar"
+    output_stats_folder = "./cluster_stats"  # one level up from updated radar folder
+    output_plot_folder = "./plots"
+    
+    process_testcases(root_folder, radar_folder, gnd_folder, output_radar_folder, output_stats_folder, output_plot_folder)
