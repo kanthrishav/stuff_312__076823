@@ -1,0 +1,330 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+
+# PyTorch Geometric imports
+from torch_geometric.data import Data, DataLoader
+from torch_geometric.nn import GCNConv
+
+# -----------------------------
+# Utility Functions
+# -----------------------------
+
+def label_smoothing(one_hot_labels, epsilon=0.1):
+    """
+    Convert one-hot labels to "soft" targets using label smoothing.
+    one_hot_labels: numpy array of shape (N, C)
+    Returns: numpy array of shape (N, C) with smoothed labels.
+    """
+    K = one_hot_labels.shape[1]
+    return (1 - epsilon) * one_hot_labels + epsilon / K
+
+def compute_similarity(x_i, x_j, sigma=1.0):
+    """
+    Computes similarity between two feature vectors using a Gaussian kernel.
+    x_i, x_j: numpy arrays (1D)
+    """
+    dist_sq = np.sum((x_i - x_j)**2)
+    return np.exp(-dist_sq / (sigma**2))
+
+def build_adjacency_matrix(X, k=20, sigma=1.0):
+    """
+    Build an adjacency matrix A (shape N x N) for detections in one cycle.
+    X: numpy array of shape (N, F) where F is number of features.
+    k: number of nearest neighbors to use.
+    sigma: scaling factor for similarity.
+    
+    Returns: A, a numpy array of shape (N, N)
+    """
+    N = X.shape[0]
+    A = np.zeros((N, N))
+    # Compute all pairwise Euclidean distances
+    # We use squared Euclidean distances here.
+    dist_sq = np.sum((X[:, None, :] - X[None, :, :])**2, axis=2)
+    
+    # For each node, select the k nearest (excluding itself)
+    for i in range(N):
+        # Get indices of nodes sorted by distance (excluding itself)
+        sorted_indices = np.argsort(dist_sq[i])
+        # Exclude self: first index is i itself; then take next k indices.
+        neighbors = sorted_indices[1:k+1]
+        for j in neighbors:
+            A[i, j] = np.exp(-dist_sq[i, j] / (sigma**2))
+    return A
+
+def normalize_adjacency(A):
+    """
+    Normalize the adjacency matrix A using the symmetric normalization:
+    A_norm = D^{-1/2} (A + I) D^{-1/2}
+    """
+    N = A.shape[0]
+    A_tilde = A + np.eye(N)  # add self-loops
+    D = np.diag(np.sum(A_tilde, axis=1))
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-8))
+    A_norm = D_inv_sqrt @ A_tilde @ D_inv_sqrt
+    return A_norm
+
+# -----------------------------
+# GNN Model for Node Classification
+# -----------------------------
+
+class GNNClassifier(nn.Module):
+    def __init__(self, in_channels, hidden_channels, num_layers, num_classes, dropout=0.5):
+        super(GNNClassifier, self).__init__()
+        self.convs = nn.ModuleList()
+        self.num_layers = num_layers
+
+        # First GCN layer
+        self.convs.append(GCNConv(in_channels, hidden_channels))
+        # Additional layers
+        for i in range(num_layers - 1):
+            self.convs.append(GCNConv(hidden_channels, hidden_channels))
+        # Final classifier
+        self.fc = nn.Linear(hidden_channels, num_classes)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index, edge_weight=None):
+        # x: (N, in_channels)
+        # edge_index: (2, E) indices for nonzero entries of A (graph connectivity)
+        # edge_weight: (E,) corresponding weights
+        for conv in self.convs:
+            x = conv(x, edge_index, edge_weight=edge_weight)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        logits = self.fc(x)  # shape (N, num_classes)
+        return logits
+
+# -----------------------------
+# Graph Smoothness Loss
+# -----------------------------
+
+def graph_smoothness_loss(predictions, edge_index, edge_weight):
+    """
+    Encourages neighboring nodes to have similar predicted class probabilities.
+    predictions: tensor of shape (N, C), output after softmax.
+    edge_index: tensor of shape (2, E).
+    edge_weight: tensor of shape (E,)
+    """
+    # For each edge (i, j), compute squared difference between predictions
+    row, col = edge_index
+    diff = predictions[row] - predictions[col]
+    loss = torch.sum(edge_weight * torch.sum(diff**2, dim=1)) / 2.0
+    return loss
+
+# -----------------------------
+# Training and Evaluation Functions
+# -----------------------------
+
+def train(model, optimizer, loader, device, alpha=0.8):
+    model.train()
+    total_loss = 0.0
+    for data in loader:
+        data = data.to(device)
+        optimizer.zero_grad()
+        out = model(data.x, data.edge_index, data.edge_weight)  # logits, shape (N, num_classes)
+        # Compute cross entropy loss with label smoothing applied to the weak labels
+        # data.y is assumed to be in integer format (0,...,C-1); convert to one-hot then smooth
+        N = data.num_nodes
+        C = out.size(1)
+        y_true = F.one_hot(data.y, num_classes=C).float()  # shape (N, C)
+        # Label smoothing: transform one-hot to soft targets
+        epsilon = 0.1
+        y_soft = (1 - epsilon) * y_true + epsilon / C
+        
+        loss_ce = F.cross_entropy(out, data.y, reduction='mean')  # PyTorch's cross entropy expects hard labels.
+        # Alternatively, using KL divergence between soft targets and predicted probabilities:
+        out_log_soft = F.log_softmax(out, dim=1)
+        loss_soft = F.kl_div(out_log_soft, y_soft, reduction='batchmean')
+        # Combine losses (here we use a weighted sum; alpha controls the influence of weak labels)
+        loss_class = alpha * loss_ce + (1 - alpha) * loss_soft
+
+        # Graph smoothness loss (using the softmax predictions)
+        pred_soft = F.softmax(out, dim=1)
+        loss_smooth = graph_smoothness_loss(pred_soft, data.edge_index, data.edge_weight)
+        
+        loss = loss_class + loss_smooth
+        
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * data.num_nodes
+    return total_loss / len(loader.dataset)
+
+def test(model, loader, device):
+    model.eval()
+    correct = 0
+    all_preds = []
+    with torch.no_grad():
+        for data in loader:
+            data = data.to(device)
+            out = model(data.x, data.edge_index, data.edge_weight)
+            pred = out.argmax(dim=1)
+            correct += int((pred == data.y).sum())
+            all_preds.append(pred.cpu().numpy())
+    return correct / len(loader.dataset), np.concatenate(all_preds)
+
+# -----------------------------
+# Data Preparation and Graph Creation
+# -----------------------------
+
+def process_cycle_dataframe(df, feature_cols, label_col, k=20, sigma=1.0):
+    """
+    Process a single cycle's dataframe.
+    - df: Pandas DataFrame for one cycle.
+    - feature_cols: list of column names for features.
+    - label_col: name of the column with weak labels (assumed to be integer class labels: 0 to 4 corresponding to "SE", "TT", "GT", "GS", "G")
+    - k: number of nearest neighbors.
+    - sigma: scaling parameter for similarity.
+    
+    Returns: a PyTorch Geometric Data object.
+    """
+    # Extract features as a numpy array of shape (N, F)
+    X = df[feature_cols].to_numpy(dtype=np.float32)  # shape (N, F)
+    N = X.shape[0]
+    
+    # Build adjacency matrix using kNN
+    A = np.zeros((N, N))
+    # Compute pairwise Euclidean distances
+    dists = np.sqrt(np.sum((X[:, None, :] - X[None, :, :])**2, axis=2))
+    # For each node, get indices of k nearest neighbors (excluding self)
+    for i in range(N):
+        # Sort distances; the smallest is self (distance 0)
+        sorted_indices = np.argsort(dists[i])
+        neighbors = sorted_indices[1:k+1]  # k nearest neighbors
+        for j in neighbors:
+            A[i, j] = np.exp(-dists[i, j]**2 / (sigma**2))
+    # Normalize adjacency matrix
+    A_norm = normalize_adjacency(A)  # shape (N, N)
+    
+    # Convert A_norm to edge_index and edge_weight format required by PyTorch Geometric.
+    # edge_index: (2, E) where E is the number of nonzero edges.
+    # edge_weight: (E,)
+    edge_index = np.array(np.nonzero(A_norm))
+    edge_weight = A_norm[np.nonzero(A_norm)]
+    edge_index = torch.tensor(edge_index, dtype=torch.long)
+    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
+    
+    # Create feature tensor and label tensor.
+    x = torch.tensor(X, dtype=torch.float)  # shape (N, F)
+    # Here we assume the weak labels are in the DataFrame as integer labels 0 to 4.
+    y = torch.tensor(df[label_col].to_numpy(), dtype=torch.long)
+    
+    data = Data(x=x, edge_index=edge_index, edge_weight=edge_weight, y=y)
+    return data
+
+# -----------------------------
+# Main Training Loop over All Feather Files
+# -----------------------------
+
+def main():
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Hyperparameters
+    k = 20
+    sigma = 1.0
+    learning_rate = 0.001
+    num_epochs = 100  # Adjust as needed
+    batch_size = 1   # We treat each cycle graph as one batch
+    num_layers = 2
+    hidden_channels = 64
+    num_classes = 5  # "SE", "TT", "GT", "GS", "G"
+    dropout = 0.5
+    alpha = 0.8  # Weight for classification loss vs. graph smoothness loss
+    
+    # Feature columns and label column names; adjust these based on your data.
+    feature_cols = [f'feat_{i}' for i in range(1, 16)]  # assuming 15 attributes are named feat_1, feat_2, ... feat_15
+    label_col = 'label'  # column name in your dataframe for the weak label
+    
+    # Path to your data files (assuming all .ftr files are in the current directory)
+    file_list = glob.glob(os.path.join('.', '*.ftr'))
+    
+    # Prepare a list for storing results and data for training
+    all_data = []
+    
+    for file in file_list:
+        print(f"Processing file: {file}")
+        # Read the feather file into a pandas DataFrame.
+        df = pd.read_feather(file)
+        # Assume the DataFrame contains a column "cycle" to indicate cycle number.
+        # Process each cycle independently.
+        cycles = df['cycle'].unique()
+        for cycle in cycles:
+            df_cycle = df[df['cycle'] == cycle].reset_index(drop=True)
+            if df_cycle.shape[0] < k + 1:
+                # Skip cycles with too few detections
+                continue
+            data = process_cycle_dataframe(df_cycle, feature_cols, label_col, k=k, sigma=sigma)
+            all_data.append(data)
+    
+    # Combine all graphs into a dataset and use DataLoader from PyTorch Geometric.
+    dataset = all_data
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Model initialization
+    in_channels = len(feature_cols)  # 15 features per detection
+    model = GNNClassifier(in_channels=in_channels,
+                          hidden_channels=hidden_channels,
+                          num_layers=num_layers,
+                          num_classes=num_classes,
+                          dropout=dropout).to(device)
+    optimizer = Adam(model.parameters(), lr=learning_rate)
+    
+    # Training Loop
+    for epoch in range(1, num_epochs+1):
+        loss = train(model, optimizer, loader, device, alpha=alpha)
+        print(f"Epoch {epoch:03d}, Loss: {loss:.4f}")
+    
+    # Save the model
+    torch.save(model.state_dict(), "gnn_model.pth")
+    
+    # Inference: Predict labels for each cycle graph and save "fine_labels" into the corresponding dataframe.
+    # Here, we demonstrate for each graph in our dataset.
+    fine_labels_all = []
+    model.eval()
+    with torch.no_grad():
+        for data in dataset:
+            data = data.to(device)
+            out = model(data.x, data.edge_index, data.edge_weight)
+            pred = out.argmax(dim=1).cpu().numpy()  # shape (N,)
+            fine_labels_all.append(pred)
+    
+    # For demonstration, assume we want to update each original file with predictions.
+    # Map predicted label indices to string labels.
+    label_map = {0: "SE", 1: "TT", 2: "GT", 3: "GS", 4: "G"}
+    
+    # For each file and for each cycle, write the fine labels back to a CSV (or update the DataFrame).
+    cycle_counter = 0
+    for file in file_list:
+        df = pd.read_feather(file)
+        # Process each cycle independently
+        cycles = df['cycle'].unique()
+        fine_labels_col = []
+        for cycle in cycles:
+            df_cycle = df[df['cycle'] == cycle].reset_index(drop=True)
+            if df_cycle.shape[0] < k + 1:
+                # For cycles too small, assign original label names (or leave blank)
+                fine_labels = df_cycle[label_col].apply(lambda x: label_map.get(x, "Unknown")).tolist()
+            else:
+                # Use predictions from the corresponding graph (assume order preserved)
+                preds = fine_labels_all[cycle_counter]
+                fine_labels = [label_map[p] for p in preds]
+                cycle_counter += 1
+            # Append fine_labels for this cycle
+            fine_labels_col.extend(fine_labels)
+        # Add fine_labels column to DataFrame and save to CSV (or update the feather file)
+        df["fine_labels"] = fine_labels_col
+        output_file = file.replace(".ftr", "_fine.csv")
+        df.to_csv(output_file, index=False)
+        print(f"Saved fine labels to {output_file}")
+
+if __name__ == "__main__":
+    main()
