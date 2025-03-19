@@ -1,0 +1,369 @@
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+
+# =============================================================================
+# 1. Load Data and Set Up Global Thresholds
+# =============================================================================
+# Load the feather file (adjust the file name/path as needed)
+df = pd.read_feather("data.feather")
+
+# Define threshold values for annotations (adjust these as appropriate for your data)
+threshold_POA_low, threshold_POA_high = 0.3, 0.7
+threshold_POE_low, threshold_POE_high = 0.3, 0.7
+threshold_POKF_low, threshold_POKF_high = 0.3, 0.7
+
+# Function to compute counts based on thresholds
+def compute_threshold_counts(series, low, high):
+    below = (series < low).sum()
+    between = ((series >= low) & (series <= high)).sum()
+    above = (series > high).sum()
+    return below, between, above
+
+# Compute counts for each column
+poa_counts = compute_threshold_counts(df["POA"], threshold_POA_low, threshold_POA_high)
+poe_counts = compute_threshold_counts(df["POE"], threshold_POE_low, threshold_POE_high)
+pokf_counts = compute_threshold_counts(df["POKF"], threshold_POKF_low, threshold_POKF_high)
+
+# Global annotation text (will be appended to every plot)
+global_text = (
+    f"POA: below {threshold_POA_low} = {poa_counts[0]}, between = {poa_counts[1]}, above {threshold_POA_high} = {poa_counts[2]}<br>"
+    f"POE: below {threshold_POE_low} = {poe_counts[0]}, between = {poe_counts[1]}, above {threshold_POE_high} = {poe_counts[2]}<br>"
+    f"POKF: below {threshold_POKF_low} = {pokf_counts[0]}, between = {pokf_counts[1]}, above {threshold_POKF_high} = {pokf_counts[2]}"
+)
+
+# =============================================================================
+# 2. Helper Function for Scatter Plots (Plots 1–21)
+# =============================================================================
+def create_scatter_plot(df, x_col, y_col, color_col=None, title="", additional_annotation=""):
+    """
+    Creates a scatter plot using Scattergl with:
+      - A slider to adjust marker size (default marker size is 2).
+      - An updatemenu button to toggle between colored (using color_col) and no color.
+      - An annotation textbox that includes global threshold counts plus any additional text.
+    """
+    # Set marker color
+    if color_col is not None:
+        marker_colors = df[color_col]
+        showscale = True
+        colorscale = "Viridis"
+    else:
+        marker_colors = "grey"
+        showscale = False
+        colorscale = None
+
+    fig = go.Figure()
+
+    trace = go.Scattergl(
+        x=df[x_col],
+        y=df[y_col],
+        mode="markers",
+        marker=dict(
+            size=2,
+            color=marker_colors,
+            colorscale=colorscale,
+            showscale=showscale
+        ),
+        name=f"{x_col} vs {y_col}"
+    )
+    fig.add_trace(trace)
+
+    # Create an annotation box that shows the global threshold counts plus any extra information
+    fig.add_annotation(
+        text=global_text + "<br>" + additional_annotation,
+        xref="paper", yref="paper",
+        x=1.05, y=1,
+        showarrow=False,
+        bordercolor="black",
+        borderwidth=1
+    )
+
+    # Add a slider for marker size (steps from size 1 to 10)
+    marker_sizes = list(range(1, 11))
+    slider_steps = []
+    for size in marker_sizes:
+        slider_steps.append(dict(
+            method="restyle",
+            args=[{"marker.size": [size]}],  # updates the marker size of the trace
+            label=str(size)
+        ))
+    fig.update_layout(sliders=[dict(
+        active=1,
+        currentvalue={"prefix": "Marker size: "},
+        pad={"t": 50},
+        steps=slider_steps
+    )])
+
+    # Add updatemenu buttons to toggle the color mapping
+    # Two buttons: "Colored" (using the original color data) and "No Color" (constant grey)
+    fig.update_layout(
+        updatemenus=[
+            dict(
+                type="buttons",
+                direction="right",
+                buttons=[
+                    dict(
+                        label="Colored",
+                        method="restyle",
+                        args=[{"marker.color": [df[color_col]] if color_col is not None else [] ,
+                               "marker.showscale": True if color_col is not None else False}]
+                    ),
+                    dict(
+                        label="No Color",
+                        method="restyle",
+                        args=[{"marker.color": ["grey"],
+                               "marker.showscale": False}]
+                    )
+                ],
+                pad={"r": 10, "t": 10},
+                showactive=True,
+                x=0,
+                xanchor="left",
+                y=1.1,
+                yanchor="top"
+            )
+        ],
+        title=title,
+        xaxis_title=x_col,
+        yaxis_title=y_col
+    )
+    return fig
+
+# =============================================================================
+# 3. Create Scatter Plots (Plots 1–21)
+# =============================================================================
+# Plot 1: POKF vs POE with colors showing POA, plus extra annotation based on 10% differences
+within_10 = ((np.abs(df["POKF"] - df["POE"]) <= 0.1 * df["POE"])).sum()
+pokf_above = (df["POKF"] > df["POE"] + 0.1 * df["POE"]).sum()
+pokf_below = (df["POKF"] < df["POE"] - 0.1 * df["POE"]).sum()
+additional_text1 = (
+    f"POKF vs POE 10% comparison:<br>"
+    f"Within 10%: {within_10}, POKF > POE+10%: {pokf_above}, POKF < POE-10%: {pokf_below}"
+)
+fig1 = create_scatter_plot(df, x_col="POKF", y_col="POE", color_col="POA",
+                           title="Plot 1: POKF vs POE (color = POA)",
+                           additional_annotation=additional_text1)
+fig1.write_html("plot1.html")
+
+# Plot 2: POA vs POE with colors showing POKF, plus extra annotation based on 10% differences between POA and POE
+within_10_2 = ((np.abs(df["POA"] - df["POE"]) <= 0.1 * df["POE"])).sum()
+poa_above = (df["POA"] > df["POE"] + 0.1 * df["POE"]).sum()
+poa_below = (df["POA"] < df["POE"] - 0.1 * df["POE"]).sum()
+additional_text2 = (
+    f"POA vs POE 10% comparison:<br>"
+    f"Within 10%: {within_10_2}, POA > POE+10%: {poa_above}, POA < POE-10%: {poa_below}"
+)
+fig2 = create_scatter_plot(df, x_col="POA", y_col="POE", color_col="POKF",
+                           title="Plot 2: POA vs POE (color = POKF)",
+                           additional_annotation=additional_text2)
+fig2.write_html("plot2.html")
+
+# Plots 3–8: POA vs variable, colored by POE
+other_vars1 = ["SNR", "RCS", "rangeFromObj", "speedDiffFromObj", "distToEdge", "normDistToEdge"]
+for i, var in enumerate(other_vars1, start=3):
+    fig = create_scatter_plot(df, x_col="POA", y_col=var, color_col="POE",
+                              title=f"Plot {i}: POA vs {var} (color = POE)")
+    fig.write_html(f"plot{i}.html")
+
+# Plots 9–14: POKF vs variable, colored by POE
+other_vars2 = ["SNR", "RCS", "rangeFromObj", "speedDiffFromObj", "distToEdge", "normDistToEdge"]
+for i, var in enumerate(other_vars2, start=9):
+    fig = create_scatter_plot(df, x_col="POKF", y_col=var, color_col="POE",
+                              title=f"Plot {i}: POKF vs {var} (color = POE)")
+    fig.write_html(f"plot{i}.html")
+
+# Plots 15–20: POE vs variable, colored by POA
+other_vars3 = ["SNR", "RCS", "rangeFromObj", "speedDiffFromObj", "distToEdge", "normDistToEdge"]
+for i, var in enumerate(other_vars3, start=15):
+    fig = create_scatter_plot(df, x_col="POE", y_col=var, color_col="POA",
+                              title=f"Plot {i}: POE vs {var} (color = POA)")
+    fig.write_html(f"plot{i}.html")
+
+# Plot 21: 3D scatter of POE, POKF, POA with colors showing SNR and a color toggle button
+fig21 = go.Figure(data=[go.Scatter3d(
+    x=df["POE"],
+    y=df["POKF"],
+    z=df["POA"],
+    mode="markers",
+    marker=dict(
+        size=2,
+        color=df["SNR"],
+        colorscale="Viridis",
+        showscale=True
+    )
+)])
+fig21.add_annotation(
+    text=global_text,
+    xref="paper", yref="paper",
+    x=1.05, y=1,
+    showarrow=False,
+    bordercolor="black",
+    borderwidth=1
+)
+fig21.update_layout(
+    title="Plot 21: 3D Scatter (POE, POKF, POA; color = SNR)",
+    scene=dict(
+        xaxis_title="POE",
+        yaxis_title="POKF",
+        zaxis_title="POA"
+    ),
+    updatemenus=[
+        dict(
+            type="buttons",
+            direction="right",
+            buttons=[
+                dict(
+                    label="Colored",
+                    method="restyle",
+                    args=[{"marker.color": [df["SNR"]], "marker.showscale": True}]
+                ),
+                dict(
+                    label="No Color",
+                    method="restyle",
+                    args=[{"marker.color": ["grey"], "marker.showscale": False}]
+                )
+            ],
+            pad={"r": 10, "t": 10},
+            showactive=True,
+            x=0,
+            xanchor="left",
+            y=1.1,
+            yanchor="top"
+        )
+    ]
+)
+fig21.write_html("plot21.html")
+
+# =============================================================================
+# 4. Create Histograms (Plots 22–24)
+# =============================================================================
+# Plot 22: Histogram of POE with 100 bins and a line connecting the bin midpoints
+hist_poe, bin_edges = np.histogram(df["POE"], bins=100)
+bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+fig22 = go.Figure()
+fig22.add_trace(go.Histogram(x=df["POE"], nbinsx=100, name="POE Histogram"))
+fig22.add_trace(go.Scatter(x=bin_centers, y=hist_poe, mode="lines+markers", name="Distribution Line"))
+fig22.update_layout(title="Plot 22: Histogram of POE", xaxis_title="POE", yaxis_title="Count")
+fig22.write_html("plot22.html")
+
+# Plot 23: Histogram of POA with 100 bins and a connecting line
+hist_poa, bin_edges = np.histogram(df["POA"], bins=100)
+bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+fig23 = go.Figure()
+fig23.add_trace(go.Histogram(x=df["POA"], nbinsx=100, name="POA Histogram"))
+fig23.add_trace(go.Scatter(x=bin_centers, y=hist_poa, mode="lines+markers", name="Distribution Line"))
+fig23.update_layout(title="Plot 23: Histogram of POA", xaxis_title="POA", yaxis_title="Count")
+fig23.write_html("plot23.html")
+
+# Plot 24: Histogram of POKF with 100 bins and a connecting line
+hist_pokf, bin_edges = np.histogram(df["POKF"], bins=100)
+bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+fig24 = go.Figure()
+fig24.add_trace(go.Histogram(x=df["POKF"], nbinsx=100, name="POKF Histogram"))
+fig24.add_trace(go.Scatter(x=bin_centers, y=hist_pokf, mode="lines+markers", name="Distribution Line"))
+fig24.update_layout(title="Plot 24: Histogram of POKF", xaxis_title="POKF", yaxis_title="Count")
+fig24.write_html("plot24.html")
+
+# =============================================================================
+# 5. Create a 3D Histogram (Plot 25)
+# =============================================================================
+# We compute a 2D histogram of POKF vs POE (using 20 bins for manageability)
+bins = 20
+hist2d, x_edges, y_edges = np.histogram2d(df["POKF"], df["POE"], bins=bins)
+x_centers = (x_edges[:-1] + x_edges[1:]) / 2
+y_centers = (y_edges[:-1] + y_edges[1:]) / 2
+
+# Build 3D bars using Mesh3d objects for each bin (only if count > 0)
+bars = []
+for i in range(bins):
+    for j in range(bins):
+        count = hist2d[i, j]
+        if count > 0:
+            # Determine the bin edges
+            x0, x1 = x_edges[i], x_edges[i+1]
+            y0, y1 = y_edges[j], y_edges[j+1]
+            z0, z1 = 0, count
+            # Define the 8 vertices of the cuboid
+            vertices = [
+                [x0, y0, z0],
+                [x1, y0, z0],
+                [x1, y1, z0],
+                [x0, y1, z0],
+                [x0, y0, z1],
+                [x1, y0, z1],
+                [x1, y1, z1],
+                [x0, y1, z1]
+            ]
+            # Define the indices for triangular faces of the cuboid
+            I = [0, 0, 0, 4, 4, 5, 1, 2, 3, 3, 6, 7]
+            J = [1, 3, 4, 5, 7, 6, 2, 3, 0, 7, 5, 4]
+            K = [3, 4, 7, 7, 5, 2, 3, 0, 1, 6, 6, 5]
+            # Extract vertex coordinates
+            x_vals = [v[0] for v in vertices]
+            y_vals = [v[1] for v in vertices]
+            z_vals = [v[2] for v in vertices]
+            bar = go.Mesh3d(
+                x=x_vals,
+                y=y_vals,
+                z=z_vals,
+                i=I,
+                j=J,
+                k=K,
+                color="blue",
+                opacity=0.5,
+                showscale=False
+            )
+            bars.append(bar)
+
+# Create a translucent surface over the top of the bars.
+# We use a grid defined by the bin centers; note we transpose hist2d so that Z aligns with X and Y.
+X, Y = np.meshgrid(x_centers, y_centers)
+Z = hist2d.T
+surface = go.Surface(
+    x=X,
+    y=Y,
+    z=Z,
+    colorscale="Viridis",
+    opacity=0.5,
+    showscale=True
+)
+
+# Combine the bars and surface into one figure
+fig25 = go.Figure(data=bars + [surface])
+fig25.add_annotation(
+    text=global_text,
+    xref="paper", yref="paper",
+    x=1.05, y=1,
+    showarrow=False,
+    bordercolor="black",
+    borderwidth=1
+)
+fig25.update_layout(
+    title="Plot 25: 3D Histogram of POKF vs POE with Translucent Surface",
+    scene=dict(
+        xaxis_title="POKF",
+        yaxis_title="POE",
+        zaxis_title="Count"
+    )
+)
+
+# Add a slider to control the opacity of the surface plot.
+# The slider steps update only the opacity of the surface trace (which is the last trace in the data list).
+opacity_values = [round(i/10, 1) for i in range(1, 11)]
+slider_steps = []
+# There are len(bars) bars and 1 surface trace. We update only the last element.
+for op in opacity_values:
+    # Create an array of opacities: leave the bars unchanged and update the surface opacity.
+    new_opacities = [bar.opacity for bar in bars] + [op]
+    slider_steps.append(dict(
+        method="restyle",
+        args=[{"opacity": new_opacities}],
+        label=str(op)
+    ))
+fig25.update_layout(sliders=[dict(
+    active=4,
+    currentvalue={"prefix": "Surface Opacity: "},
+    pad={"t": 50},
+    steps=slider_steps
+)])
+fig25.write_html("plot25.html")
