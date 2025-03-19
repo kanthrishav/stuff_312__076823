@@ -1,0 +1,27 @@
+custom_js = """
+<script>
+  // Automatically get the first Plotly div on the page
+  var plotDiv = document.getElementsByClassName('plotly-graph-div')[0];
+  plotDiv.on('plotly_relayout', function(eventData) {
+      // Determine the new x and y ranges; if not provided, use current layout ranges.
+      var xrange = eventData['xaxis.range'] || plotDiv.layout.xaxis.range;
+      var yrange = eventData['yaxis.range'] || plotDiv.layout.yaxis.range;
+      
+      // Get the data from the first trace (assuming scatter plot)
+      var xData = plotDiv.data[0].x;
+      var yData = plotDiv.data[0].y;
+      var visibleCount = 0;
+      
+      // Count points that fall within the current view
+      for (var i = 0; i < xData.length; i++) {
+          if (xData[i] >= xrange[0] && xData[i] <= xrange[1] &&
+              yData[i] >= yrange[0] && yData[i] <= yrange[1]) {
+              visibleCount++;
+          }
+      }
+      
+      // Update the annotation text at index 1 with the new count
+      Plotly.relayout(plotDiv, {'annotations[1].text': 'Detections in view: ' + visibleCount});
+  });
+</script>
+"""
