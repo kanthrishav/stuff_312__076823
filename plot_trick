@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+"""
+Complete Dummy Data Generation and Detection Visualization for Radar Tracker
+
+This script generates dummy CSV files for:
+  - Detections ("detections.csv")
+  - Ego Motion ("ego_motion.csv")
+  - Ground Truth ("ground_truth.csv")
+
+The dummy data obeys:
+  - 100,000 radar cycles.
+  - Each cycle has 1,000 detections.
+  - 10 potential targets (types: car, pedestrian, long_vehicle, bicycle) appear/disappear.
+  - Actual target detections have higher SNR/RCS; clutter, ghost, and mirror detections are added.
+  - Ego motion simulates movement with occasional turns.
+  
+After generating the data, the script plots the detection data using Plotly:
+  - For each timestamp ("mc"), the x-axis of the plot is the detection’s y position and the y-axis is the detection’s x position.
+  - Marker size is 4 for points whose label is not "irrelevant" and 2 for "irrelevant" points.
+  - Colors: "inEgoLaneLOS" = red; "inLeftLaneLOS" and "inRightLaneLOS" = blue; "irrelevant" = grey.
+  - Hover text for each point displays "vx", "vy", "poe", "dp", and "pfd".
+  - For each timestamp, a dotted black line (width 1) is drawn from the origin to a point 5m away in the direction of the ego's yaw angle (from "egoYawAngle") – with axes swapped.
+  - An animated slider enables stepping through timestamps.
+  - The plot is written to an HTML file ("detection_plot.html").
+
+Optimized with scattergl (WebGL) and precomputed frames for performance.
+"""
+
+# --------------------------- Imports and Logging ---------------------------
+import os
+import math
+import random
+import logging
+import numpy as np
+import pandas as pd
+import pyarrow.feather as feather
+import plotly.graph_objects as go
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.cluster import AgglomerativeClustering
+from collections import defaultdict
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# --------------------------- Global Parameters ---------------------------
+# IMPORTANT: For real use, set NUM_CYCLES=100000 and DETECTIONS_PER_CYCLE=1000.
+# For testing, you may reduce these numbers.
+NUM_CYCLES = 100000
+DETECTIONS_PER_CYCLE = 1000
+
+NUM_TARGETS = 10  # Number of potential targets
+TARGET_TYPES = {
+    "car": {"min_dets": 3, "max_dets": 10, "rcs_range": (10, 30)},
+    "pedestrian": {"min_dets": 1, "max_dets": 5, "rcs_range": (0, 5)},
+    "bicycle": {"min_dets": 1, "max_dets": 5, "rcs_range": (1, 5)},
+    "long_vehicle": {"min_dets": 5, "max_dets": 20, "rcs_range": (20, 40)}
+}
+target_ids = list(range(1, NUM_TARGETS + 1))
+target_info = {tid: {"type": random.choice(list(TARGET_TYPES.keys()))} for tid in target_ids}
+
+# Ego motion parameters
+EGO_SPEED_RANGE = (10, 20)       # m/s
+EGO_ACCEL_RANGE = (-1, 1)        # m/s^2
+EGO_YAW_RATE_RANGE = (-0.1, 0.1)  # rad/s
+
+# Radar parameters
+FOV_DEG = 120                   # Field-of-view: -60° to +60°.
+MAX_RANGE = 150                 # Maximum detection range in meters.
+
+# --------------------------- Helper Functions ---------------------------
+def random_in_range(low, high):
+    return random.uniform(low, high)
+
+def add_noise(value, noise_std):
+    return value + np.random.normal(0, noise_std)
+
+# --------------------------- Generate Ego Motion ---------------------------
+def generate_ego_motion():
+    """Generates ego motion data for each radar cycle."""
+    ego_rows = []
+    for cycle in range(1, NUM_CYCLES + 1):
+        ego_speed = random_in_range(*EGO_SPEED_RANGE)
+        acceleration = random_in_range(*EGO_ACCEL_RANGE)
+        heading = math.radians(10) * math.sin(2 * math.pi * cycle / NUM_CYCLES)
+        yaw_rate = random_in_range(*EGO_YAW_RATE_RANGE)
+        ego_rows.append({
+            "radar_cycle": cycle,
+            "ego_speed": ego_speed,
+            "acceleration": acceleration,
+            "heading": heading,
+            "yaw_rate": yaw_rate,
+            "egoYawAngle": heading  # For simplicity, use heading as egoYawAngle.
+        })
+    return pd.DataFrame(ego_rows)
+
+# --------------------------- Generate Ground Truth ---------------------------
+def generate_ground_truth():
+    """
+    Generates ground truth data for targets.
+    For each cycle, each target is active with 50% probability.
+    Ground truth includes positions, velocities, dimensions, and orientation.
+    """
+    gt_rows = []
+    for cycle in range(1, NUM_CYCLES + 1):
+        for tid in target_ids:
+            if random.random() > 0.5:
+                continue
+            x_pos = random_in_range(10, MAX_RANGE)
+            y_pos = random_in_range(-MAX_RANGE/2, MAX_RANGE/2)
+            x_vel = random_in_range(-10, 30)
+            y_vel = random_in_range(-5, 5)
+            yaw_rate = random_in_range(-0.2, 0.2)
+            ttype = target_info[tid]["type"]
+            if ttype == "car":
+                length = random_in_range(3.5, 5)
+                width = random_in_range(1.5, 2)
+                height = random_in_range(1.2, 1.8)
+            elif ttype == "pedestrian":
+                length = random_in_range(0.3, 0.6)
+                width = random_in_range(0.3, 0.6)
+                height = random_in_range(1.5, 1.8)
+            elif ttype == "bicycle":
+                length = random_in_range(1.5, 2)
+                width = random_in_range(0.5, 0.8)
+                height = random_in_range(1.2, 1.6)
+            elif ttype == "long_vehicle":
+                length = random_in_range(6, 12)
+                width = random_in_range(2.5, 3)
+                height = random_in_range(2.5, 3.5)
+            else:
+                length, width, height = 4, 2, 1.5
+            orientation = random_in_range(-math.pi, math.pi)
+            gt_rows.append({
+                "radar_cycle": cycle,
+                "target_id": tid,
+                "target_x_position": x_pos,
+                "target_y_position": y_pos,
+                "target_x_velocity": x_vel,
+                "target_y_velocity": y_vel,
+                "target_yaw_rate": yaw_rate,
+                "target_length": length,
+                "target_width": width,
+                "target_height": height,
+                "target_orientation": orientation,
+                "target_type": ttype
+            })
+    return pd.DataFrame(gt_rows)
+
+# --------------------------- Generate Detections ---------------------------
+def generate_detections():
+    """
+    Generates detection data for each cycle.
+    For each cycle:
+      - Use ground truth to generate actual target detections.
+      - For each active target, generate detections based on its type.
+      - Add clutter, ghost, and mirror detections to reach DETECTIONS_PER_CYCLE.
+      - Clutter, ghost, mirror detections are distinguishable (e.g., lower SNR, lower RCS).
+    """
+    detection_rows = []
+    gt_df = generate_ground_truth()  # Ground truth for simulation.
+    for cycle in range(1, NUM_CYCLES + 1):
+        # Get ground truth for this cycle.
+        cycle_gt = gt_df[gt_df["radar_cycle"] == cycle]
+        # Generate detections for each target.
+        for _, row in cycle_gt.iterrows():
+            tid = row["target_id"]
+            ttype = row["target_type"]
+            det_range = TARGET_TYPES.get(ttype, {"min_dets": 1, "max_dets": 5})
+            num_dets = random.randint(det_range["min_dets"], det_range["max_dets"])
+            # Compute true range and azimuth.
+            true_range = math.sqrt(row["target_x_position"]**2 + row["target_y_position"]**2)
+            true_azimuth = math.atan2(row["target_y_position"], row["target_x_position"])
+            fov_rad = math.radians(FOV_DEG) / 2
+            true_azimuth = max(-fov_rad, min(fov_rad, true_azimuth))
+            for i in range(num_dets):
+                radial_range = add_noise(true_range, noise_std=0.5)
+                az1 = add_noise(true_azimuth, noise_std=0.02)
+                az2 = add_noise(true_azimuth, noise_std=0.02)
+                az_var1 = random_in_range(0.005, 0.02)
+                az_var2 = random_in_range(0.005, 0.02)
+                az_model_err1 = random_in_range(0, 0.01)
+                az_model_err2 = random_in_range(0, 0.01)
+                el1 = add_noise(0, noise_std=0.01)
+                el2 = add_noise(0, noise_std=0.01)
+                el_var1 = random_in_range(0.001, 0.01)
+                el_var2 = random_in_range(0.001, 0.01)
+                el_model_err1 = random_in_range(0, 0.005)
+                el_model_err2 = random_in_range(0, 0.005)
+                # Compute relative radial velocity.
+                dx = row["target_x_position"]
+                dy = row["target_y_position"]
+                dist = true_range if true_range > 0 else 1
+                unit_x, unit_y = dx/dist, dy/dist
+                true_rrv = row["target_x_velocity"] * unit_x + row["target_y_velocity"] * unit_y
+                rrv_hyps = [add_noise(true_rrv, noise_std=0.2) for _ in range(5)]
+                rrv_vars = [random_in_range(0.1, 0.5) for _ in range(5)]
+                snr = random_in_range(15, 30)
+                rcs_low, rcs_high = TARGET_TYPES[ttype]["rcs_range"]
+                rcs = random_in_range(rcs_low, rcs_high)
+                rss = random_in_range(-60, -40)
+                sub_beamformer = random.choice([0, 1])
+                detection_rows.append({
+                    "radar_cycle": cycle,
+                    "id": f"{cycle}_{tid}_{i}",
+                    "x": radial_range * math.cos(true_azimuth),  # true x position wrt sensor
+                    "y": radial_range * math.sin(true_azimuth),  # true y position
+                    "vx": add_noise(row["target_x_velocity"], noise_std=0.5),
+                    "vy": add_noise(row["target_y_velocity"], noise_std=0.5),
+                    "poe": random_in_range(0.8, 1.0),
+                    "pfd": random_in_range(0.8, 1.0),
+                    "label": "inEgoLaneLOS",  # assume actual targets are in ego lane for now
+                    "dp": random_in_range(0.7, 1.0),
+                    "egoYawAngle": row["target_orientation"],  # for simulation, use target orientation as egoYawAngle
+                    # Multi-hypothesis attributes:
+                    "relative_radial_velocity_hyp1": rrv_hyps[0],
+                    "relative_radial_velocity_hyp2": rrv_hyps[1],
+                    "relative_radial_velocity_hyp3": rrv_hyps[2],
+                    "relative_radial_velocity_hyp4": rrv_hyps[3],
+                    "relative_radial_velocity_hyp5": rrv_hyps[4],
+                    "rrv_var_hyp1": rrv_vars[0],
+                    "rrv_var_hyp2": rrv_vars[1],
+                    "rrv_var_hyp3": rrv_vars[2],
+                    "rrv_var_hyp4": rrv_vars[3],
+                    "rrv_var_hyp5": rrv_vars[4],
+                    "azimuth_angle_hyp1": az1,
+                    "azimuth_angle_hyp2": az2,
+                    "azimuth_var_hyp1": az_var1,
+                    "azimuth_var_hyp2": az_var2,
+                    "azimuth_model_error_hyp1": az_model_err1,
+                    "azimuth_model_error_hyp2": az_model_err2,
+                    "elevation_angle_hyp1": el1,
+                    "elevation_angle_hyp2": el2,
+                    "elevation_var_hyp1": el_var1,
+                    "elevation_var_hyp2": el_var2,
+                    "elevation_model_error_hyp1": el_model_err1,
+                    "elevation_model_error_hyp2": el_model_err2,
+                    "detection_type": "target"
+                })
+        # Fill remaining detections to reach DETECTIONS_PER_CYCLE.
+        cycle_detections = [d for d in detection_rows if d["radar_cycle"] == cycle]
+        current_count = len(cycle_detections)
+        remaining = DETECTIONS_PER_CYCLE - current_count
+        if remaining > 0:
+            num_clutter = int(0.8 * remaining)
+            num_ghost = int(0.1 * remaining)
+            num_mirror = remaining - num_clutter - num_ghost
+            for _ in range(num_clutter):
+                radial_range = random_in_range(10, MAX_RANGE)
+                azimuth = random_in_range(-math.radians(60), math.radians(60))
+                detection_rows.append({
+                    "radar_cycle": cycle,
+                    "id": f"{cycle}_clutter_{_}",
+                    "x": radial_range * math.cos(azimuth),
+                    "y": radial_range * math.sin(azimuth),
+                    "vx": random_in_range(-10, 10),
+                    "vy": random_in_range(-10, 10),
+                    "poe": random_in_range(0, 0.5),
+                    "pfd": random_in_range(0, 0.5),
+                    "label": "irrelevant",
+                    "dp": random_in_range(0, 0.5),
+                    "egoYawAngle": random_in_range(-math.pi, math.pi),
+                    "relative_radial_velocity_hyp1": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp2": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp3": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp4": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp5": random_in_range(-10, 10),
+                    "rrv_var_hyp1": random_in_range(1, 2),
+                    "rrv_var_hyp2": random_in_range(1, 2),
+                    "rrv_var_hyp3": random_in_range(1, 2),
+                    "rrv_var_hyp4": random_in_range(1, 2),
+                    "rrv_var_hyp5": random_in_range(1, 2),
+                    "azimuth_angle_hyp1": azimuth,
+                    "azimuth_angle_hyp2": azimuth + random.uniform(-0.1, 0.1),
+                    "azimuth_var_hyp1": random_in_range(0.1, 0.2),
+                    "azimuth_var_hyp2": random_in_range(0.1, 0.2),
+                    "azimuth_model_error_hyp1": random_in_range(0.05, 0.1),
+                    "azimuth_model_error_hyp2": random_in_range(0.05, 0.1),
+                    "elevation_angle_hyp1": random_in_range(-0.1, 0.1),
+                    "elevation_angle_hyp2": random_in_range(-0.1, 0.1),
+                    "elevation_var_hyp1": random_in_range(0.05, 0.1),
+                    "elevation_var_hyp2": random_in_range(0.05, 0.1),
+                    "elevation_model_error_hyp1": random_in_range(0.02, 0.05),
+                    "elevation_model_error_hyp2": random_in_range(0.02, 0.05),
+                    "snr": random_in_range(0, 5),
+                    "rcs": random_in_range(0, 2),
+                    "received_signal_strength": random_in_range(-100, -80),
+                    "sub_beamformer": 0,
+                    "detection_type": "clutter"
+                })
+            for _ in range(num_ghost):
+                radial_range = random_in_range(10, MAX_RANGE)
+                azimuth = random_in_range(-math.radians(60), math.radians(60))
+                detection_rows.append({
+                    "radar_cycle": cycle,
+                    "id": f"{cycle}_ghost_{_}",
+                    "x": radial_range * math.cos(azimuth),
+                    "y": radial_range * math.sin(azimuth),
+                    "vx": random_in_range(-10, 10),
+                    "vy": random_in_range(-10, 10),
+                    "poe": random_in_range(0, 0.5),
+                    "pfd": random_in_range(0, 0.5),
+                    "label": "irrelevant",
+                    "dp": random_in_range(0, 0.5),
+                    "egoYawAngle": random_in_range(-math.pi, math.pi),
+                    "relative_radial_velocity_hyp1": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp2": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp3": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp4": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp5": random_in_range(-10, 10),
+                    "rrv_var_hyp1": random_in_range(1, 2),
+                    "rrv_var_hyp2": random_in_range(1, 2),
+                    "rrv_var_hyp3": random_in_range(1, 2),
+                    "rrv_var_hyp4": random_in_range(1, 2),
+                    "rrv_var_hyp5": random_in_range(1, 2),
+                    "azimuth_angle_hyp1": azimuth,
+                    "azimuth_angle_hyp2": azimuth + random.uniform(-0.1, 0.1),
+                    "azimuth_var_hyp1": random_in_range(0.1, 0.2),
+                    "azimuth_var_hyp2": random_in_range(0.1, 0.2),
+                    "azimuth_model_error_hyp1": random_in_range(0.05, 0.1),
+                    "azimuth_model_error_hyp2": random_in_range(0.05, 0.1),
+                    "elevation_angle_hyp1": random_in_range(-0.1, 0.1),
+                    "elevation_angle_hyp2": random_in_range(-0.1, 0.1),
+                    "elevation_var_hyp1": random_in_range(0.05, 0.1),
+                    "elevation_var_hyp2": random_in_range(0.05, 0.1),
+                    "elevation_model_error_hyp1": random_in_range(0.02, 0.05),
+                    "elevation_model_error_hyp2": random_in_range(0.02, 0.05),
+                    "snr": random_in_range(0, 5),
+                    "rcs": random_in_range(0, 2),
+                    "received_signal_strength": random_in_range(-100, -80),
+                    "sub_beamformer": 0,
+                    "detection_type": "ghost"
+                })
+            for _ in range(num_mirror):
+                radial_range = random_in_range(10, MAX_RANGE)
+                azimuth = random_in_range(-math.radians(60), math.radians(60))
+                mirror_azimuth = -azimuth
+                detection_rows.append({
+                    "radar_cycle": cycle,
+                    "id": f"{cycle}_mirror_{_}",
+                    "x": radial_range * math.cos(mirror_azimuth),
+                    "y": radial_range * math.sin(mirror_azimuth),
+                    "vx": random_in_range(-10, 10),
+                    "vy": random_in_range(-10, 10),
+                    "poe": random_in_range(0, 0.5),
+                    "pfd": random_in_range(0, 0.5),
+                    "label": "irrelevant",
+                    "dp": random_in_range(0, 0.5),
+                    "egoYawAngle": random_in_range(-math.pi, math.pi),
+                    "relative_radial_velocity_hyp1": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp2": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp3": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp4": random_in_range(-10, 10),
+                    "relative_radial_velocity_hyp5": random_in_range(-10, 10),
+                    "rrv_var_hyp1": random_in_range(1, 2),
+                    "rrv_var_hyp2": random_in_range(1, 2),
+                    "rrv_var_hyp3": random_in_range(1, 2),
+                    "rrv_var_hyp4": random_in_range(1, 2),
+                    "rrv_var_hyp5": random_in_range(1, 2),
+                    "azimuth_angle_hyp1": mirror_azimuth,
+                    "azimuth_angle_hyp2": mirror_azimuth + random.uniform(-0.1, 0.1),
+                    "azimuth_var_hyp1": random_in_range(0.1, 0.2),
+                    "azimuth_var_hyp2": random_in_range(0.1, 0.2),
+                    "azimuth_model_error_hyp1": random_in_range(0.05, 0.1),
+                    "azimuth_model_error_hyp2": random_in_range(0.05, 0.1),
+                    "elevation_angle_hyp1": random_in_range(-0.1, 0.1),
+                    "elevation_angle_hyp2": random_in_range(-0.1, 0.1),
+                    "elevation_var_hyp1": random_in_range(0.05, 0.1),
+                    "elevation_var_hyp2": random_in_range(0.05, 0.1),
+                    "elevation_model_error_hyp1": random_in_range(0.02, 0.05),
+                    "elevation_model_error_hyp2": random_in_range(0.02, 0.05),
+                    "snr": random_in_range(0, 5),
+                    "rcs": random_in_range(0, 2),
+                    "received_signal_strength": random_in_range(-100, -80),
+                    "sub_beamformer": 0,
+                    "detection_type": "mirror"
+                })
+    logger.info("Detection generation complete for %d cycles.", NUM_CYCLES)
+    return pd.DataFrame(detection_rows)
+
+def generate_dummy_data():
+    """Generates dummy CSV files for ego motion, ground truth, and detections."""
+    logger.info("Generating dummy data files...")
+    ego_df = generate_ego_motion()
+    gt_df = generate_ground_truth()
+    det_df = generate_detections()
+    ego_df.to_csv("ego_motion.csv", index=False)
+    logger.info("Ego motion data saved to ego_motion.csv.")
+    gt_df.to_csv("ground_truth.csv", index=False)
+    logger.info("Ground truth data saved to ground_truth.csv.")
+    det_df.to_csv("detections.csv", index=False)
+    logger.info("Detection data saved to detections.csv.")
+    logger.info("Dummy data generation complete.")
+
+# --------------------------- 9. Visualization of Tracks (Animated with Slider) ---------------------------
+# Mapping for dynamic property labels and colors.
+DYNAMIC_PROPERTY_LABELS = {
+    0: "STATIONARY",
+    1: "MOVING",
+    2: "ONCOMING",
+    3: "CROSSINGTOLEFT",
+    4: "CROSSINGTORIGHT"
+}
+DYNAMIC_PROPERTY_COLORS = {
+    "STATIONARY": "gray",
+    "MOVING": "blue",
+    "ONCOMING": "red",
+    "CROSSINGTOLEFT": "green",
+    "CROSSINGTORIGHT": "orange"
+}
+
+def generate_hover_text(track: dict) -> str:
+    """Generates hover text for a track with all required attributes."""
+    obj_class_probs = track.get("object_class", [])
+    if isinstance(obj_class_probs, list) and len(obj_class_probs) == 5:
+        obj_class_idx = int(np.argmax(obj_class_probs))
+        obj_class_str = ["CAR", "PEDESTRIAN", "BICYCLIST", "MOTORBIKE", "LONG VEHICLE"][obj_class_idx]
+    else:
+        obj_class_str = str(obj_class_probs)
+    dyn_prop_probs = track.get("dynamic_property", [])
+    if isinstance(dyn_prop_probs, list) and len(dyn_prop_probs) == 5:
+        dyn_prop_idx = int(np.argmax(dyn_prop_probs))
+        dyn_prop_str = DYNAMIC_PROPERTY_LABELS.get(dyn_prop_idx, "UNKNOWN")
+    else:
+        dyn_prop_str = str(dyn_prop_probs)
+    hover_text = (
+        f"Dist X: {track.get('dist_x', 0):.2f}<br>"
+        f"Dist Y: {track.get('dist_y', 0):.2f}<br>"
+        f"Vabs X: {track.get('vabs_x', 0):.2f}<br>"
+        f"Vabs Y: {track.get('vabs_y', 0):.2f}<br>"
+        f"Vrel X: {track.get('vrel_x', 0):.2f}<br>"
+        f"Vrel Y: {track.get('vrel_y', 0):.2f}<br>"
+        f"Accel X: {track.get('accel_x', 0):.2f}<br>"
+        f"Accel Y: {track.get('accel_y', 0):.2f}<br>"
+        f"Orientation: {track.get('orientation', 0):.2f} rad<br>"
+        f"Yaw Rate: {track.get('yaw_rate', 0):.2f}<br>"
+        f"Variances: {', '.join([f'{v:.2f}' for v in track.get('variances', [0]*10)])}<br>"
+        f"Prob Exist: {track.get('prob_existence', 0):.2f}<br>"
+        f"Prob Ghost: {track.get('prob_ghost', 0):.2f}<br>"
+        f"RCS: {track.get('rcs', 0):.2f}<br>"
+        f"SNR: {track.get('snr', 0):.2f}<br>"
+        f"Length: {track.get('length', 0):.2f}<br>"
+        f"Width: {track.get('width', 0):.2f}<br>"
+        f"Age: {track.get('age', 0):.2f}<br>"
+        f"Height: {track.get('height', 0):.2f}<br>"
+        f"Height Var: {track.get('height_variance', 0):.2f}<br>"
+        f"Corners: {track.get('corners', [])}<br>"
+        f"Object Class: {obj_class_str}<br>"
+        f"Dynamic Prop: {dyn_prop_str}"
+    )
+    return hover_text
+
+def visualize_tracks(tracks_by_cycle: dict, ground_truth_file: str):
+    """
+    Creates an animated Plotly figure with a slider.
+    Each frame corresponds to one radar cycle.
+    For each cycle:
+      - Plots detections (tracks) as markers (using scattergl) with:
+          x-axis = y (position), y-axis = x (position) [swapped].
+      - Marker size: 4 for points with label not "irrelevant"; 2 for "irrelevant".
+      - Colors: "inEgoLaneLOS" = red; "inLeftLaneLOS" and "inRightLaneLOS" = blue; "irrelevant" = grey.
+      - Adds a dotted black line (width 1) from origin to (5*sin(egoYawAngle), 5*cos(egoYawAngle)) for that cycle.
+    The plot is written to an HTML file.
+    """
+    logger.info("Starting animated track visualization.")
+    # Assume tracks_by_cycle is a dict: {mc: list of track dicts}.
+    # Also load ground truth (for visualization, we simply plot a blue line).
+    try:
+        gt_df = pd.read_csv(ground_truth_file)
+    except Exception as e:
+        logger.error("Error loading ground truth file: %s", e)
+        raise RuntimeError(f"Error loading ground truth file: {e}")
+    if not {"target_x_position", "target_y_position"}.issubset(gt_df.columns):
+        raise ValueError("Ground truth file must contain 'target_x_position' and 'target_y_position' columns.")
+    gt_x = gt_df["target_x_position"].values
+    gt_y = gt_df["target_y_position"].values
+
+    cycles_sorted = sorted(tracks_by_cycle.keys())
+    init_cycle = cycles_sorted[0]
+    init_tracks = tracks_by_cycle[init_cycle]
+    data = []
+    # Ground truth trace.
+    data.append(go.Scattergl(
+        x=gt_x,
+        y=gt_y,
+        mode="lines",
+        line=dict(color="blue", width=2),
+        name="Ground Truth"
+    ))
+    # Plot tracks for the initial cycle.
+    for track in init_tracks:
+        # For tracks, plot the point: use y position as x-axis and x position as y-axis.
+        x_val = track.get("y", 0) if "y" in track else track.get("dist_y", 0)
+        y_val = track.get("x", 0) if "x" in track else track.get("dist_x", 0)
+        # Determine marker size and color based on label.
+        label = track.get("label", "irrelevant")
+        size = 2 if label == "irrelevant" else 4
+        color = {"inEgoLaneLOS": "red",
+                 "inLeftLaneLOS": "blue",
+                 "inRightLaneLOS": "blue",
+                 "irrelevant": "grey"}.get(label, "black")
+        data.append(go.Scattergl(
+            x=[x_val],
+            y=[y_val],
+            mode="markers",
+            marker=dict(size=size, color=color),
+            name=f"Point {track.get('id','')}",
+            hovertext=f"vx: {track.get('vx',0):.2f}<br>vy: {track.get('vy',0):.2f}<br>poe: {track.get('poe',0):.2f}<br>dp: {track.get('dp',0):.2f}<br>pfd: {track.get('pfd',0):.2f}",
+            hoverinfo="text"
+        ))
+    # Add ego yaw line for initial cycle.
+    # For each cycle, egoYawAngle is unique. We take it from the first row of that cycle.
+    if len(init_tracks) > 0:
+        ego_yaw = init_tracks[0].get("egoYawAngle", 0)
+    else:
+        ego_yaw = 0
+    # Compute line endpoint: normally (5*cos, 5*sin), but swap axes.
+    arrow_x = 5 * math.sin(ego_yaw)
+    arrow_y = 5 * math.cos(ego_yaw)
+    data.append(go.Scattergl(
+        x=[0, arrow_x],
+        y=[0, arrow_y],
+        mode="lines",
+        line=dict(color="black", width=1, dash="dot"),
+        name="Ego Yaw"
+    ))
+    
+    frames = []
+    for cycle in cycles_sorted:
+        # For each timestamp, filter points (simulate that tracks_by_cycle now contain detections)
+        # Here, assume the same dataframe structure as initial.
+        frame_traces = []
+        # Ground truth remains constant.
+        frame_traces.append(go.Scattergl(
+            x=gt_x,
+            y=gt_y,
+            mode="lines",
+            line=dict(color="blue", width=2),
+            name="Ground Truth"
+        ))
+        # For each detection in this cycle.
+        cycle_tracks = tracks_by_cycle[cycle]
+        for track in cycle_tracks:
+            x_val = track.get("y", 0) if "y" in track else track.get("dist_y", 0)
+            y_val = track.get("x", 0) if "x" in track else track.get("dist_x", 0)
+            label = track.get("label", "irrelevant")
+            size = 2 if label == "irrelevant" else 4
+            color = {"inEgoLaneLOS": "red",
+                     "inLeftLaneLOS": "blue",
+                     "inRightLaneLOS": "blue",
+                     "irrelevant": "grey"}.get(label, "black")
+            frame_traces.append(go.Scattergl(
+                x=[x_val],
+                y=[y_val],
+                mode="markers",
+                marker=dict(size=size, color=color),
+                name=f"Point {track.get('id','')}",
+                hovertext=f"vx: {track.get('vx',0):.2f}<br>vy: {track.get('vy',0):.2f}<br>poe: {track.get('poe',0):.2f}<br>dp: {track.get('dp',0):.2f}<br>pfd: {track.get('pfd',0):.2f}",
+                hoverinfo="text"
+            ))
+        # Ego yaw line for this cycle.
+        if len(cycle_tracks) > 0:
+            ego_yaw = cycle_tracks[0].get("egoYawAngle", 0)
+        else:
+            ego_yaw = 0
+        arrow_x = 5 * math.sin(ego_yaw)
+        arrow_y = 5 * math.cos(ego_yaw)
+        frame_traces.append(go.Scattergl(
+            x=[0, arrow_x],
+            y=[0, arrow_y],
+            mode="lines",
+            line=dict(color="black", width=1, dash="dot"),
+            name="Ego Yaw"
+        ))
+        frames.append(go.Frame(data=frame_traces, name=str(cycle)))
+    
+    slider_steps = []
+    for cycle in cycles_sorted:
+        slider_steps.append({
+            "args": [[str(cycle)], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
+            "label": str(cycle),
+            "method": "animate"
+        })
+    
+    layout = go.Layout(
+        title="Detection Visualization by Timestamp",
+        xaxis_title="Y Position (m)",
+        yaxis_title="X Position (m)",
+        template="plotly_dark",
+        updatemenus=[{
+            "buttons": [
+                {
+                    "args": [None, {"frame": {"duration": 100, "redraw": True}, "fromcurrent": True}],
+                    "label": "Play",
+                    "method": "animate"
+                },
+                {
+                    "args": [[None], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
+                    "label": "Pause",
+                    "method": "animate"
+                }
+            ],
+            "direction": "left",
+            "pad": {"r": 10, "t": 70},
+            "showactive": False,
+            "type": "buttons",
+            "x": 0.1,
+            "xanchor": "right",
+            "y": 0,
+            "yanchor": "top"
+        }],
+        sliders=[{
+            "active": 0,
+            "currentvalue": {
+                "font": {"size": 20},
+                "prefix": "Timestamp (mc): ",
+                "visible": True,
+                "xanchor": "right"
+            },
+            "pad": {"b": 10, "t": 50},
+            "len": 0.9,
+            "steps": slider_steps
+        }]
+    )
+    
+    fig = go.Figure(data=data, layout=layout, frames=frames)
+    # Write the figure to an HTML file.
+    fig.write_html("detection_plot.html", include_plotlyjs="cdn")
+    logger.info("Detection plot written to detection_plot.html.")
+
+# --------------------------- 10. Main Pipeline ---------------------------
+def main():
+    logger.info("Starting main pipeline.")
+    
+    try:
+        logger.info("Generating dummy data files...")
+        generate_dummy_data()
+        logger.info("Dummy data generation complete.")
+    except Exception as e:
+        logger.error("Error generating dummy data: %s", e)
+        return
+
+    try:
+        logger.info("Loading data...")
+        merged_df = load_data("detections.csv", "ego_motion.csv", "ground_truth.csv")
+        logger.info("Data loaded successfully with %d records.", len(merged_df))
+    except Exception as e:
+        logger.error("Error loading data: %s", e)
+        return
+
+    try:
+        logger.info("Preprocessing data...")
+        preprocessed_df = preprocess_data(merged_df)
+        logger.info("Data preprocessed successfully.")
+    except Exception as e:
+        logger.error("Error during preprocessing: %s", e)
+        return
+
+    try:
+        cycles = sorted(preprocessed_df["radar_cycle"].unique())
+        logger.info("Extracted %d radar cycles.", len(cycles))
+    except Exception as e:
+        logger.error("Error extracting radar cycles: %s", e)
+        return
+
+    all_cycle_tracks = []   # For final aggregation.
+    tracks_by_cycle = {}    # For animated visualization.
+    prev_tracks = None
+
+    for cycle in cycles:
+        logger.info("Processing radar cycle: %d", cycle)
+        try:
+            cycle_data = preprocessed_df[preprocessed_df["radar_cycle"] == cycle]
+        except Exception as e:
+            logger.error("Error filtering data for cycle %d: %s", cycle, e)
+            continue
+
+        try:
+            fused_cycle_data = multi_hypothesis_fusion(cycle_data.copy())
+        except Exception as e:
+            logger.error("Error during multi-hypothesis fusion for cycle %d: %s", cycle, e)
+            continue
+
+        try:
+            embeddings = feature_extraction(fused_cycle_data)
+        except Exception as e:
+            logger.error("Error during feature extraction for cycle %d: %s", cycle, e)
+            continue
+
+        try:
+            assoc_results = data_association(embeddings)
+        except Exception as e:
+            logger.error("Error during data association for cycle %d: %s", cycle, e)
+            continue
+
+        try:
+            cycle_tracks = track_creation(
+                assoc_results,
+                fused_cycle_data.to_numpy(),
+                contextual_embeddings=assoc_results.get("contextual_embeddings")
+            )
+            for track in cycle_tracks:
+                track["radar_cycle"] = cycle
+        except Exception as e:
+            logger.error("Error during track creation for cycle %d: %s", cycle, e)
+            continue
+
+        try:
+            df_cycle_tracks = pd.DataFrame(cycle_tracks)
+            feather.write_feather(df_cycle_tracks, f"tracks_cycle_{cycle}.feather")
+            logger.info("Saved tracks for cycle %d.", cycle)
+        except Exception as e:
+            logger.error("Error saving Feather file for cycle %d: %s", cycle, e)
+
+        if prev_tracks is None:
+            updated_tracks = cycle_tracks
+        else:
+            try:
+                new_measurements = np.stack([dict_to_vector(track) for track in cycle_tracks], axis=0)
+            except Exception as e:
+                logger.error("Error converting tracks to vectors in cycle %d: %s", cycle, e)
+                continue
+            try:
+                updated_tracks = track_propagation(prev_tracks, new_measurements=new_measurements)
+            except Exception as e:
+                logger.error("Error during track propagation for cycle %d: %s", cycle, e)
+                continue
+
+        all_cycle_tracks.extend(updated_tracks)
+        prev_tracks = updated_tracks
+        tracks_by_cycle[cycle] = updated_tracks
+        logger.info("Cycle %d processed with %d tracks.", cycle, len(updated_tracks))
+
+    if len(all_cycle_tracks) == 0:
+        logger.error("No tracks processed. Exiting pipeline.")
+        return
+
+    try:
+        logger.info("Aggregating track states over cycles...")
+        aggregated_tracks = aggregate_tracks(all_cycle_tracks)
+        logger.info("Track aggregation complete with %d aggregated tracks.", len(aggregated_tracks))
+    except Exception as e:
+        logger.error("Error during track aggregation: %s", e)
+        return
+
+    try:
+        logger.info("Visualizing animated tracks...")
+        visualize_tracks(tracks_by_cycle, "ground_truth.csv")
+        logger.info("Animated track visualization complete.")
+    except Exception as e:
+        logger.error("Error during animated track visualization: %s", e)
+        return
+
+    try:
+        logger.info("Visualizing detections and ground truth...")
+        visualize_detections_and_ground_truth()
+        logger.info("Detections and ground truth visualization complete.")
+    except Exception as e:
+        logger.error("Error during detections/GT visualization: %s", e)
+        return
+
+    logger.info("Main pipeline complete.")
+
+if __name__ == "__main__":
+    main()
