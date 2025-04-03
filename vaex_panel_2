@@ -20,13 +20,15 @@ df = df[df['relevant']]
 
 # Compute object classification
 def classify_objects(df):
-    conditions = [
-        (df.y >= -2) & (df.y <= 2),
-        (df.y >= -6) & (df.y < -2),
-        (df.y > 2) & (df.y <= 6)
-    ]
-    labels = ['inEgoLane', 'inLeftEgoLane', 'inRightEgoLane']
-    df['labels'] = np.select(conditions, labels, default='irrelevant')
+    df['inEgoLane'] = (df.y >= -2) & (df.y <= 2)
+    df['inLeftEgoLane'] = (df.y >= -6) & (df.y < -2)
+    df['inRightEgoLane'] = (df.y > 2) & (df.y <= 6)
+    
+    df['labels'] = 'irrelevant'  # Default label
+    df['labels'] = df['inEgoLane'].map({True: 'inEgoLane'}).fillna(df['labels'])
+    df['labels'] = df['inLeftEgoLane'].map({True: 'inLeftEgoLane'}).fillna(df['labels'])
+    df['labels'] = df['inRightEgoLane'].map({True: 'inRightEgoLane'}).fillna(df['labels'])
+    
     return df
 
 df = classify_objects(df)
