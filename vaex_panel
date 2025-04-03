@@ -1,0 +1,132 @@
+import vaex
+import panel as pn
+import plotly.graph_objects as go
+import numpy as np
+
+# Load data efficiently with Vaex
+def load_data(file_path):
+    df = vaex.open(file_path)
+    return df
+
+# Preprocess Data
+def preprocess_data(df):
+    df["egoYawRateDeg"] = np.rad2deg(df["egoYawRate"])  # Convert to degrees
+    df = df[df["egoYawRateDeg"] < 2]  # Filter relevant radar cycles
+    
+    # Determine direct line of sight and lane categorization
+    df["label"] = "irrelevant"  # Default label
+    df["inEgoLane"] = (df["y"] >= -2) & (df["y"] <= 2)
+    df["inLeftEgoLane"] = (df["y"] >= -6) & (df["y"] < -2)
+    df["inRightEgoLane"] = (df["y"] > 2) & (df["y"] <= 6)
+    df["label"] = df["inEgoLane"].replace({True: "inEgoLane"})
+    df["label"] = df["inLeftEgoLane"].replace({True: "inLeftEgoLane"})
+    df["label"] = df["inRightEgoLane"].replace({True: "inRightEgoLane"})
+    return df
+
+# Create Top Section Plot
+def create_top_plot(df, current_cycle, y_max=100):
+    cycle_data = df[df["mc"] == current_cycle]
+    
+    fig = go.Figure()
+    
+    colors = {"inEgoLane": "red", "inLeftEgoLane": "blue", "inRightEgoLane": "green", "irrelevant": "grey"}
+    sizes = {"irrelevant": 2, "default": 4}
+    
+    for label, color in colors.items():
+        subset = cycle_data[cycle_data["label"] == label]
+        fig.add_trace(go.Scattergl(
+            x=subset["y"].tolist(),
+            y=subset["x"].tolist(),
+            mode='markers',
+            marker=dict(size=sizes.get(label, sizes["default"]), color=color),
+            name=label,
+            text=subset[["vx", "vy", "dp", "poe", "pfd"]].to_pandas_df().to_dict('records')
+        ))
+    
+    # Ego marker
+    ego_data = cycle_data["egoSpeed"].unique()[0], cycle_data["egoYawRate"].unique()[0]
+    fig.add_trace(go.Scatter(
+        x=[0], y=[0], mode="markers",
+        marker=dict(size=3, color="black"),
+        name="Ego Position",
+        text=f"Speed: {ego_data[0]}\nYawRate: {ego_data[1]}"
+    ))
+    
+    # Ego yaw direction arrow
+    ego_yaw = cycle_data["egoYawRate"].unique()[0]
+    fig.add_trace(go.Scatter(
+        x=[0, 5 * np.sin(ego_yaw)],
+        y=[0, 5 * np.cos(ego_yaw)],
+        mode='lines',
+        line=dict(color='black', width=1, dash='dot'),
+        name="Ego Yaw Direction"
+    ))
+    
+    fig.update_layout(title="Object Positions", xaxis=dict(range=[-10, 10]), yaxis=dict(range=[0, y_max]))
+    return fig
+
+# Create Historical POE Plots
+def create_poe_plot(df, current_cycle, label):
+    subset = df[df["label"] == label]
+    nearest_obj = subset[np.abs(subset["y"]) == np.min(np.abs(subset["y"]))]
+    if nearest_obj.shape[0] == 0:
+        return go.Figure()
+    
+    object_id = nearest_obj["id"].tolist()[0]
+    data = df[df["id"] == object_id]
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=data["mc"].tolist(),
+        y=data["poe"].tolist(),
+        mode='lines+markers',
+        name=f"{object_id} (POE)"
+    ))
+    fig.update_layout(title=f"POE of Object {object_id}")
+    return fig
+
+# Initialize Panel Layout
+pn.extension()
+data_file = "radar_data.feather"
+df = load_data(data_file)
+df = preprocess_data(df)
+
+current_cycle = df["mc"].min()
+y_max_slider = pn.widgets.FloatSlider(name="Y-Axis Max", start=-200, end=200, value=100)
+cycle_slider = pn.widgets.IntSlider(name="Radar Cycle", start=int(df["mc"].min()), end=int(df["mc"].max()), value=int(current_cycle))
+
+# Create plots
+top_plot = pn.pane.Plotly(create_top_plot(df, current_cycle, y_max_slider.value))
+left_poe_plot = pn.pane.Plotly(create_poe_plot(df, current_cycle, "inLeftEgoLane"))
+center_poe_plot = pn.pane.Plotly(create_poe_plot(df, current_cycle, "inEgoLane"))
+right_poe_plot = pn.pane.Plotly(create_poe_plot(df, current_cycle, "inRightEgoLane"))
+
+# Update function
+def update_plots(event):
+    new_cycle = cycle_slider.value
+    y_max = y_max_slider.value
+    top_plot.object = create_top_plot(df, new_cycle, y_max)
+    left_poe_plot.object = create_poe_plot(df, new_cycle, "inLeftEgoLane")
+    center_poe_plot.object = create_poe_plot(df, new_cycle, "inEgoLane")
+    right_poe_plot.object = create_poe_plot(df, new_cycle, "inRightEgoLane")
+
+cycle_slider.param.watch(update_plots, "value")
+y_max_slider.param.watch(update_plots, "value")
+
+# Save to HTML function
+def save_to_html():
+    top_plot.object.write_html("dashboard_snapshot.html")
+    print("Saved current dashboard state to dashboard_snapshot.html")
+
+save_button = pn.widgets.Button(name="Save Dashboard", button_type="primary")
+save_button.on_click(lambda event: save_to_html())
+
+dash = pn.Column(
+    pn.pane.Markdown("## Objects Of Interest (OOI)"),
+    pn.Row(top_plot, y_max_slider),
+    cycle_slider,
+    pn.Row(left_poe_plot, center_poe_plot, right_poe_plot),
+    save_button
+)
+
+dash.servable()
