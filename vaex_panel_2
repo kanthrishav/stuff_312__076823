@@ -1,7 +1,7 @@
 import vaex
 import panel as pn
 import numpy as np
-import hvplot.vaex
+import hvplot.pandas
 import holoviews as hv
 import param
 from bokeh.models import HoverTool
@@ -12,56 +12,57 @@ import sys
 # Load data from feather file via pandas
 file_path = sys.argv[1]
 df_pd = pd.read_feather(file_path)
-df = vaex.from_pandas(df_pd)
 
-# Filter relevant radar cycles
-df['relevant'] = df['egoYawRate'] < 2
-df = df[df['relevant']]
-
-# Compute object classification
+# Compute object classification in Pandas before converting to Vaex
 def classify_objects(df):
-    df['inEgoLane'] = (df.y >= -2) & (df.y <= 2)
-    df['inLeftEgoLane'] = (df.y >= -6) & (df.y < -2)
-    df['inRightEgoLane'] = (df.y > 2) & (df.y <= 6)
-    
-    df['labels'] = 'irrelevant'  # Default label
-    df['labels'] = df['inEgoLane'].map({True: 'inEgoLane'}).fillna(df['labels'])
-    df['labels'] = df['inLeftEgoLane'].map({True: 'inLeftEgoLane'}).fillna(df['labels'])
-    df['labels'] = df['inRightEgoLane'].map({True: 'inRightEgoLane'}).fillna(df['labels'])
-    
+    conditions = [
+        (df['y'] >= -2) & (df['y'] <= 2),
+        (df['y'] >= -6) & (df['y'] < -2),
+        (df['y'] > 2) & (df['y'] <= 6)
+    ]
+    labels = ['inEgoLane', 'inLeftEgoLane', 'inRightEgoLane']
+    df['labels'] = np.select(conditions, labels, default='irrelevant')
     return df
 
-df = classify_objects(df)
+df_pd = classify_objects(df_pd)
+df = vaex.from_pandas(df_pd)
 
 # Widgets
 y_slider = pn.widgets.IntSlider(name='Y Axis Limit', start=-200, end=200, value=100)
 x_slider = pn.widgets.IntSlider(name='X Axis Limit', start=1, end=30, value=10)
-cycle_slider = pn.widgets.IntSlider(name='Radar Cycle', start=df.mc.min(), end=df.mc.max(), value=df.mc.min())
+cycle_slider = pn.widgets.IntSlider(name='Radar Cycle', start=int(df_pd['mc'].min()), end=int(df_pd['mc'].max()), value=int(df_pd['mc'].min()))
 save_button = pn.widgets.Button(name='Save HTML', button_type='primary')
 
 # Function to transform object bounds into ego coordinates
 def transform_bounds(df):
-    cos_o, sin_o = np.cos(df.o), np.sin(df.o)
-    x_corners = [df.x + cos_o * df.lf - sin_o * df.wl,
-                  df.x - cos_o * df.lr - sin_o * df.wl,
-                  df.x - cos_o * df.lr + sin_o * df.wr,
-                  df.x + cos_o * df.lf + sin_o * df.wr,
-                  df.x + cos_o * df.lf - sin_o * df.wl]  # Closing the rectangle
-    y_corners = [df.y + sin_o * df.lf + cos_o * df.wl,
-                  df.y - sin_o * df.lr + cos_o * df.wl,
-                  df.y - sin_o * df.lr - cos_o * df.wr,
-                  df.y + sin_o * df.lf - cos_o * df.wr,
-                  df.y + sin_o * df.lf + cos_o * df.wl]  # Closing the rectangle
+    cos_o, sin_o = np.cos(df['o']), np.sin(df['o'])
+    x_corners = np.column_stack([
+        df['x'] + cos_o * df['lf'] - sin_o * df['wl'],
+        df['x'] - cos_o * df['lr'] - sin_o * df['wl'],
+        df['x'] - cos_o * df['lr'] + sin_o * df['wr'],
+        df['x'] + cos_o * df['lf'] + sin_o * df['wr'],
+        df['x'] + cos_o * df['lf'] - sin_o * df['wl']
+    ])
+    y_corners = np.column_stack([
+        df['y'] + sin_o * df['lf'] + cos_o * df['wl'],
+        df['y'] - sin_o * df['lr'] + cos_o * df['wl'],
+        df['y'] - sin_o * df['lr'] - cos_o * df['wr'],
+        df['y'] + sin_o * df['lf'] - cos_o * df['wr'],
+        df['y'] + sin_o * df['lf'] + cos_o * df['wl']
+    ])
     return x_corners, y_corners
 
 # Plotting function
 def plot_objects(cycle, xlim, ylim):
-    cycle_df = df[df.mc == cycle]
+    cycle_df = df[df['mc'] == cycle].to_pandas_df()
     x_corners, y_corners = transform_bounds(cycle_df)
     
-    scatter = cycle_df.hvplot.scatter('y', 'x', by='labels', size=3, color={'inEgoLane': 'red', 'inLeftEgoLane': 'blue', 'inRightEgoLane': 'green', 'irrelevant': 'gray'})
+    color_map = {'inEgoLane': 'red', 'inLeftEgoLane': 'blue', 'inRightEgoLane': 'green', 'irrelevant': 'gray'}
+    scatter = cycle_df.hvplot.scatter(
+        x='y', y='x', by='labels', size=3, cmap=color_map
+    )
     
-    bounds = [hv.Curve((y_corners[i], x_corners[i]), group=str(cycle_df.id[i])) for i in range(len(cycle_df))]
+    bounds = [hv.Curve(list(zip(y_corners[i], x_corners[i]))) for i in range(len(cycle_df))]
     bounds = hv.Overlay(bounds)
     
     return (scatter * bounds).opts(width=1920, height=400, xlim=(-xlim, xlim), ylim=(0, ylim))
@@ -72,7 +73,7 @@ def update_top_plot(cycle, xlim, ylim):
 
 def save_html(event):
     html_path = "dashboard_snapshot.html"
-    pn.panel(update_top_plot).save(html_path)
+    pn.panel(update_top_plot()).save(html_path)
     webbrowser.open(html_path)
 
 save_button.on_click(save_html)
@@ -87,14 +88,15 @@ def bottom_section(cycle):
         width=1440
     )
 
-top_section = pn.Column(update_top_plot, width=1920)
-controls = pn.Row(y_slider, x_slider, cycle_slider, save_button)
+top_section = pn.Row(update_top_plot, width=1920)
+controls = pn.Row(y_slider, x_slider, cycle_slider, save_button, sizing_mode='stretch_width')
 
 dashboard = pn.Column(
     pn.pane.Markdown("# Objects Of Interest (OOI)", style={'font-family': 'monospace condensed'}),
     controls,
     top_section,
-    bottom_section
+    bottom_section,
+    sizing_mode='stretch_width'
 )
 
 dashboard.show()
