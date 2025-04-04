@@ -12,7 +12,7 @@ from numba import njit, prange
 # ---------------------------
 # INITIALIZE PANEL (fix extension warning)
 # ---------------------------
-pn.extension()  # Do not specify "bokeh" explicitly to avoid the extension warning
+pn.extension()  # Do not specify "bokeh" explicitly
 pn.config.raw_css.append("""
     .bk-root { font-family: "Courier New", monospace; }
     body { margin: 0; padding: 0; }
@@ -105,14 +105,13 @@ else:
     sel = np.where(mask)[0]
     pdf['OOI'] = 0  # initialize all to 0
     if sel.size > 0:
+        # For each unique (mc, label) pair, choose the object with minimum range.
         sel_mc = mc_arr[sel]
         sel_label = labels_arr[sel]
         sel_r = r_arr[sel]
         order_sel = np.argsort(sel_r)
         ordered_sel = sel[order_sel]
-        # Create keys from (mc, label)
         keys = np.stack((mc_arr[ordered_sel], labels_arr[ordered_sel]), axis=1)
-        # Find unique (mc, label) pairs; the first occurrence (lowest r) is chosen
         unique_keys, unique_idx = np.unique(keys, axis=0, return_index=True)
         selected_indices = ordered_sel[unique_idx]
         pdf.loc[selected_indices, 'OOI'] = 1
@@ -133,14 +132,15 @@ df = vaex.from_pandas(pdf)
 # ---------------------------
 dashboard_start = time.time()
 
-# --- Create main slider widgets (in a horizontal row) ---
+# --- Main slider widgets (placed in a horizontal row) ---
+# Increase Radar Cycle Slider width for finer control
 y_axis_slider = pn.widgets.FloatSlider(name='Y-axis Slider', start=-200, end=200, value=100, step=1)
 x_axis_slider = pn.widgets.FloatSlider(name='X-axis Slider', start=1, end=30, value=10, step=1)
 radar_cycle_slider = pn.widgets.IntSlider(name='Radar Cycle Slider', 
                                            start=int(df.mc.min()), end=int(df.mc.max()),
-                                           value=int(df.mc.min()), step=1)
+                                           value=int(df.mc.min()), step=1, width=600)
 
-# --- Create filter sliders (stacked vertically in Graph Subsection 1) ---
+# --- Filter sliders (stacked vertically in Graph Subsection 1) ---
 eyr_slider = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, value=2, step=0.01)
 es_slider = pn.widgets.FloatSlider(name='ES Slider', start=0, end=10, value=0.2, step=0.1)
 mp_slider = pn.widgets.FloatSlider(name='MP Slider', start=0, end=100, value=71, step=1)
@@ -154,7 +154,7 @@ save_button = pn.widgets.Button(name='Save Current State', button_type='primary'
 # ---------------------------
 object_scatter_source = ColumnDataSource(data=dict(x=[], y=[], color=[], size=[], hover=[]))
 object_patch_source = ColumnDataSource(data=dict(xs=[], ys=[], color=[]))
-ego_source = ColumnDataSource(data=dict(x=[0], y=[0], hover=["mc: NA, egoSpeed: NA, egoYawRate: NA"]))
+ego_source = ColumnDataSource(data=dict(x=[0], y=[0], hover=[""]))
 
 ts_source_ego = ColumnDataSource(data=dict(mc=[], poe=[]))
 ts_source_left = ColumnDataSource(data=dict(mc=[], poe=[]))
@@ -163,21 +163,29 @@ ts_source_right = ColumnDataSource(data=dict(mc=[], poe=[]))
 # ---------------------------
 # Create Bokeh Figures
 # ---------------------------
-object_plot = figure(title="Object Plot", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset")
+# Object Plot: Increase height by 60% (set explicit height)
+object_plot = figure(title="Object Plot", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", height=640)
 scatter_renderer = object_plot.scatter('x', 'y', source=object_scatter_source,
                                          size='size', color='color', fill_alpha=0.6)
-object_plot.patches('xs', 'ys', source=object_patch_source, fill_alpha=0.1, line_color='color')
+# Draw rectangular bounds (with thicker lines and higher fill opacity)
+object_plot.patches('xs', 'ys', source=object_patch_source, fill_alpha=0.4, line_color='color', line_width=2)
 object_plot.scatter('x', 'y', source=ego_source, size=3, color='black', fill_alpha=1.0)
 object_plot.add_tools(HoverTool(tooltips=[("Details", "@hover")], renderers=[scatter_renderer]))
 
+# Time-series plots for POE vs. mc
 ts_plot_ego = figure(title="inEgoLaneOOI", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", y_range=(0, 100))
+ts_plot_ego.line('mc', 'poe', source=ts_source_ego, line_width=1, color='blue')
+ts_plot_ego.circle('mc', 'poe', source=ts_source_ego, size=3, color='blue')
+
 ts_plot_left = figure(title="inLeftEgoLaneOOI", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", y_range=(0, 100))
+ts_plot_left.line('mc', 'poe', source=ts_source_left, line_width=1, color='green')
+ts_plot_left.circle('mc', 'poe', source=ts_source_left, size=3, color='green')
+
 ts_plot_right = figure(title="inRightEgoLaneOOI", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", y_range=(0, 100))
-for p in [ts_plot_ego, ts_plot_left, ts_plot_right]:
-    p.scatter([], [])
+ts_plot_right.line('mc', 'poe', source=ts_source_right, line_width=1, color='magenta')
+ts_plot_right.circle('mc', 'poe', source=ts_source_right, size=3, color='magenta')
 
 empty_plot = figure(sizing_mode="stretch_both", toolbar_location=None)
-empty_plot.scatter([], [])
 
 # ---------------------------
 # Callback Functions for Fast Updates
@@ -185,9 +193,10 @@ empty_plot.scatter([], [])
 def update_object_plot():
     """Update the main object plot (scatter and patches) instantly using ColumnDataSource."""
     current_mc = radar_cycle_slider.value
-    x_lim = x_axis_slider.value
-    y_lim = y_axis_slider.value
-    
+    # Use the X-axis and Y-axis slider values as specified:
+    x_lim = x_axis_slider.value  # x-axis: from -x_lim to +x_lim
+    y_lim = y_axis_slider.value  # y-axis: from 0 to y_lim
+
     object_plot.x_range.start = -x_lim
     object_plot.x_range.end = x_lim
     object_plot.y_range.start = 0
@@ -195,23 +204,23 @@ def update_object_plot():
 
     # Filter data for the current radar cycle and apply filter sliders
     df_cycle = df[df.mc == current_mc].to_pandas_df()
-    # Apply additional filters
     df_cycle = df_cycle[(df_cycle.egoYawRate < eyr_slider.value) &
                         (df_cycle.egoSpeed > es_slider.value) &
                         (df_cycle.mirrProb < mp_slider.value) &
                         (df_cycle.lc > age_slider.value)]
     
-    # If after filtering no objects remain, reset sources and set ego defaults
+    # If no objects are available after filtering, leave the data sources empty.
     if df_cycle.empty:
         object_scatter_source.data = dict(x=[], y=[], color=[], size=[], hover=[])
         object_patch_source.data = dict(xs=[], ys=[], color=[])
-        ego_source.data = dict(x=[0], y=[0], hover=["mc: NA, egoSpeed: NA, egoYawRate: NA"])
+        ego_source.data = dict(x=[0], y=[0], hover=[""])
         return
 
     scatter_x, scatter_y, colors, sizes, hovers = [], [], [], [], []
     patch_xs, patch_ys, patch_colors = [], [], []
 
     for _, row in df_cycle.iterrows():
+        # Determine color and size based on OOI, LOS and label
         if row['OOI'] == 1:
             color = 'red'
             size = 4
@@ -228,22 +237,22 @@ def update_object_plot():
             color = 'grey'
             size = 2
 
-        # Note: x-axis displays y distance; y-axis displays x distance
+        # For plotting, swap coordinates: x-axis shows y distance, y-axis shows x distance.
         scatter_x.append(row['y'])
         scatter_y.append(row['x'])
         colors.append(color)
         sizes.append(size)
         
-        # Hover text (only for objects with Motion==1)
+        # Format hover text in one horizontal row.
+        # id, mirrProb, dp, poe as int; vx, vy as float (2 decimals); pfd as float (4 decimals)
         if row['Motion'] == 1:
-            hover_text = (f"id: {row['id']}, lc: {row['lc']}, mirrProb: {row['mirrProb']}, "
-                          f"vx: {row['vx']}, vy: {row['vy']}, dp: {row['dp']}, "
-                          f"poe: {row['poe']}, pfd: {row['pfd']}")
+            hover_text = (f"id: {int(row['id'])}, mirrProb: {int(row['mirrProb'])}, dp: {int(row['dp'])}, "
+                          f"poe: {int(row['poe'])}, vx: {row['vx']:.2f}, vy: {row['vy']:.2f}, pfd: {row['pfd']:.4f}")
         else:
             hover_text = ""
         hovers.append(hover_text)
         
-        # Compute rectangular bounds from object's position, orientation and corner coordinates
+        # Compute rectangular bounds from object's local corner data.
         lf = row['lf'] * 0.001
         lr = row['lr'] * 0.001
         wl = row['wl'] * 0.001
@@ -258,7 +267,7 @@ def update_object_plot():
         R = np.array([[cos_t, -sin_t],
                       [sin_t,  cos_t]])
         global_corners = (R @ local_corners.T).T + np.array([row['x'], row['y']])
-        # Swap coordinates for plotting
+        # Swap coordinates for plotting (x = y, y = x)
         patch_xs.append(global_corners[:, 1].tolist())
         patch_ys.append(global_corners[:, 0].tolist())
         patch_colors.append(color)
@@ -266,7 +275,7 @@ def update_object_plot():
     object_scatter_source.data = dict(x=scatter_x, y=scatter_y, color=colors, size=sizes, hover=hovers)
     object_patch_source.data = dict(xs=patch_xs, ys=patch_ys, color=patch_colors)
     
-    # Update ego source safely (if df_cycle is not empty)
+    # Update ego point using the first object from the filtered set
     ego_info = df_cycle.iloc[0]
     ego_hover = f"mc: {ego_info['mc']}, egoSpeed: {ego_info['egoSpeed']}, egoYawRate: {ego_info['egoYawRate']}"
     ego_source.data = dict(x=[0], y=[0], hover=[ego_hover])
@@ -297,6 +306,7 @@ def update_all(event=None):
     ts_plot_left.title.text = title_left
     ts_plot_right.title.text = title_right
 
+# Attach callbacks to all relevant sliders.
 for widget in [radar_cycle_slider, x_axis_slider, y_axis_slider, eyr_slider, es_slider, mp_slider, age_slider]:
     widget.param.watch(update_all, 'value')
 
@@ -315,6 +325,7 @@ header_section = pn.pane.Markdown(
 
 slider_section = pn.Row(y_axis_slider, x_axis_slider, radar_cycle_slider, sizing_mode="stretch_width", height=50)
 
+# Arrange grid: 2 rows x 3 columns
 grid = pn.GridSpec(sizing_mode='stretch_both', max_height=600)
 grid[0, 0] = pn.Column(eyr_slider, es_slider, mp_slider, age_slider)  # Subsection 1: filter sliders
 grid[0, 1] = ts_plot_ego                                             # Subsection 2: POE time series (ego lane)
@@ -326,7 +337,7 @@ grid[1, 2] = ts_plot_right                                             # Subsect
 dashboard_layout = pn.Column(header_section, slider_section, grid, save_button,
                                sizing_mode="stretch_both", margin=0)
 
-# Ensure an initial update so that plots appear instantly
+# Ensure initial update with actual data from first radar cycle (no dummy data)
 update_all()
 
 dashboard_layout.servable()
