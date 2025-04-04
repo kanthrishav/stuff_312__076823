@@ -6,7 +6,7 @@ import pandas as pd
 import vaex
 import panel as pn
 from bokeh.plotting import figure
-from bokeh.models import ColumnDataSource, HoverTool
+from bokeh.models import ColumnDataSource, HoverTool, Span
 from numba import njit, prange
 
 # ---------------------------
@@ -22,7 +22,7 @@ print(f"[{time.time():.3f}] Panel extension loaded.")
 # ---------------------------
 # PARAMETERS & FILE PATHS
 # ---------------------------
-LOS_thresh = 0.1  # radians for LOS computation
+LOS_thresh = 0.035  # Updated threshold (radians)
 original_file_path = "data_original.feather"
 preprocessed_file_path = "data_preprocessed.feather"
 
@@ -133,12 +133,12 @@ df = vaex.from_pandas(pdf)
 dashboard_start = time.time()
 
 # --- Main slider widgets (placed in a horizontal row) ---
-# Increase Radar Cycle Slider width for finer control
+# Elongate Radar Cycle Slider by 200%
 y_axis_slider = pn.widgets.FloatSlider(name='Y-axis Slider', start=-200, end=200, value=100, step=1)
 x_axis_slider = pn.widgets.FloatSlider(name='X-axis Slider', start=1, end=30, value=10, step=1)
 radar_cycle_slider = pn.widgets.IntSlider(name='Radar Cycle Slider', 
                                            start=int(df.mc.min()), end=int(df.mc.max()),
-                                           value=int(df.mc.min()), step=1, width=600)
+                                           value=int(df.mc.min()), step=1, width=1200)
 
 # --- Filter sliders (stacked vertically in Graph Subsection 1) ---
 eyr_slider = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, value=2, step=0.01)
@@ -163,14 +163,33 @@ ts_source_right = ColumnDataSource(data=dict(mc=[], poe=[]))
 # ---------------------------
 # Create Bokeh Figures
 # ---------------------------
-# Object Plot: Increase height by 60% (set explicit height)
-object_plot = figure(title="Object Plot", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", height=640)
+# Object Plot: Increase height to 1000 and set y_range.start to -2
+object_plot = figure(title="Object Plot", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", height=1000)
+object_plot.x_range.start = -x_axis_slider.value
+object_plot.x_range.end = x_axis_slider.value
+object_plot.y_range.start = -2
+object_plot.y_range.end = y_axis_slider.value
+
+# Draw vertical dotted lines at x = -6, -2, 2, 6 (x-axis represents object y-distance)
+for xv in [-6, -2, 2, 6]:
+    span = Span(location=xv, dimension='height', line_color='purple', line_dash='dotted', line_width=1)
+    object_plot.add_layout(span)
+
+# Draw scatter points for objects
 scatter_renderer = object_plot.scatter('x', 'y', source=object_scatter_source,
                                          size='size', color='color', fill_alpha=0.6)
-# Draw rectangular bounds (with thicker lines and higher fill opacity)
-object_plot.patches('xs', 'ys', source=object_patch_source, fill_alpha=0.4, line_color='color', line_width=2)
-object_plot.scatter('x', 'y', source=ego_source, size=3, color='black', fill_alpha=1.0)
-object_plot.add_tools(HoverTool(tooltips=[("Details", "@hover")], renderers=[scatter_renderer]))
+# Draw rectangular bounds using patches.
+# Note: Each patch’s coordinates are explicitly closed by appending the first point.
+object_plot.patches('xs', 'ys', source=object_patch_source, fill_alpha=0.4, line_color='color', line_width=10)
+# Draw ego point at origin; scatter size increased to 4.
+ego_renderer = object_plot.scatter('x', 'y', source=ego_source, size=4, color='black', fill_alpha=1.0)
+
+# Hover tool for object scatter
+object_hover = HoverTool(tooltips=[("Details", "@hover")], renderers=[scatter_renderer])
+object_plot.add_tools(object_hover)
+# Separate hover tool for the ego point.
+ego_hover = HoverTool(tooltips=[("Ego", "@hover")], renderers=[ego_renderer])
+object_plot.add_tools(ego_hover)
 
 # Time-series plots for POE vs. mc
 ts_plot_ego = figure(title="inEgoLaneOOI", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", y_range=(0, 100))
@@ -193,13 +212,12 @@ empty_plot = figure(sizing_mode="stretch_both", toolbar_location=None)
 def update_object_plot():
     """Update the main object plot (scatter and patches) instantly using ColumnDataSource."""
     current_mc = radar_cycle_slider.value
-    # Use the X-axis and Y-axis slider values as specified:
+    # Use X-axis and Y-axis slider values:
     x_lim = x_axis_slider.value  # x-axis: from -x_lim to +x_lim
-    y_lim = y_axis_slider.value  # y-axis: from 0 to y_lim
-
+    y_lim = y_axis_slider.value  # y-axis: from -2 to y_lim (y_min now -2)
     object_plot.x_range.start = -x_lim
     object_plot.x_range.end = x_lim
-    object_plot.y_range.start = 0
+    object_plot.y_range.start = -2
     object_plot.y_range.end = y_lim
 
     # Filter data for the current radar cycle and apply filter sliders
@@ -209,7 +227,7 @@ def update_object_plot():
                         (df_cycle.mirrProb < mp_slider.value) &
                         (df_cycle.lc > age_slider.value)]
     
-    # If no objects are available after filtering, leave the data sources empty.
+    # If no objects are available after filtering, clear the data sources.
     if df_cycle.empty:
         object_scatter_source.data = dict(x=[], y=[], color=[], size=[], hover=[])
         object_patch_source.data = dict(xs=[], ys=[], color=[])
@@ -220,15 +238,15 @@ def update_object_plot():
     patch_xs, patch_ys, patch_colors = [], [], []
 
     for _, row in df_cycle.iterrows():
-        # Determine color and size based on OOI, LOS and label
+        # Determine color and size based on OOI, LOS and label.
         if row['OOI'] == 1:
             color = 'red'
             size = 4
         elif row['LOS'] == 1 and row['label'] == 1:
-            color = 'lightblue'
+            color = 'blue'  # Changed from lightblue
             size = 3
         elif row['LOS'] == 1 and row['label'] == 2:
-            color = 'lightgreen'
+            color = 'green'  # Changed from lightgreen
             size = 3
         elif row['LOS'] == 1 and row['label'] == 3:
             color = 'magenta'
@@ -237,13 +255,13 @@ def update_object_plot():
             color = 'grey'
             size = 2
 
-        # For plotting, swap coordinates: x-axis shows y distance, y-axis shows x distance.
+        # For plotting, swap coordinates: x-axis shows y-distance, y-axis shows x-distance.
         scatter_x.append(row['y'])
         scatter_y.append(row['x'])
         colors.append(color)
         sizes.append(size)
         
-        # Format hover text in one horizontal row.
+        # Format hover text for the object:
         # id, mirrProb, dp, poe as int; vx, vy as float (2 decimals); pfd as float (4 decimals)
         if row['Motion'] == 1:
             hover_text = (f"id: {int(row['id'])}, mirrProb: {int(row['mirrProb'])}, dp: {int(row['dp'])}, "
@@ -257,28 +275,38 @@ def update_object_plot():
         lr = row['lr'] * 0.001
         wl = row['wl'] * 0.001
         wr = row['wr'] * 0.001
+        # Define local corners: front-left, front-right, rear-right, rear-left.
         local_corners = np.array([[lf, wl],
                                   [lf, -wr],
                                   [-lr, -wr],
                                   [-lr, wl]])
+        # Compute rotation matrix and transform to ego coordinate system.
         theta = row['orient']
         cos_t = math.cos(theta)
         sin_t = math.sin(theta)
         R = np.array([[cos_t, -sin_t],
                       [sin_t,  cos_t]])
         global_corners = (R @ local_corners.T).T + np.array([row['x'], row['y']])
-        # Swap coordinates for plotting (x = y, y = x)
-        patch_xs.append(global_corners[:, 1].tolist())
-        patch_ys.append(global_corners[:, 0].tolist())
+        # Swap coordinates for plotting (x = global y, y = global x).
+        xs = global_corners[:, 1].tolist()
+        ys = global_corners[:, 0].tolist()
+        # Explicitly close the polygon by appending the first point.
+        xs.append(xs[0])
+        ys.append(ys[0])
+        patch_xs.append(xs)
+        patch_ys.append(ys)
         patch_colors.append(color)
         
     object_scatter_source.data = dict(x=scatter_x, y=scatter_y, color=colors, size=sizes, hover=hovers)
     object_patch_source.data = dict(xs=patch_xs, ys=patch_ys, color=patch_colors)
     
-    # Update ego point using the first object from the filtered set
+    # Update ego point: use the first object from the filtered set.
     ego_info = df_cycle.iloc[0]
-    ego_hover = f"mc: {ego_info['mc']}, egoSpeed: {ego_info['egoSpeed']}, egoYawRate: {ego_info['egoYawRate']}"
-    ego_source.data = dict(x=[0], y=[0], hover=[ego_hover])
+    # Convert egoYawRate from rad/s to deg/s and format values.
+    ego_hover_text = (f"mc: {int(ego_info['mc'])}, "
+                      f"egoSpeed: {ego_info['egoSpeed']:.3f}, "
+                      f"egoYawRate: {math.degrees(ego_info['egoYawRate']):.3f} deg/s")
+    ego_source.data = dict(x=[0], y=[0], hover=[ego_hover_text])
 
 def update_time_series(source, label_val, title_prefix):
     """Update the POE vs. mc plot for an object with a given label and OOI==1."""
@@ -325,8 +353,8 @@ header_section = pn.pane.Markdown(
 
 slider_section = pn.Row(y_axis_slider, x_axis_slider, radar_cycle_slider, sizing_mode="stretch_width", height=50)
 
-# Arrange grid: 2 rows x 3 columns
-grid = pn.GridSpec(sizing_mode='stretch_both', max_height=600)
+# Arrange grid: 2 rows x 3 columns; grid max_height set to 1000.
+grid = pn.GridSpec(sizing_mode='stretch_both', max_height=1000)
 grid[0, 0] = pn.Column(eyr_slider, es_slider, mp_slider, age_slider)  # Subsection 1: filter sliders
 grid[0, 1] = ts_plot_ego                                             # Subsection 2: POE time series (ego lane)
 grid[0, 2] = empty_plot                                              # Subsection 3: empty
@@ -337,7 +365,7 @@ grid[1, 2] = ts_plot_right                                             # Subsect
 dashboard_layout = pn.Column(header_section, slider_section, grid, save_button,
                                sizing_mode="stretch_both", margin=0)
 
-# Ensure initial update with actual data from first radar cycle (no dummy data)
+# Ensure initial update with actual data from the first radar cycle.
 update_all()
 
 dashboard_layout.servable()
