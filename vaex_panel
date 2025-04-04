@@ -22,7 +22,7 @@ print(f"[{time.time():.3f}] Panel extension loaded.")
 # ---------------------------
 # PARAMETERS & FILE PATHS
 # ---------------------------
-LOS_thresh = 0.035  # Updated LOS threshold
+LOS_thresh = 0.035  # Updated threshold
 original_file_path = "data_original.feather"
 preprocessed_file_path = "data_preprocessed.feather"
 
@@ -40,12 +40,12 @@ else:
     pdf = pd.read_feather(original_file_path)
     
     # --- Compute basic geometric quantities (vectorized) ---
-    pdf['az'] = np.arctan2(pdf['y'].values, pdf['x'].values)  # azimuth angle (radians)
-    pdf['r'] = np.hypot(pdf['x'].values, pdf['y'].values)       # range (distance)
-    pdf['Motion'] = np.where(pdf['dp'].isin([1, 2, 5, 6]), 1, 0)
-    print(f"[{time.time()-preprocess_start:.3f} sec] Basic columns (az, r, Motion) computed.")
+    pdf['az'] = np.arctan2(pdf['y'].values, pdf['x'].values)  # in radians
+    pdf['r'] = np.hypot(pdf['x'].values, pdf['y'].values)       # distance
+    pdf['Motion'] = np.where(pdf['dp'].isin([1,2,5,6]), 1, 0)
+    print(f"[{time.time()-preprocess_start:.3f} sec] Basic columns computed.")
 
-    # --- LOS Computation (fully parallelized with Numba) ---
+    # --- LOS Computation (parallelized with Numba) ---
     @njit(parallel=True)
     def compute_all_los(sorted_az, sorted_r, group_start, group_end, thresh):
         n_groups = group_start.shape[0]
@@ -63,7 +63,6 @@ else:
                 los_sorted[j] = flag
         return los_sorted
 
-    # Process groups by sorting by radar cycle
     mc_arr = pdf['mc'].values
     order = np.argsort(mc_arr)
     sorted_mc = mc_arr[order]
@@ -96,13 +95,13 @@ else:
     pdf['label'] = labels
     print(f"[{time.time()-preprocess_start:.3f} sec] Label column computed.")
 
-    # --- OOI Computation (fully vectorized using NumPy) ---
+    # --- OOI Computation (vectorized using NumPy) ---
     labels_arr = pdf['label'].values
     mc_arr = pdf['mc'].values
     r_arr = pdf['r'].values
     mask = (labels_arr == 1) | (labels_arr == 2) | (labels_arr == 3)
     sel = np.where(mask)[0]
-    pdf['OOI'] = 0  # initialize all to 0
+    pdf['OOI'] = 0
     if sel.size > 0:
         sel_mc = mc_arr[sel]
         sel_label = labels_arr[sel]
@@ -115,14 +114,13 @@ else:
         pdf.loc[selected_indices, 'OOI'] = 1
     print(f"[{time.time()-preprocess_start:.3f} sec] OOI column computed.")
 
-    # --- Save the preprocessed dataframe ---
     pdf.to_feather(preprocessed_file_path)
-    print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed dataframe saved to {preprocessed_file_path}.")
+    print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed dataframe saved.")
 
 print(f"[{time.time()-preprocess_start:.3f} sec] Data preprocessing complete.")
 print(f"[{time.time()-start_total:.3f} sec] Total initialization complete.")
 
-# Convert to Vaex dataframe for on-demand filtering
+# Use Vaex for on-demand filtering
 df = vaex.from_pandas(pdf)
 
 # ---------------------------
@@ -130,37 +128,34 @@ df = vaex.from_pandas(pdf)
 # ---------------------------
 dashboard_start = time.time()
 
-# --- Top Slider Section: Only Radar Cycle Slider (widened further) ---
-radar_cycle_slider = pn.widgets.IntSlider(
-    name='Radar Cycle Slider', 
-    start=int(df.mc.min()), 
-    end=int(df.mc.max()),
-    value=int(df.mc.min()), 
-    step=1, 
-    width=2400  # increased width by 200%
+# --- Radar Cycle Slider using unique values from dataframe ---
+unique_mcs = np.sort(pdf['mc'].unique())
+radar_cycle_slider = pn.widgets.DiscreteSlider(
+    name='Radar Cycle Slider',
+    options=list(unique_mcs),
+    value=unique_mcs[0],
+    width=1800
 )
 
-# --- Filter Panel: Vertical stack of filter sliders (placed in Graph Section - Subsection 1) ---
-# These include EYR, ES, MP, Age, and below them the X-axis and Y-axis sliders.
+# --- Filter Panel (placed in Graph Section - Subsection 1) ---
 eyr_slider = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, value=2, step=0.01)
 es_slider = pn.widgets.FloatSlider(name='ES Slider', start=0, end=10, value=0.2, step=0.1)
 mp_slider = pn.widgets.FloatSlider(name='MP Slider', start=0, end=100, value=71, step=1)
 age_slider = pn.widgets.FloatSlider(name='Age Slider', start=0, end=100, value=20, step=1)
+# Now place X-axis and Y-axis sliders here (vertically below Age Slider)
 x_axis_slider = pn.widgets.FloatSlider(name='X-axis Slider', start=1, end=30, value=10, step=1)
 y_axis_slider = pn.widgets.FloatSlider(name='Y-axis Slider', start=-50, end=200, value=100, step=1)
-# Note: y_axis_slider now controls the upper limit of the y-axis (object plot) while y_min is fixed to -2.
-
 filter_panel = pn.Column(eyr_slider, es_slider, mp_slider, age_slider, x_axis_slider, y_axis_slider, sizing_mode="stretch_width")
 
 # --- Save Button ---
 save_button = pn.widgets.Button(name='Save Current State', button_type='primary')
 
 # ---------------------------
-# Prepare ColumnDataSources for fast updates
+# Prepare ColumnDataSources
 # ---------------------------
 object_scatter_source = ColumnDataSource(data=dict(x=[], y=[], color=[], size=[], hover=[]))
-# New source for rectangle (bounding box) data:
-object_rect_source = ColumnDataSource(data=dict(rx=[], ry=[], rwidth=[], rheight=[], rangle=[], rcolor=[]))
+# For patches we use a patches glyph – each entry is a list of x coordinates and y coordinates.
+object_patch_source = ColumnDataSource(data=dict(xs=[], ys=[], color=[]))
 ego_source = ColumnDataSource(data=dict(x=[0], y=[0], hover=[""]))
 
 ts_source_ego = ColumnDataSource(data=dict(mc=[], poe=[]))
@@ -170,42 +165,48 @@ ts_source_right = ColumnDataSource(data=dict(mc=[], poe=[]))
 # ---------------------------
 # Create Bokeh Figures
 # ---------------------------
-# OBJECT PLOT: Elongated to height=1000 and with y_range starting at -2.
+# OBJECT PLOT: Height set to 1000; y_range starts at -2.
 object_plot = figure(
     title="Object Plot", 
     sizing_mode="stretch_both", 
     tools="pan,wheel_zoom,reset",
     height=1000
 )
+# Initially set x_range and y_range based on slider values.
 object_plot.x_range.start = -x_axis_slider.value
 object_plot.x_range.end = x_axis_slider.value
 object_plot.y_range.start = -2
 object_plot.y_range.end = y_axis_slider.value
 
-# Add vertical dotted lines at x = -6, -2, 2, 6 (x-axis of plot represents global y)
+# Vertical dotted lines at x = -6, -2, 2, 6 (x-axis shows global y)
 for xv in [-6, -2, 2, 6]:
     span = Span(location=xv, dimension='height', line_color='purple', line_dash='dotted', line_width=1)
     object_plot.add_layout(span)
 
-# Draw object scatter points (note: x = object's global y, y = object's global x)
+# Bold border lines on right and top edges.
+right_border = Span(location=object_plot.x_range.end, dimension='height', line_color="black", line_width=3)
+top_border = Span(location=object_plot.y_range.end, dimension='width', line_color="black", line_width=3)
+object_plot.add_layout(right_border)
+object_plot.add_layout(top_border)
+
+# Draw object scatter points.
 scatter_renderer = object_plot.scatter(
     'x', 'y', source=object_scatter_source,
     size='size', color='color', fill_alpha=0.6
 )
 
-# Draw bounding boxes using rect glyph.
-# The rect glyph parameters: x, y, width, height, angle.
-rect_renderer = object_plot.rect(
-    'rx', 'ry', width='rwidth', height='rheight', angle='rangle',
-    source=object_rect_source, fill_alpha=0.4, line_color='rcolor', line_width=10
+# Draw rectangular bounds using patches.
+patch_renderer = object_plot.patches(
+    'xs', 'ys', source=object_patch_source,
+    fill_alpha=0.5, line_color='color', line_width=10
 )
 
-# Draw ego point at origin; scatter size increased to 4.
+# Draw ego point at origin.
 ego_renderer = object_plot.scatter(
     'x', 'y', source=ego_source, size=4, color='black', fill_alpha=1.0
 )
 
-# Hover tools: one for object scatter, one for ego point.
+# Hover tools.
 object_hover = HoverTool(tooltips=[("Details", "@hover")], renderers=[scatter_renderer])
 object_plot.add_tools(object_hover)
 ego_hover = HoverTool(tooltips=[("Ego", "@hover")], renderers=[ego_renderer])
@@ -242,21 +243,25 @@ ts_plot_right.circle('mc', 'poe', source=ts_source_right, size=3, color='magenta
 empty_plot = figure(sizing_mode="stretch_both", toolbar_location=None)
 
 # ---------------------------
-# Callback Functions for Fast Updates
+# Callback Functions
 # ---------------------------
 def update_object_plot():
-    """Update the main object plot (scatter, bounding box, and ego point) instantly."""
+    """Update object plot (scatter, patches, ego point) using real data."""
     current_mc = radar_cycle_slider.value
-    # Update object plot axis limits using X and Y slider values.
+    # Update axis limits based on X-axis and Y-axis sliders.
     x_lim = x_axis_slider.value
     y_lim = y_axis_slider.value
     object_plot.x_range.start = -x_lim
     object_plot.x_range.end = x_lim
     object_plot.y_range.start = -2
     object_plot.y_range.end = y_lim
+    # Update right and top border spans.
+    right_border.location = object_plot.x_range.end
+    top_border.location = object_plot.y_range.end
 
-    # Filter data for the current radar cycle and apply filter sliders.
+    # Filter data for the current radar cycle.
     df_cycle = df[df.mc == current_mc].to_pandas_df()
+    # Apply additional filter sliders.
     df_cycle = df_cycle[
         (df_cycle.egoYawRate < eyr_slider.value) &
         (df_cycle.egoSpeed > es_slider.value) &
@@ -264,26 +269,26 @@ def update_object_plot():
         (df_cycle.lc > age_slider.value)
     ]
     
+    # (Since all mc values have objects, df_cycle should not be empty.)
     if df_cycle.empty:
         object_scatter_source.data = dict(x=[], y=[], color=[], size=[], hover=[])
-        object_rect_source.data = dict(rx=[], ry=[], rwidth=[], rheight=[], rangle=[], rcolor=[])
+        object_patch_source.data = dict(xs=[], ys=[], color=[])
         ego_source.data = dict(x=[0], y=[0], hover=[""])
         return
 
     scatter_x, scatter_y, colors, sizes, hovers = [], [], [], [], []
-    # For bounding boxes using rect glyph:
-    rect_rx, rect_ry, rect_widths, rect_heights, rect_angles, rect_colors = [], [], [], [], [], []
+    patch_xs, patch_ys, patch_colors = [], [], []
 
     for _, row in df_cycle.iterrows():
-        # Determine color and scatter size based on OOI, LOS, and label.
+        # Determine color and size.
         if row['OOI'] == 1:
             col = 'red'
             size_val = 4
         elif row['LOS'] == 1 and row['label'] == 1:
-            col = 'blue'  # changed to blue
+            col = 'blue'
             size_val = 3
         elif row['LOS'] == 1 and row['label'] == 2:
-            col = 'green'  # changed to green
+            col = 'green'
             size_val = 3
         elif row['LOS'] == 1 and row['label'] == 3:
             col = 'magenta'
@@ -292,63 +297,58 @@ def update_object_plot():
             col = 'grey'
             size_val = 2
 
-        # For scatter: x-axis displays object's global y, y-axis displays object's global x.
+        # For scatter: Plot x = object's global y, y = object's global x.
         scatter_x.append(row['y'])
         scatter_y.append(row['x'])
         colors.append(col)
         sizes.append(size_val)
-        # Format hover text: id, mirrProb, dp, poe as int; vx, vy as floats (2 decimals); pfd as float (4 decimals).
+        # Format hover text: id, mirrProb, dp, poe as int; vx, vy (2 decimals); pfd (4 decimals).
         if row['Motion'] == 1:
-            hover_text = (f"id: {int(row['id'])}, mirrProb: {int(row['mirrProb'])}, dp: {int(row['dp'])}, "
-                          f"poe: {int(row['poe'])}, vx: {row['vx']:.2f}, vy: {row['vy']:.2f}, pfd: {row['pfd']:.4f}")
+            hover_text = (f"id: {int(row['id'])}, mirrProb: {int(row['mirrProb'])}, "
+                          f"dp: {int(row['dp'])}, poe: {int(row['poe'])}, "
+                          f"vx: {row['vx']:.2f}, vy: {row['vy']:.2f}, pfd: {row['pfd']:.4f}")
         else:
             hover_text = ""
         hovers.append(hover_text)
         
-        # --- Compute bounding box using rect glyph ---
-        # Scale corner coordinates.
+        # --- Compute rectangular bounds using explicit corners ---
         lf = row['lf'] * 0.001
         lr = row['lr'] * 0.001
         wl = row['wl'] * 0.001
         wr = row['wr'] * 0.001
-        # Compute center in the object's local coordinate system.
-        center_local = ((lf - lr) / 2.0, (wl - wr) / 2.0)
-        # Dimensions: width = (wl + wr), height = (lf + lr)
-        obj_width = wl + wr
-        obj_length = lf + lr
-        # Rotation matrix for object orientation.
+        # Local corners: front-left, front-right, rear-right, rear-left.
+        local_corners = np.array([[lf, wl],
+                                   [lf, -wr],
+                                   [-lr, -wr],
+                                   [-lr, wl]])
+        # Rotation matrix.
         theta = row['orient']
-        cos_t = math.cos(theta)
-        sin_t = math.sin(theta)
-        # Global center = object's position + rotation*center_local.
-        global_center_x = row['x'] + (cos_t * center_local[0] - sin_t * center_local[1])
-        global_center_y = row['y'] + (sin_t * center_local[0] + cos_t * center_local[1])
-        # For plotting, swap: plot x = global_center_y, plot y = global_center_x.
-        rect_rx.append(global_center_y)
-        rect_ry.append(global_center_x)
-        # For the rect glyph, width is the object's width and height is the object's length.
-        rect_widths.append(obj_width)
-        rect_heights.append(obj_length)
-        # The rect glyph’s angle: convert object orientation to plot angle:
-        rect_angles.append(math.pi/2 - theta)
-        rect_colors.append(col)
+        R = np.array([[math.cos(theta), -math.sin(theta)],
+                      [math.sin(theta),  math.cos(theta)]])
+        # Global corners.
+        global_corners = (R @ local_corners.T).T + np.array([row['x'], row['y']])
+        # For plotting, swap coordinates: plot_x = global_corners[:,1], plot_y = global_corners[:,0].
+        poly_x = global_corners[:, 1].tolist()
+        poly_y = global_corners[:, 0].tolist()
+        # Close the polygon.
+        poly_x.append(poly_x[0])
+        poly_y.append(poly_y[0])
+        patch_xs.append(poly_x)
+        patch_ys.append(poly_y)
+        patch_colors.append(col)
     
     object_scatter_source.data = dict(x=scatter_x, y=scatter_y, color=colors, size=sizes, hover=hovers)
-    object_rect_source.data = dict(
-        rx=rect_rx, ry=rect_ry, rwidth=rect_widths, rheight=rect_heights, 
-        rangle=rect_angles, rcolor=rect_colors
-    )
+    object_patch_source.data = dict(xs=patch_xs, ys=patch_ys, color=patch_colors)
     
-    # Update ego point using first object from filtered data.
+    # Update ego point.
     ego_info = df_cycle.iloc[0]
-    # Convert egoYawRate from rad/s to deg/s and format values.
     ego_hover_text = (f"mc: {int(ego_info['mc'])}, "
                       f"egoSpeed: {ego_info['egoSpeed']:.3f}, "
                       f"egoYawRate: {math.degrees(ego_info['egoYawRate']):.3f} deg/s")
     ego_source.data = dict(x=[0], y=[0], hover=[ego_hover_text])
 
 def update_time_series(source, label_val, title_prefix):
-    """Update the POE vs. mc plot for an object with a given label and OOI==1."""
+    """Update POE vs. mc plot for an object with given label & OOI==1."""
     current_mc = radar_cycle_slider.value
     df_cycle = df[df.mc == current_mc].to_pandas_df()
     obj_data = df_cycle[(df_cycle.OOI == 1) & (df_cycle.label == label_val)]
@@ -373,19 +373,17 @@ def update_all(event=None):
     ts_plot_left.title.text = title_left
     ts_plot_right.title.text = title_right
 
-# Attach callbacks to all relevant sliders.
 for widget in [radar_cycle_slider, x_axis_slider, y_axis_slider, eyr_slider, es_slider, mp_slider, age_slider]:
     widget.param.watch(update_all, 'value')
 
 def save_callback(event):
     pn.panel(dashboard_layout).save('dashboard_state.html', resources='inline')
-    print(f"[{time.time()-dashboard_start:.3f} sec] Dashboard state saved to dashboard_state.html")
+    print(f"[{time.time()-dashboard_start:.3f} sec] Dashboard state saved.")
 save_button.on_click(save_callback)
 
 # ---------------------------
 # LAYOUT CONSTRUCTION
 # ---------------------------
-# Header section.
 header_section = pn.pane.Markdown(
     "<h1 style='font-family: Courier New, monospace; text-align: center;'>Objects Of Interest (OOI)</h1>",
     sizing_mode="stretch_width", height=50
@@ -394,25 +392,22 @@ header_section = pn.pane.Markdown(
 # Top slider section now contains only the Radar Cycle Slider.
 slider_section = pn.Row(radar_cycle_slider, sizing_mode="stretch_width", height=50)
 
-# Create a GridSpec with 2 rows x 3 columns; set max_height to 1000.
-# Layout assignment:
-#   - Cell (0,0): Filter Panel (vertical stack: EYR, ES, MP, Age, X-axis, Y-axis)
-#   - Cell (1,0): Time series plot for inLeftEgoLaneOOI.
-#   - Cells (0:2,1): Object Plot (merged vertically spanning rows 0 and 1 in column 1).
-#   - Cell (0,2): Time series plot for inEgoLaneOOI (moved from subsection 2 to subsection 3).
-#   - Cell (1,2): Time series plot for inRightEgoLaneOOI.
+# Create a GridSpec (max_height=1000) with 2 rows and 3 columns.
+# Layout:
+#  • Column 0: Filter Panel (row 0) and ts_plot_left (row 1)
+#  • Column 1: Object Plot spanning both rows (covering subsections 2 and 5)
+#  • Column 2: ts_plot_ego (row 0) and ts_plot_right (row 1)
 grid = pn.GridSpec(sizing_mode='stretch_both', max_height=1000)
 grid[0, 0] = filter_panel
 grid[1, 0] = ts_plot_left
-grid[0:2, 1] = object_plot  # Object Plot spans both rows in column 1.
+grid[0:2, 1] = object_plot
 grid[0, 2] = ts_plot_ego
 grid[1, 2] = ts_plot_right
 
-# Assemble the complete dashboard layout.
 dashboard_layout = pn.Column(header_section, slider_section, grid, save_button,
                                sizing_mode="stretch_both", margin=0)
 
-# Ensure initial update with real data from the first radar cycle.
+# Ensure initial update with real data.
 update_all()
 
 dashboard_layout.servable()
