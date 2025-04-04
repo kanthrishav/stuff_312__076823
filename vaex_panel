@@ -7,6 +7,7 @@ import vaex
 import panel as pn
 from bokeh.plotting import figure
 from bokeh.models import ColumnDataSource, HoverTool, Span
+from bokeh.io import curdoc
 from numba import njit, prange
 
 # ---------------------------
@@ -39,13 +40,13 @@ else:
     print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed file not found. Reading original data.")
     pdf = pd.read_feather(original_file_path)
     
-    # Compute basic geometric quantities
+    # Compute basic quantities
     pdf['az'] = np.arctan2(pdf['y'].values, pdf['x'].values)
     pdf['r'] = np.hypot(pdf['x'].values, pdf['y'].values)
     pdf['Motion'] = np.where(pdf['dp'].isin([1, 2, 5, 6]), 1, 0)
     print(f"[{time.time()-preprocess_start:.3f} sec] Basic columns computed.")
 
-    # LOS computation using Numba (parallelized)
+    # LOS computation (parallelized via Numba)
     @njit(parallel=True)
     def compute_all_los(sorted_az, sorted_r, group_start, group_end, thresh):
         n_groups = group_start.shape[0]
@@ -80,7 +81,7 @@ else:
     pdf['LOS'] = los
     print(f"[{time.time()-preprocess_start:.3f} sec] LOS column computed.")
 
-    # Label computation: convert egoYawRate to deg/s and use absolute value
+    # Label computation: convert egoYawRate to deg/s and use absolute value.
     mirrProb = pdf['mirrProb'].values
     egoYawRate = pdf['egoYawRate'].values
     egoSpeed = pdf['egoSpeed'].values
@@ -121,7 +122,7 @@ else:
 print(f"[{time.time()-preprocess_start:.3f} sec] Data preprocessing complete.")
 print(f"[{time.time()-start_total:.3f} sec] Total initialization complete.")
 
-# Convert to Vaex dataframe for on-demand filtering
+# Convert to Vaex dataframe for on-demand filtering.
 df = vaex.from_pandas(pdf)
 
 # ---------------------------
@@ -129,7 +130,7 @@ df = vaex.from_pandas(pdf)
 # ---------------------------
 dashboard_start = time.time()
 
-# Build radar cycle slider from actual unique mc values (as integers)
+# Build radar cycle slider from unique mc values (as integers)
 unique_mcs = sorted(list(set(pdf['mc'].astype(int).tolist())))
 radar_cycle_slider = pn.widgets.DiscreteSlider(
     name='Radar Cycle Slider',
@@ -155,24 +156,22 @@ def go_to_cycle(event):
 cycle_go_button.on_click(go_to_cycle)
 
 # Filter Panel: vertical stack of filter sliders plus X- and Y-axis sliders.
-# (Set Age slider default to 0 so that filtering does not remove all objects by default.)
 eyr_slider = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, value=2, step=0.01)
 es_slider = pn.widgets.FloatSlider(name='ES Slider', start=0, end=10, value=0.2, step=0.1)
 mp_slider = pn.widgets.FloatSlider(name='MP Slider', start=0, end=100, value=71, step=1)
 age_slider = pn.widgets.FloatSlider(name='Age Slider', start=0, end=100, value=0, step=1)
 x_axis_slider = pn.widgets.FloatSlider(name='X-axis Slider', start=1, end=30, value=10, step=1)
 y_axis_slider = pn.widgets.FloatSlider(name='Y-axis Slider', start=-50, end=200, value=100, step=1)
-# Text pane below Y-axis slider to display current egoYawRate (deg/s) and egoSpeed (m/s)
 stats_pane = pn.pane.Markdown("", sizing_mode="stretch_width")
 filter_panel = pn.Column(eyr_slider, es_slider, mp_slider, age_slider, x_axis_slider, y_axis_slider, stats_pane, sizing_mode="stretch_width")
 
-# --- New Radar Cycle Navigation Controls ---
+# New Radar Cycle Navigation Controls.
 step_button = pn.widgets.Button(name="Step 1", button_type="primary")
 animate_button = pn.widgets.Button(name="Animate", button_type="success")
 step_size_input = pn.widgets.TextInput(name="Step Size (s)", value="2", width=100)
 stop_button = pn.widgets.Button(name="Stop", button_type="warning")
 
-animate_callback = None  # global variable to hold periodic callback id
+animate_callback = None  # to hold periodic callback id
 
 def step_callback(event):
     current_value = radar_cycle_slider.value
@@ -193,22 +192,26 @@ def animate_click(event):
         val = float(step_size_input.value)
     except:
         val = 2.0
-    # If val is an integer (or integer-equivalent), then interpret it as cycles per second.
-    # Else, use its float value.
-    if float(val).is_integer():
-        period = int(1000 / val)
-    else:
-        period = int(1000 / val)
-    animate_callback = pn.state.add_periodic_callback(animate_func, period)
+    # Determine period in ms.
+    # If val is an integer (or integer-equivalent), period = int(1000/val).
+    # Otherwise, period is computed similarly.
+    period = int(1000 / val)
+    animate_callback = curdoc().add_periodic_callback(animate_func, period)
 
 animate_button.on_click(animate_click)
 
 def stop_click(event):
-    pn.state.clear_periodic_callbacks()
+    global animate_callback
+    if animate_callback is not None:
+        try:
+            curdoc().remove_periodic_callback(animate_callback)
+        except Exception as e:
+            print("Error removing callback:", e)
+        animate_callback = None
 
 stop_button.on_click(stop_click)
 
-# Arrange radar cycle slider and navigation buttons in one row.
+# Arrange radar cycle slider and navigation controls in one row.
 radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, step_button, animate_button, step_size_input, stop_button, sizing_mode="stretch_width")
 
 # Save Button.
@@ -228,7 +231,7 @@ ts_source_right = ColumnDataSource(data=dict(mc=[], poe=[]))
 # ---------------------------
 # Create Bokeh Figures
 # ---------------------------
-# Bird's Eye View (only the object plot) is renamed to "Bird's Eye View"
+# Bird's Eye View plot (renamed only the object plot)
 birdseye_plot = figure(
     title="Bird's Eye View", 
     sizing_mode="stretch_both", 
@@ -240,41 +243,34 @@ birdseye_plot.x_range.end = x_axis_slider.value
 birdseye_plot.y_range.start = -2
 birdseye_plot.y_range.end = y_axis_slider.value
 
-# Vertical dotted lines (x-axis represents global y)
 for xv in [-6, -2, 2, 6]:
     span = Span(location=xv, dimension='height', line_color='purple', line_dash='dotted', line_width=1)
     birdseye_plot.add_layout(span)
 
-# Bold border lines on right and top edges.
 right_border = Span(location=birdseye_plot.x_range.end, dimension='height', line_color="black", line_width=3)
 top_border = Span(location=birdseye_plot.y_range.end, dimension='width', line_color="black", line_width=3)
 birdseye_plot.add_layout(right_border)
 birdseye_plot.add_layout(top_border)
 
-# Scatter points for objects.
 scatter_renderer = birdseye_plot.scatter(
     'x', 'y', source=object_scatter_source,
     size='size', color='color', fill_alpha=0.6
 )
 
-# Bounding boxes via rect glyph.
 rect_renderer = birdseye_plot.rect(
     'rx', 'ry', width='rwidth', height='rheight', angle='rangle',
     source=object_rect_source, fill_color='rcolor', fill_alpha=0.4, line_color='rcolor', line_width=1
 )
 
-# Ego point.
 ego_renderer = birdseye_plot.scatter(
     'x', 'y', source=ego_source, size=4, color='black', fill_alpha=1.0
 )
 
-# Hover tools: For objects and ego.
 object_hover = HoverTool(tooltips=[("Details", "@hover")], renderers=[scatter_renderer])
 birdseye_plot.add_tools(object_hover)
 ego_hover = HoverTool(tooltips=[("Ego", "@hover")], renderers=[ego_renderer])
 birdseye_plot.add_tools(ego_hover)
 
-# TIME-SERIES PLOTS (titles now without HTML tags)
 ts_plot_ego = figure(
     title="inEgoLaneOOI", 
     sizing_mode="stretch_both", 
@@ -308,9 +304,7 @@ empty_plot = figure(sizing_mode="stretch_both", toolbar_location=None)
 # Callback Functions
 # ---------------------------
 def update_object_plot():
-    """Update the Bird's Eye View plot using real data."""
     current_mc = radar_cycle_slider.value
-    # Update axis limits.
     x_lim = x_axis_slider.value
     y_lim = y_axis_slider.value
     birdseye_plot.x_range.start = -x_lim
@@ -320,22 +314,18 @@ def update_object_plot():
     right_border.location = birdseye_plot.x_range.end
     top_border.location = birdseye_plot.y_range.end
 
-    # Filter data for the selected radar cycle.
     df_cycle = df[df.mc == current_mc].to_pandas_df()
-    # Apply additional filters.
     filtered = df_cycle[
-        (df_cycle.egoYawRate < np.radians(2)) &  # using radian threshold here for filtering
+        (df_cycle.egoYawRate < np.radians(2)) &
         (df_cycle.egoSpeed > es_slider.value) &
         (df_cycle.mirrProb < mp_slider.value) &
         (df_cycle.lc > age_slider.value)
     ]
-    # Then further apply absolute egoYawRate condition in deg/s.
     if not filtered.empty:
         filtered = filtered[np.abs(np.degrees(filtered['egoYawRate'])) < 2]
     if filtered.empty:
-        filtered = df_cycle  # fallback to full cycle if filters remove all objects
+        filtered = df_cycle
 
-    # Update stats pane (show current egoYawRate in deg/s and egoSpeed from first object).
     if not filtered.empty:
         first = filtered.iloc[0]
         stats_text = f"egoYawRate: {math.degrees(first['egoYawRate']):.3f} deg/s, egoSpeed: {first['egoSpeed']:.3f} m/s"
@@ -347,7 +337,6 @@ def update_object_plot():
     rect_rx, rect_ry, rect_widths, rect_heights, rect_angles, rect_colors = [], [], [], [], [], []
     
     for _, row in filtered.iterrows():
-        # Determine color and scatter size.
         if row['OOI'] == 1:
             col = 'red'
             size_val = 4
@@ -364,21 +353,16 @@ def update_object_plot():
             col = 'grey'
             size_val = 2
 
-        # Format hover text as 3 vertical rows.
         hover_text = (f"id: {int(row['id'])}, vx: {row['vx']:.2f}, vy: {row['vy']:.2f}\n"
                       f"mirrProb: {int(row['mirrProb'])}, poe: {int(row['poe'])}, pfd: {row['pfd']:.4f}\n"
                       f"dp: {int(row['dp'])}")
         
-        # For scatter: plot x = global y, y = global x.
         scatter_x.append(row['y'])
         scatter_y.append(row['x'])
         colors.append(col)
         sizes.append(size_val)
         hovers.append(hover_text)
         
-        # Compute bounding box parameters using the rect glyph approach.
-        # Use object's center as its (x, y) position.
-        # Width = (wl + wr) and Height = (lf + lr) (no additional scaling now).
         rwidth = row['wl'] + row['wr']
         rheight = row['lf'] + row['lr']
         rx = row['y']
@@ -397,7 +381,6 @@ def update_object_plot():
         rangle=rect_angles, rcolor=rect_colors
     )
     
-    # Update ego point.
     ego_info = filtered.iloc[0]
     ego_hover_text = (f"mc: {int(ego_info['mc'])}, "
                       f"egoSpeed: {ego_info['egoSpeed']:.3f}, "
@@ -433,7 +416,10 @@ for widget in [radar_cycle_slider, x_axis_slider, y_axis_slider, eyr_slider, es_
     widget.param.watch(update_all, 'value')
 
 def save_callback(event):
-    pn.state.clear_periodic_callbacks()  # Stop any animation.
+    try:
+        curdoc().remove_periodic_callback(animate_callback)
+    except Exception as e:
+        print("Error stopping animation:", e)
     update_all()
     pn.panel(dashboard_layout).save('dashboard_state.html', resources='inline')
     print(f"[{time.time()-dashboard_start:.3f} sec] Dashboard state saved.")
@@ -448,15 +434,9 @@ header_section = pn.pane.Markdown(
     sizing_mode="stretch_width", height=50
 )
 
-# Arrange radar cycle slider and navigation controls in one row.
 radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, step_button, animate_button, step_size_input, stop_button, sizing_mode="stretch_width")
-
 slider_section = pn.Row(radar_control_row, sizing_mode="stretch_width", height=50)
 
-# Grid layout: 2 rows x 3 columns.
-# • Column 0: Filter Panel (row 0) and ts_plot_left (row 1)
-# • Column 1: Bird's Eye View spanning both rows
-# • Column 2: ts_plot_ego (row 0) and ts_plot_right (row 1)
 grid = pn.GridSpec(sizing_mode='stretch_both', max_height=1000)
 grid[0, 0] = filter_panel
 grid[1, 0] = ts_plot_left
@@ -466,8 +446,9 @@ grid[1, 2] = ts_plot_right
 
 dashboard_layout = pn.Column(header_section, slider_section, grid, save_button, sizing_mode="stretch_both", margin=0)
 
-# Initial update with real data.
+# Ensure initial update (also attach onload callback so that updates occur after refresh)
 update_all()
+pn.state.onload(lambda: update_all())
 
 dashboard_layout.servable()
 print(f"[{time.time()-dashboard_start:.3f} sec] Dashboard creation complete.")
