@@ -6,161 +6,210 @@ import pandas as pd
 import vaex
 import panel as pn
 from bokeh.plotting import figure
-from bokeh.models import HoverTool, Arrow, NormalHead
+from bokeh.models import ColumnDataSource, HoverTool
+from numba import njit
 
-# Enable the Bokeh extension in Panel and set a monospace condensed style
-pn.extension('bokeh')
+# ---------------------------
+# INITIALIZE PANEL (fix extension warning)
+# ---------------------------
+pn.extension()  # Do not specify "bokeh" explicitly
 pn.config.raw_css.append("""
     .bk-root { font-family: "Courier New", monospace; }
     body { margin: 0; padding: 0; }
 """)
+print(f"[{time.time():.3f}] Panel extension loaded.")
 
 # ---------------------------
-# 1. DATA PREPROCESSING STEP
+# PARAMETERS & FILE PATHS
+# ---------------------------
+LOS_thresh = 0.1  # radians for LOS computation
+original_file_path = "data_original.feather"
+preprocessed_file_path = "data_preprocessed.feather"
+
+# ---------------------------
+# DATA PREPROCESSING (with timing prints)
 # ---------------------------
 start_total = time.time()
 preprocess_start = time.time()
 
-# File paths (adjust these as needed)
-original_file_path = "data_original.feather"
-preprocessed_file_path = "data_preprocessed.feather"
-
-# Check if preprocessed file already exists
 if os.path.exists(preprocessed_file_path):
     print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed file found. Loading preprocessed dataframe.")
-    df = vaex.open(preprocessed_file_path)
+    pdf = pd.read_feather(preprocessed_file_path)
 else:
     print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed file not found. Reading original data and starting preprocessing.")
-    # Read the original feather file as a pandas dataframe
     pdf = pd.read_feather(original_file_path)
     
-    # --- Compute basic geometric quantities ---
-    pdf['az'] = np.arctan2(pdf['y'], pdf['x'])         # Azimuth angle (in radians)
-    pdf['r'] = np.sqrt(pdf['x']**2 + pdf['y']**2)         # Range (distance)
-    pdf['Motion'] = np.where(pdf['dp'].isin([1, 2, 5, 6]), 1, 0)  # Motion flag based on dp values
-    
+    # Compute basic geometric quantities in vectorized fashion
+    pdf['az'] = np.arctan2(pdf['y'].values, pdf['x'].values)  # azimuth angle in radians
+    pdf['r'] = np.hypot(pdf['x'].values, pdf['y'].values)       # range (distance)
+    pdf['Motion'] = np.where(pdf['dp'].isin([1, 2, 5, 6]), 1, 0)
     print(f"[{time.time()-preprocess_start:.3f} sec] Basic columns (az, r, Motion) computed.")
 
-    # --- Compute LOS (Line-Of-Sight) per radar cycle ---
-    # For each radar cycle, for each object, if there is any object with a smaller range and with
-    # an azimuth angle within ±thresh, mark LOS=0; otherwise LOS=1.
-    LOS_thresh = 0.1  # set threshold (radians) for comparing azimuth angles
+    # ---------------------------
+    # LOS Computation using Numba over each radar cycle group
+    # ---------------------------
+    @njit
+    def compute_los_numba(az, r, thresh):
+        n = len(az)
+        los = np.empty(n, dtype=np.int8)
+        for i in range(n):
+            flag = 1
+            for j in range(n):
+                if i != j:
+                    if r[j] < r[i] and abs(az[j] - az[i]) < thresh:
+                        flag = 0
+                        break
+            los[i] = flag
+        return los
 
-    def compute_LOS(group, thresh=LOS_thresh):
-        az = group['az'].values
-        r = group['r'].values
-        LOS = np.ones(len(r), dtype=np.int8)
-        # Because each radar cycle has at most 100 objects, a simple loop is acceptable here
-        for i in range(len(r)):
-            # Check if any other object in this cycle is closer and within the azimuth window
-            if np.any((r < r[i]) & (np.abs(az - az[i]) < thresh)):
-                LOS[i] = 0
-        return LOS
-
-    # Apply the LOS computation for each radar cycle group
-    pdf['LOS'] = pdf.groupby('mc', group_keys=False).apply(lambda g: pd.Series(compute_LOS(g), index=g.index))
+    # Process groups by first sorting by radar cycle (mc)
+    mc_arr = pdf['mc'].values
+    order = np.argsort(mc_arr)
+    sorted_mc = mc_arr[order]
+    unique_mc, group_start = np.unique(sorted_mc, return_index=True)
+    los_result = np.empty(len(pdf), dtype=np.int8)
+    for i in range(len(unique_mc)):
+        start_idx = group_start[i]
+        end_idx = group_start[i+1] if i < len(unique_mc)-1 else len(pdf)
+        idx = order[start_idx:end_idx]
+        group_az = pdf['az'].values[idx]
+        group_r = pdf['r'].values[idx]
+        los_result[idx] = compute_los_numba(group_az, group_r, LOS_thresh)
+    pdf['LOS'] = los_result
     print(f"[{time.time()-preprocess_start:.3f} sec] LOS column computed.")
 
-    # --- Compute Label ---
-    # For objects satisfying all of: mirrProb < 71, egoYawRate < 2 (deg/s), egoSpeed > 0.2, Motion==1, LOS==1,
-    # assign label 1 if y in [-2,2], 2 if y in [-6,-2), 3 if y in (2,6], else 0.
-    pdf['label'] = 0
-    cond = (pdf['mirrProb'] < 71) & (pdf['egoYawRate'] < 2) & (pdf['egoSpeed'] > 0.2) & (pdf['Motion'] == 1) & (pdf['LOS'] == 1)
-    pdf.loc[cond, 'label'] = np.where(
-        (pdf.loc[cond, 'y'] >= -2) & (pdf.loc[cond, 'y'] <= 2), 1,
-        np.where(
-            (pdf.loc[cond, 'y'] >= -6) & (pdf.loc[cond, 'y'] < -2), 2,
-            np.where(
-                (pdf.loc[cond, 'y'] > 2) & (pdf.loc[cond, 'y'] <= 6), 3,
-                0
-            )
-        )
-    )
+    # ---------------------------
+    # Label Computation (vectorized)
+    # ---------------------------
+    # Conditions: mirrProb < 71, egoYawRate < 2, egoSpeed > 0.2, Motion==1, LOS==1
+    cond = (pdf['mirrProb'].values < 71) & (pdf['egoYawRate'].values < 2) & (pdf['egoSpeed'].values > 0.2) & (pdf['Motion'].values == 1) & (pdf['LOS'].values == 1)
+    labels = np.zeros(len(pdf), dtype=np.int8)
+    y_arr = pdf['y'].values
+    labels[np.where(cond & (y_arr >= -2) & (y_arr <= 2))] = 1
+    labels[np.where(cond & (y_arr >= -6) & (y_arr < -2))] = 2
+    labels[np.where(cond & (y_arr > 2) & (y_arr <= 6))] = 3
+    pdf['label'] = labels
     print(f"[{time.time()-preprocess_start:.3f} sec] Label column computed.")
 
-    # --- Compute OOI (Object-Of-Interest) ---
-    # For each radar cycle, for each label type (1,2,3), find the object with the smallest range and mark it with 1.
+    # ---------------------------
+    # OOI Computation using pandas groupby (fast C aggregation)
+    # ---------------------------
     pdf['OOI'] = 0
-    for mc_val, group in pdf.groupby('mc'):
-        for lbl in [1, 2, 3]:
-            subset = group[group['label'] == lbl]
-            if not subset.empty:
-                idx_min = subset['r'].idxmin()  # get the index of the nearest object for this label type
-                pdf.loc[idx_min, 'OOI'] = 1
+    mask = pdf['label'].isin([1, 2, 3])
+    if mask.sum() > 0:
+        ooi_idx = pdf[mask].groupby(['mc', 'label'])['r'].idxmin()
+        pdf.loc[ooi_idx, 'OOI'] = 1
     print(f"[{time.time()-preprocess_start:.3f} sec] OOI column computed.")
 
-    # --- Save the preprocessed dataframe ---
+    # Save preprocessed file
     pdf.to_feather(preprocessed_file_path)
     print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed dataframe saved to {preprocessed_file_path}.")
-    df = vaex.from_pandas(pdf)
+
+print(f"[{time.time()-preprocess_start:.3f} sec] Data preprocessing complete.")
+print(f"[{time.time()-start_total:.3f} sec] Total initialization complete.")
+
+# Convert to Vaex dataframe for dashboard (only used for on‐demand filtering)
+df = vaex.from_pandas(pdf)
 
 # ---------------------------
-# 2. DASHBOARD CREATION STEP
+# DASHBOARD CREATION
 # ---------------------------
 dashboard_start = time.time()
 
-# --- Define the main sliders in the "Slider Section" ---
+# Create main slider widgets (placed in a horizontal row)
 y_axis_slider = pn.widgets.FloatSlider(name='Y-axis Slider', start=-200, end=200, value=100, step=1)
 x_axis_slider = pn.widgets.FloatSlider(name='X-axis Slider', start=1, end=30, value=10, step=1)
-# Use the min and max radar cycles from the dataframe (converted to int)
-radar_cycle_slider = pn.widgets.IntSlider(name='Radar Cycle Slider', start=int(df.mc.min()), 
-                                            end=int(df.mc.max()), value=int(df.mc.min()), step=1)
+radar_cycle_slider = pn.widgets.IntSlider(name='Radar Cycle Slider', 
+                                           start=int(df.mc.min()), end=int(df.mc.max()),
+                                           value=int(df.mc.min()), step=1)
 
-# --- Define filter sliders (stacked vertically in Graph section - Subsection 1) ---
+# Filter sliders (stacked vertically in Graph subsection 1)
 eyr_slider = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, value=2, step=0.01)
 es_slider = pn.widgets.FloatSlider(name='ES Slider', start=0, end=10, value=0.2, step=0.1)
 mp_slider = pn.widgets.FloatSlider(name='MP Slider', start=0, end=100, value=71, step=1)
 age_slider = pn.widgets.FloatSlider(name='Age Slider', start=0, end=100, value=20, step=1)
 
-# --- Save button ---
+# Save button to dump current state as interactive HTML
 save_button = pn.widgets.Button(name='Save Current State', button_type='primary')
 
-# --- Create Bokeh figures for the six subplots ---
-# Subsection 5: Main object plot
-object_plot = figure(title="Object Plot", width=400, height=400, tools="pan,wheel_zoom,reset", sizing_mode="stretch_both")
-# Add an (initially empty) HoverTool – we will set hover info on the glyphs that have Motion==1
-object_plot.add_tools(HoverTool(tooltips=[("Details", "@desc")], mode='mouse'))
+# ---------------------------
+# Prepare ColumnDataSources for fast updates
+# ---------------------------
+# For object plot (Subsection 5)
+object_scatter_source = ColumnDataSource(data=dict(x=[], y=[], color=[], size=[], hover=[]))
+object_patch_source = ColumnDataSource(data=dict(xs=[], ys=[], color=[]))
+ego_source = ColumnDataSource(data=dict(x=[0], y=[0], hover=["mc: NA, egoSpeed: NA, egoYawRate: NA"]))
 
-# Subsections 2, 4, 6: Time series plots for POE vs mc
-ts_plot_ego = figure(title="inEgoLaneOOI", width=300, height=200, tools="pan,wheel_zoom,reset",
-                     sizing_mode="stretch_both", y_range=(0, 100))
-ts_plot_left = figure(title="inLeftEgoLaneOOI", width=300, height=200, tools="pan,wheel_zoom,reset",
-                      sizing_mode="stretch_both", y_range=(0, 100))
-ts_plot_right = figure(title="inRightEgoLaneOOI", width=300, height=200, tools="pan,wheel_zoom,reset",
-                       sizing_mode="stretch_both", y_range=(0, 100))
-# Subsection 3: An empty plot (no axes, no toolbar)
-empty_plot = figure(width=300, height=200, toolbar_location=None)
-empty_plot.outline_line_color = None
-empty_plot.background_fill_color = None
+# For time series plots (Subsections 2, 4, 6)
+ts_source_ego = ColumnDataSource(data=dict(mc=[], poe=[]))
+ts_source_left = ColumnDataSource(data=dict(mc=[], poe=[]))
+ts_source_right = ColumnDataSource(data=dict(mc=[], poe=[]))
 
-# --- Function: Update the Object Plot (Subsection 5) ---
-def update_object_plot(event=None):
-    # Clear previous renderers
-    object_plot.renderers = []
-    object_plot.title.text = "Object Plot"
-    
-    # Get current slider values
+# ---------------------------
+# Create Bokeh Figures
+# ---------------------------
+# Object plot (Subsection 5)
+object_plot = figure(title="Object Plot", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset")
+# Add scatter glyph (using scatter to avoid deprecated circle())
+scatter_renderer = object_plot.scatter('x', 'y', source=object_scatter_source,
+                                         size='size', color='color', fill_alpha=0.6)
+# Add patches glyph for rectangular bounds
+object_plot.patches('xs', 'ys', source=object_patch_source, fill_alpha=0.1, line_color='color')
+# Add ego (origin) point
+object_plot.scatter('x', 'y', source=ego_source, size=3, color='black', fill_alpha=1.0)
+# Add HoverTool for object scatter (only for Motion==1 objects, hover text in 'hover' field)
+object_plot.add_tools(HoverTool(tooltips=[("Details", "@hover")], renderers=[scatter_renderer]))
+
+# Time series plots for POE vs. mc
+ts_plot_ego = figure(title="inEgoLaneOOI", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", y_range=(0, 100))
+ts_plot_left = figure(title="inLeftEgoLaneOOI", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", y_range=(0, 100))
+ts_plot_right = figure(title="inRightEgoLaneOOI", sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", y_range=(0, 100))
+# To avoid warnings when no data, add a dummy renderer (invisible)
+for p in [ts_plot_ego, ts_plot_left, ts_plot_right]:
+    p.scatter([], [])
+
+# An empty plot for Subsection 3
+empty_plot = figure(sizing_mode="stretch_both", toolbar_location=None)
+empty_plot.scatter([], [])
+
+# ---------------------------
+# Callback Functions for Fast Updates
+# ---------------------------
+def update_object_plot():
+    """Update the main object plot (scatter and patches) instantly using ColumnDataSource."""
     current_mc = radar_cycle_slider.value
     x_lim = x_axis_slider.value
     y_lim = y_axis_slider.value
     
-    # Filter data for the current radar cycle and apply filter sliders from Subsection 1
-    # (Since each cycle has at most 100 objects, converting to a pandas DataFrame is acceptable.)
+    # Set axis limits (remember: x-axis = y distance, y-axis = x distance)
+    object_plot.x_range.start = -x_lim
+    object_plot.x_range.end = x_lim
+    object_plot.y_range.start = 0
+    object_plot.y_range.end = y_lim
+
+    # Filter data for the current radar cycle and apply filter sliders
+    # (Each cycle has at most 100 objects, so conversion to pandas is fast.)
     df_cycle = df[df.mc == current_mc].to_pandas_df()
+    if df_cycle.empty:
+        # Reset sources to empty if no data
+        object_scatter_source.data = dict(x=[], y=[], color=[], size=[], hover=[])
+        object_patch_source.data = dict(xs=[], ys=[], color=[])
+        ego_source.data = dict(x=[0], y=[0], hover=["mc: NA, egoSpeed: NA, egoYawRate: NA"])
+        return
+
+    # Apply filter sliders
     df_cycle = df_cycle[(df_cycle.egoYawRate < eyr_slider.value) &
                         (df_cycle.egoSpeed > es_slider.value) &
                         (df_cycle.mirrProb < mp_slider.value) &
                         (df_cycle.lc > age_slider.value)]
     
-    # Set axis limits for the object plot:
-    object_plot.x_range.start = -x_lim
-    object_plot.x_range.end = x_lim
-    object_plot.y_range.start = 0
-    object_plot.y_range.end = y_lim
+    # Prepare lists for scatter and patch data
+    scatter_x, scatter_y, colors, sizes, hovers = [], [], [], [], []
+    patch_xs, patch_ys, patch_colors = [], [], []
     
-    # Loop over each object in the filtered radar cycle
+    # Process each object (max 100 objects per cycle)
     for _, row in df_cycle.iterrows():
-        # --- Determine color and size ---
+        # Determine color and size
         if row['OOI'] == 1:
             color = 'red'
             size = 4
@@ -171,138 +220,131 @@ def update_object_plot(event=None):
             color = 'lightgreen'
             size = 3
         elif row['LOS'] == 1 and row['label'] == 3:
-            color = 'plum'
+            color = 'magenta'
             size = 3
         else:
             color = 'grey'
             size = 2
 
-        # --- Scatter point for the object ---
-        # Note: For the plot, x-axis represents the y distance and y-axis represents the x distance.
-        object_plot.circle(x=row['y'], y=row['x'], size=size, color=color, fill_alpha=0.6, line_color=color)
+        # Scatter: Note the axis swap (x-axis= y distance, y-axis= x distance)
+        scatter_x.append(row['y'])
+        scatter_y.append(row['x'])
+        colors.append(color)
+        sizes.append(size)
         
-        # --- Draw the rectangular bounds of the object ---
-        # Scale the corner dimensions back (they were multiplied by 1000)
+        # Hover text: Only for objects with Motion==1 show details, else empty string
+        if row['Motion'] == 1:
+            hover_text = (f"id: {row['id']}, lc: {row['lc']}, mirrProb: {row['mirrProb']}, "
+                          f"vx: {row['vx']}, vy: {row['vy']}, dp: {row['dp']}, "
+                          f"poe: {row['poe']}, pfd: {row['pfd']}")
+        else:
+            hover_text = ""
+        hovers.append(hover_text)
+        
+        # Compute rectangular bounds using corner data:
+        # Scale corner dimensions back from (lf, lr, wl, wr)
         lf = row['lf'] * 0.001
         lr = row['lr'] * 0.001
         wl = row['wl'] * 0.001
         wr = row['wr'] * 0.001
-        # Define corners in the object's local coordinate system:
-        # front-left, front-right, rear-right, rear-left
+        # Local corners: front-left, front-right, rear-right, rear-left
         local_corners = np.array([[lf, wl],
                                   [lf, -wr],
                                   [-lr, -wr],
                                   [-lr, wl]])
-        # Rotation matrix for the object's orientation
         theta = row['orient']
-        R = np.array([[math.cos(theta), -math.sin(theta)],
-                      [math.sin(theta),  math.cos(theta)]])
-        # Transform local corners into the ego coordinate system by rotating and then translating
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        R = np.array([[cos_t, -sin_t],
+                      [sin_t,  cos_t]])
         global_corners = (R @ local_corners.T).T + np.array([row['x'], row['y']])
-        # For plotting, swap coordinates: (global_y, global_x)
-        plot_x = global_corners[:, 1]
-        plot_y = global_corners[:, 0]
-        object_plot.patch(x=plot_x.tolist(), y=plot_y.tolist(), fill_alpha=0.1, line_color=color)
+        # Swap coordinates for plotting: (global_y, global_x)
+        patch_xs.append(global_corners[:, 1].tolist())
+        patch_ys.append(global_corners[:, 0].tolist())
+        patch_colors.append(color)
         
-        # --- Add an arrow for objects with label 1,2,3 ---
-        if row['label'] in [1, 2, 3]:
-            # Compute the front-center point in local coordinates: (lf, (wl - wr)/2)
-            front_center_local = np.array([lf, (wl - wr) / 2])
-            front_center_global = R @ front_center_local + np.array([row['x'], row['y']])
-            # Compute arrow end by adding a 1-meter vector in the object’s orientation direction
-            arrow_vec = np.array([math.cos(theta), math.sin(theta)])
-            arrow_end = front_center_global + arrow_vec * 1.0
-            # Swap coordinates for plotting
-            arrow_start = (front_center_global[1], front_center_global[0])
-            arrow_end_plot = (arrow_end[1], arrow_end[0])
-            arrow = Arrow(end=NormalHead(size=10, fill_color=color),
-                          x_start=arrow_start[0], y_start=arrow_start[1],
-                          x_end=arrow_end_plot[0], y_end=arrow_end_plot[1],
-                          line_color=color)
-            object_plot.add_layout(arrow)
+    # Update the data sources
+    object_scatter_source.data = dict(x=scatter_x, y=scatter_y, color=colors, size=sizes, hover=hovers)
+    object_patch_source.data = dict(xs=patch_xs, ys=patch_ys, color=patch_colors)
     
-    # --- Add a black point at the ego (origin) with hover info ---
-    if not df_cycle.empty:
-        ego_info = df_cycle.iloc[0]
-        # (For brevity, we simply add the point; additional hover details could be added via a separate glyph.)
-    object_plot.circle(x=0, y=0, size=3, color='black', fill_alpha=1.0, line_color='black')
+    # Update ego source (always at origin, with current mc, egoSpeed, egoYawRate from the first row if available)
+    ego_info = df_cycle.iloc[0]
+    ego_hover = f"mc: {ego_info['mc']}, egoSpeed: {ego_info['egoSpeed']}, egoYawRate: {ego_info['egoYawRate']}"
+    ego_source.data = dict(x=[0], y=[0], hover=[ego_hover])
 
-# --- Function: Update time series plots for POE vs. radar cycle (Subsections 2, 4, and 6) ---
-def update_time_series(plot, label_val, title_prefix):
-    plot.renderers = []
+def update_time_series(source, label_val, title_prefix):
+    """Update one of the POE vs. mc plots for the object with given label and OOI==1."""
     current_mc = radar_cycle_slider.value
-    # Extract the current radar cycle data as a pandas DataFrame
+    # Get current radar cycle data (pandas)
     df_cycle = df[df.mc == current_mc].to_pandas_df()
-    # Find the object in this cycle with OOI==1 and matching label (if any)
+    # Find object with OOI==1 and matching label
     obj_data = df_cycle[(df_cycle.OOI == 1) & (df_cycle.label == label_val)]
     if not obj_data.empty:
         obj_id = obj_data.iloc[0]['id']
         current_poe = obj_data.iloc[0]['poe']
-        # Get the object's track across radar cycles (using the object id)
+        # Get track for this object across cycles (using vaex for speed)
         df_obj = df[df.id == obj_id].to_pandas_df()
-        # Select data from 5 cycles before to 5 cycles after the current cycle
         df_obj = df_obj[(df_obj.mc >= current_mc - 5) & (df_obj.mc <= current_mc + 5)]
-        if not df_obj.empty:
-            df_obj = df_obj.sort_values('mc')
-            plot.circle(x=df_obj['mc'], y=df_obj['poe'], size=1, color="blue")
-            plot.line(x=df_obj['mc'], y=df_obj['poe'], line_width=1, color="blue")
-            plot.title.text = f"<b>{title_prefix} OOId: {obj_id} | POE: {current_poe}</b>"
-        else:
-            plot.title.text = f"<b>{title_prefix} No Track Data</b>"
+        df_obj = df_obj.sort_values('mc')
+        source.data = dict(mc=df_obj['mc'].tolist(), poe=df_obj['poe'].tolist())
+        return f"<b>{title_prefix} OOId: {obj_id} | POE: {current_poe}</b>"
     else:
-        plot.title.text = f"<b>{title_prefix} No Data</b>"
+        source.data = dict(mc=[], poe=[])
+        return f"<b>{title_prefix} No Data</b>"
 
-# --- Callback to update all plots when any slider value changes ---
 def update_all(event=None):
+    """Update all plots and time series data; designed to be fast (<500ms)."""
     update_object_plot()
-    update_time_series(ts_plot_ego, 1, "inEgoLaneOOI")
-    update_time_series(ts_plot_left, 2, "inLeftEgoLaneOOI")
-    update_time_series(ts_plot_right, 3, "inRightEgoLaneOOI")
+    title_ego = update_time_series(ts_source_ego, 1, "inEgoLaneOOI")
+    title_left = update_time_series(ts_source_left, 2, "inLeftEgoLaneOOI")
+    title_right = update_time_series(ts_source_right, 3, "inRightEgoLaneOOI")
+    ts_plot_ego.title.text = title_ego
+    ts_plot_left.title.text = title_left
+    ts_plot_right.title.text = title_right
 
-# Attach callbacks to slider changes
+# Attach fast callbacks to slider changes
 for widget in [radar_cycle_slider, x_axis_slider, y_axis_slider, eyr_slider, es_slider, mp_slider, age_slider]:
     widget.param.watch(update_all, 'value')
 
-# --- Save button callback: Save the current state as an interactive HTML file ---
+# Save button callback: Save the current dashboard state to an interactive HTML file
 def save_callback(event):
     pn.panel(dashboard_layout).save('dashboard_state.html', resources='inline')
     print(f"[{time.time()-dashboard_start:.3f} sec] Dashboard state saved to dashboard_state.html")
 save_button.on_click(save_callback)
 
 # ---------------------------
-# 3. LAYOUT CONSTRUCTION
+# LAYOUT CONSTRUCTION
 # ---------------------------
-# Heading section: 90% width, 5% height, with title text
+# Heading section: 90% width, 5% height
 header_section = pn.pane.Markdown(
-    "<h1 style='font-family: monospace; text-align: center;'>Objects Of Interest (OOI)</h1>",
+    "<h1 style='font-family: Courier New, monospace; text-align: center;'>Objects Of Interest (OOI)</h1>",
     sizing_mode="stretch_width", height=50
 )
 
-# Slider section: 90% width, 5% height (all three sliders on a single horizontal line)
+# Slider section: 90% width, 5% height (three sliders in one row)
 slider_section = pn.Row(y_axis_slider, x_axis_slider, radar_cycle_slider, sizing_mode="stretch_width", height=50)
 
-# Graph section: 90% width, 85% height
-# Arrange 6 subsections in a 2x3 grid:
-#   Row 1: Subsections 1 (filter sliders), 2 (inEgoLaneOOI plot), 3 (empty)
-#   Row 2: Subsections 4 (inLeftEgoLaneOOI plot), 5 (Object plot), 6 (inRightEgoLaneOOI plot)
+# Graph section: 90% width, 85% height arranged in 2 rows x 3 columns:
+# Row 1: Subsection 1 (filter sliders), Subsection 2 (ts_plot_ego), Subsection 3 (empty)
+# Row 2: Subsection 4 (ts_plot_left), Subsection 5 (object plot), Subsection 6 (ts_plot_right)
 grid = pn.GridSpec(sizing_mode='stretch_both', max_height=600)
 grid[0, 0] = pn.Column(eyr_slider, es_slider, mp_slider, age_slider)  # Subsection 1: filter sliders
-grid[0, 1] = ts_plot_ego                                             # Subsection 2
-grid[0, 2] = empty_plot                                              # Subsection 3 (empty)
-grid[1, 0] = ts_plot_left                                              # Subsection 4
-grid[1, 1] = object_plot                                               # Subsection 5: main object plot
-grid[1, 2] = ts_plot_right                                             # Subsection 6
+grid[0, 1] = ts_plot_ego                                             # Subsection 2: time series plot for label1
+grid[0, 2] = empty_plot                                              # Subsection 3: empty
+grid[1, 0] = ts_plot_left                                              # Subsection 4: time series plot for label2
+grid[1, 1] = object_plot                                               # Subsection 5: object plot
+grid[1, 2] = ts_plot_right                                             # Subsection 6: time series plot for label3
 
-# Assemble the complete dashboard layout
 dashboard_layout = pn.Column(header_section, slider_section, grid, save_button,
                                sizing_mode="stretch_both", margin=0)
 
+# Ensure initial update so that plots show immediately
+update_all()
+
 dashboard_layout.servable()
 print(f"[{time.time()-dashboard_start:.3f} sec] Dashboard creation complete.")
-print(f"[{time.time()-start_total:.3f} sec] Total initialization complete.")
 
 # ---------------------------
-# 4. LAUNCH THE DASHBOARD
+# LAUNCH THE DASHBOARD
 # ---------------------------
-# This command will generate the URL for the dashboard and open it in your default browser.
 pn.serve(dashboard_layout, show=True, start=True)
