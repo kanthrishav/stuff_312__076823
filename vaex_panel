@@ -1,86 +1,353 @@
 import vaex
-import panel as pn
-import plotly.graph_objects as go
+import pandas as pd
 import numpy as np
+import panel as pn
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import mplcursors
+import math
+import webbrowser
 
-# Load data
-df = vaex.open('data.feather')
+# ---------------------------
+# 1. Dashboard style & settings
+# ---------------------------
+pn.extension(raw_css=[".bk { font-family: 'Consolas', monospace !important; }"],
+             sizing_mode='stretch_width')
+pn.config.raw_css.append("""
+html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+}
+""")
 
-# Filter relevant radar cycles
-df['relevant'] = df['egoYawRate'].abs() < np.deg2rad(2)
-relevant_cycles = df[df['relevant']]
+# ---------------------------
+# 2. Data Loading and Preprocessing
+# ---------------------------
+# Read the feather file into a pandas dataframe
+data_file = 'data.feather'
+df_pd = pd.read_feather(data_file)
 
-# Function to get objects in direct line of sight
-def get_direct_los(df):
-    df = df.sort(['y'], ascending=False)  # Sort by y (distance from ego)
-    seen_x_positions = set()
-    los_mask = []
-    for x in df['x'].values:
-        if x in seen_x_positions:
-            los_mask.append(False)
+# Compute azimuth and range using x and y positions
+df_pd['az'] = np.arctan2(df_pd['y'], df_pd['x'])
+df_pd['r'] = np.sqrt(df_pd['x']**2 + df_pd['y']**2)
+
+# Compute "Motion": if dp is 1,2,5, or 6 then 1 else 0
+df_pd['Motion'] = np.where(df_pd['dp'].isin([1, 2, 5, 6]), 1, 0)
+
+# Define a threshold (in radians) for LOS calculation (adjust as needed)
+THRESH = 0.1  
+
+# Compute LOS per radar cycle:
+# For each object A in a radar cycle (grouped by "mc"), if any other object has a smaller range
+# and its azimuth is within A's az ± THRESH, then LOS is 0; otherwise it is 1.
+def compute_LOS(group):
+    group = group.copy()
+    n = len(group)
+    los = np.ones(n, dtype=int)
+    for i in range(n):
+        az_i = group.iloc[i]['az']
+        r_i = group.iloc[i]['r']
+        for j in range(n):
+            if i == j:
+                continue
+            if (group.iloc[j]['r'] < r_i and 
+                (group.iloc[j]['az'] >= az_i - THRESH) and 
+                (group.iloc[j]['az'] <= az_i + THRESH)):
+                los[i] = 0
+                break
+    group['LOS'] = los
+    return group
+
+df_pd = df_pd.groupby('mc', group_keys=False).apply(compute_LOS)
+
+# Compute label based on conditions:
+# Only for rows with mirrProb < 71, egoYawRate < 2, egoSpeed > 0.2, Motion == 1 and LOS == 1,
+# assign:
+#   label = 1 if y is between -2 and 2 (ego lane)
+#   label = 2 if y is between -6 and -2 (left of ego lane)
+#   label = 3 if y is between 2 and 6 (right of ego lane)
+# Otherwise label = 0.
+def compute_label(row):
+    if (row['mirrProb'] < 71) and (row['egoYawRate'] < 2) and (row['egoSpeed'] > 0.2) and (row['Motion'] == 1) and (row['LOS'] == 1):
+        if -2 <= row['y'] <= 2:
+            return 1
+        elif -6 <= row['y'] < -2:
+            return 2
+        elif 2 < row['y'] <= 6:
+            return 3
         else:
-            los_mask.append(True)
-            seen_x_positions.add(x)
-    df['directLOS'] = los_mask
-    return df[df['directLOS']]
+            return 0
+    else:
+        return 0
 
-df_los = get_direct_los(relevant_cycles)
+df_pd['label'] = df_pd.apply(compute_label, axis=1)
 
-def categorize_objects(df):
-    conditions = [
-        (df['x'].between(-2, 2), 'inEgoLane'),
-        (df['x'].between(-6, -2), 'inLeftEgoLane'),
-        (df['x'].between(2, 6), 'inRightEgoLane')
-    ]
-    df['category'] = 'irrelevant'
-    for cond, label in conditions:
-        df['category'] = df['category'].where(~cond, label)
-    return df
+# Compute OOI: For each radar cycle (mc) and for each label in (1,2,3),
+# mark the object with the smallest range as OOI = 1; all others 0.
+def compute_OOI(group):
+    group = group.copy()
+    group['OOI'] = 0
+    for lbl in [1, 2, 3]:
+        sub = group[group['label'] == lbl]
+        if not sub.empty:
+            idx = sub['r'].idxmin()
+            group.loc[idx, 'OOI'] = 1
+    return group
 
-df_los = categorize_objects(df_los)
+df_pd = df_pd.groupby('mc', group_keys=False).apply(compute_OOI)
 
-# Create interactive widgets
-cycle_slider = pn.widgets.IntSlider(name='Radar Cycle', start=int(df['mc'].min()), end=int(df['mc'].max()), step=1, value=int(df['mc'].min()))
-y_axis_slider = pn.widgets.FloatSlider(name='Y-Axis Max', start=-200, end=200, step=1, value=100)
-x_axis_slider = pn.widgets.FloatSlider(name='X-Axis Limit (+/-)', start=1, end=30, step=1, value=10)
+# Scale the corner columns (lf, lr, wl, wr) from 1000 scale to the proper scale
+for col in ['lf', 'lr', 'wl', 'wr']:
+    df_pd[col] = df_pd[col] * 0.001
 
-# Function to update the plot
-def update_plot(cycle, y_max, x_limit):
-    subset = df_los[df_los['mc'] == cycle]
-    colors = {'inEgoLane': 'red', 'inLeftEgoLane': 'blue', 'inRightEgoLane': 'green', 'irrelevant': 'grey'}
-    sizes = {'inEgoLane': 3, 'inLeftEgoLane': 3, 'inRightEgoLane': 3, 'irrelevant': 2}
-    traces = []
-    for category, color in colors.items():
-        cat_subset = subset[subset['category'] == category]
-        traces.append(go.Scattergl(
-            x=cat_subset['y'], y=cat_subset['x'], mode='markers',
-            marker=dict(size=sizes[category], color=color),
-            text=cat_subset[['vx', 'vy', 'dp', 'poe', 'pfd']].to_dict('records'),
-            hoverinfo='text'
-        ))
-    fig = go.Figure(traces)
-    fig.update_layout(
-        title=dict(text='Objects of Interest (OOI)', x=1, y=1, xanchor='right', yanchor='top', font=dict(size=12, bold=True)),
-        xaxis=dict(range=[-x_limit, x_limit]),
-        yaxis=dict(range=[0, y_max]),
-        width=900, height=400, margin=dict(l=0, r=0, t=0, b=0)
-    )
-    return fig
+# Convert the preprocessed pandas dataframe to a Vaex dataframe for fast slicing
+df_v = vaex.from_pandas(df_pd, copy_index=False)
 
-plot = pn.bind(update_plot, cycle_slider, y_axis_slider, x_axis_slider)
+# For the Radar Cycle Slider, get the sorted unique radar cycle values
+radar_cycles = np.sort(df_pd['mc'].unique())
 
-def save_plot():
-    fig = update_plot(cycle_slider.value, y_axis_slider.value, x_axis_slider.value)
-    fig.write_html("saved_plot.html")
-    print("Plot saved as saved_plot.html")
+# ---------------------------
+# 3. Define Panel Widgets (Sliders and Button)
+# ---------------------------
+# Subsection 1: Four vertical sliders for filtering the object plot
+slider_EYR = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, step=0.01, value=2)
+slider_ES  = pn.widgets.FloatSlider(name='ES Slider',  start=0, end=10, step=0.1, value=0.5)
+slider_MP  = pn.widgets.FloatSlider(name='MP Slider',  start=0, end=100, step=0.5, value=70)
+slider_Age = pn.widgets.IntSlider(name='Age Slider',   start=0, end=100, step=1, value=20)
 
-save_button = pn.widgets.Button(name='Save Plot', button_type='primary')
-save_button.on_click(lambda event: save_plot())
+# Slider Section (a horizontal row of 3 sliders)
+slider_Y_axis = pn.widgets.FloatSlider(name='Y-axis Slider', start=-200, end=200, step=1, value=100)
+slider_X_axis = pn.widgets.FloatSlider(name='X-axis Slider', start=1, end=30, step=1, value=10)
+slider_Radar  = pn.widgets.IntSlider(name='Radar Cycle Slider', start=int(radar_cycles[0]), end=int(radar_cycles[-1]), step=1, value=int(radar_cycles[0]))
 
-dash_layout = pn.Column(
-    pn.Row(cycle_slider, y_axis_slider, x_axis_slider, save_button),
-    plot
+# A button to save the current state (plots from the current radar cycle)
+save_button = pn.widgets.Button(name='Save Dashboard State', button_type='primary')
+
+# ---------------------------
+# 4. Create Matplotlib Figures for the Plots
+# ---------------------------
+# Figure for object plot (subsection 5)
+fig_obj, ax_obj = plt.subplots(figsize=(4, 4))
+# Figures for time series plots (subsections 2, 4, 6)
+fig_ts1, ax_ts1 = plt.subplots(figsize=(4, 2))
+fig_ts2, ax_ts2 = plt.subplots(figsize=(4, 2))
+fig_ts3, ax_ts3 = plt.subplots(figsize=(4, 2))
+
+# ---------------------------
+# 5. Define Update Functions for the Plots
+# ---------------------------
+def update_object_plot(event=None):
+    """Update the main Object Plot (subsection 5)."""
+    ax_obj.clear()
+    current_mc = slider_Radar.value
+
+    # Filter data for the current radar cycle (using Vaex for speed) and convert to pandas
+    df_cycle = df_v[df_v.mc == current_mc].to_pandas_df()
+
+    # Apply additional filters from the vertical sliders
+    df_cycle = df_cycle[(df_cycle['egoYawRate'] < slider_EYR.value) &
+                        (df_cycle['egoSpeed'] > slider_ES.value) &
+                        (df_cycle['mirrProb'] < slider_MP.value) &
+                        (df_cycle['lc'] > slider_Age.value)]
+
+    # Set x-axis and y-axis limits based on the slider values
+    ax_obj.set_xlim(-slider_X_axis.value, slider_X_axis.value)
+    ax_obj.set_ylim(0, slider_Y_axis.value)
+
+    # Plot a black scatter point at the origin (0,0) with hover info showing mc, egoSpeed, and egoYawRate
+    if not df_cycle.empty:
+        egoSpeed = df_cycle['egoSpeed'].iloc[0]
+        egoYawRate = df_cycle['egoYawRate'].iloc[0]
+    else:
+        egoSpeed, egoYawRate = 'N/A', 'N/A'
+    ax_obj.scatter(0, 0, color='black', s=30, label=f"mc:{current_mc}, egoSpeed:{egoSpeed}, egoYawRate:{egoYawRate}")
+
+    # Loop over each object in the current cycle
+    for idx, row in df_cycle.iterrows():
+        # Determine colour and scatter size based on Motion, LOS, label, and OOI
+        color = 'grey'
+        size = 2
+        if row['OOI'] == 1:
+            color = 'red'
+            size = 4
+        elif row['LOS'] == 1:
+            if row['label'] == 1:
+                color = 'lightblue'
+                size = 3
+            elif row['label'] == 2:
+                color = 'lightgreen'
+                size = 3
+            elif row['label'] == 3:
+                color = 'lightmagenta'
+                size = 3
+
+        # Plot the object as a scatter point; note the x-axis uses the object's y position and y-axis uses x position.
+        ax_obj.scatter(row['y'], row['x'], color=color, s=size*10)
+
+        # Draw the rectangular bounds.
+        # The object's rectangle is defined in its local coordinate system:
+        # corners: front-left, front-right, rear-right, rear-left.
+        local_corners = np.array([[row['lf'], row['wl']],
+                                  [row['lf'], -row['wr']],
+                                  [-row['lr'], -row['wr']],
+                                  [-row['lr'], row['wl']]])
+        # Rotation matrix to transform from object local to ego coordinate system.
+        cos_o = np.cos(row['o'])
+        sin_o = np.sin(row['o'])
+        R = np.array([[cos_o, -sin_o],
+                      [sin_o,  cos_o]])
+        rotated_corners = np.dot(local_corners, R.T)
+        # Translate by the object's ego position (x, y)
+        corners = rotated_corners + np.array([row['x'], row['y']])
+        polygon = patches.Polygon(corners, closed=True, fill=False, edgecolor=color, linewidth=1)
+        ax_obj.add_patch(polygon)
+
+        # For objects with label 1,2,3, draw an arrow (of ~1 m length) indicating the orientation.
+        if row['label'] in [1, 2, 3]:
+            # Front-center in local coordinates is (lf, 0)
+            front_center = np.array([row['lf'], 0])
+            front_center_rotated = np.dot(front_center, R.T) + np.array([row['x'], row['y']])
+            ax_obj.arrow(row['x'], row['y'],
+                         front_center_rotated[0] - row['x'],
+                         front_center_rotated[1] - row['y'],
+                         head_width=0.2, head_length=0.2, fc=color, ec=color)
+
+    ax_obj.legend(fontsize=6)
+    ax_obj.set_title("Object Plot")
+    fig_obj.tight_layout()
+    fig_obj.canvas.draw_idle()
+
+    # Attach mplcursors for hover text (for objects with Motion==1)
+    cursor = mplcursors.cursor(ax_obj.collections, hover=True)
+    @cursor.connect("add")
+    def on_add(sel):
+        x, y = sel.target
+        # Find the closest object (approximate by Euclidean distance)
+        dists = np.sqrt((df_cycle['y'] - x)**2 + (df_cycle['x'] - y)**2)
+        if not dists.empty:
+            idx_min = dists.idxmin()
+            row = df_cycle.loc[idx_min]
+            if row['Motion'] == 1:
+                sel.annotation.set_text(
+                    f"id: {row['id']}\n"
+                    f"lc: {row['lc']}\n"
+                    f"mirrProb: {row['mirrProb']}\n"
+                    f"vx: {row['vx']}\n"
+                    f"vy: {row['vy']}\n"
+                    f"dp: {row['dp']}\n"
+                    f"poe: {row['poe']}\n"
+                    f"pfd: {row['pfd']}"
+                )
+            else:
+                sel.annotation.set_text("")
+    return pn.pane.Matplotlib(fig_obj, tight=True)
+
+def update_time_series(label_val, ax, fig, title_prefix):
+    """Update time series plot for the object with OOI==1 and a specific label."""
+    ax.clear()
+    current_mc = slider_Radar.value
+    # Filter for the current radar cycle to find the object (with OOI==1 and given label)
+    df_cycle = df_v[(df_v.mc == current_mc) & (df_v.OOI == 1) & (df_v.label == label_val)].to_pandas_df()
+    if df_cycle.empty:
+        ax.set_title(f"{title_prefix} - No Data")
+    else:
+        obj_id = df_cycle.iloc[0]['id']
+        current_poe = df_cycle.iloc[0]['poe']
+        # Get all data for this object id in a window of 5 cycles before and after current cycle
+        df_obj = df_v[(df_v.id == obj_id) & 
+                      (df_v.mc >= current_mc - 5) & 
+                      (df_v.mc <= current_mc + 5)].to_pandas_df()
+        if not df_obj.empty:
+            ax.plot(df_obj['mc'], df_obj['poe'], marker='o', markersize=2, linewidth=1)
+            ax.set_ylim(0, 100)
+            ax.set_title(f"{title_prefix}{obj_id} - POE: {current_poe}")
+        else:
+            ax.set_title(f"{title_prefix} - No Data")
+    fig.tight_layout()
+    fig.canvas.draw_idle()
+    return pn.pane.Matplotlib(fig, tight=True)
+
+def update_ts1(event=None):
+    return update_time_series(1, ax_ts1, fig_ts1, "inEgoLaneOOI ")
+
+def update_ts2(event=None):
+    return update_time_series(2, ax_ts2, fig_ts2, "inLeftEgoLaneOOI ")
+
+def update_ts3(event=None):
+    return update_time_series(3, ax_ts3, fig_ts3, "inRightEgoLaneOOI ")
+
+def update_all(event=None):
+    pane_obj.object = update_object_plot()
+    pane_ts1.object = update_ts1()
+    pane_ts2.object = update_ts2()
+    pane_ts3.object = update_ts3()
+
+# ---------------------------
+# 6. Create Panel Panes for the Plots and Attach Callbacks
+# ---------------------------
+pane_obj = pn.panel(update_object_plot(), sizing_mode='stretch_both')
+pane_ts1 = pn.panel(update_ts1(), sizing_mode='stretch_both')
+pane_ts2 = pn.panel(update_ts2(), sizing_mode='stretch_both')
+pane_ts3 = pn.panel(update_ts3(), sizing_mode='stretch_both')
+
+# Whenever any slider value changes, update all plots.
+for widget in [slider_EYR, slider_ES, slider_MP, slider_Age, slider_Y_axis, slider_X_axis, slider_Radar]:
+    widget.param.watch(update_all, 'value')
+
+# Save button callback to export the current dashboard as an interactive HTML file.
+def save_dashboard(event):
+    dashboard.save('dashboard_state.html', embed=True)
+    print("Dashboard state saved to dashboard_state.html")
+
+save_button.on_click(save_dashboard)
+
+# ---------------------------
+# 7. Build the Dashboard Layout
+# ---------------------------
+# Heading Section (90% width, 5% height)
+heading = pn.pane.Markdown("<h1 style='font-family: Consolas, monospace; text-align: center;'>Objects Of Interest (OOI)</h1>",
+                           sizing_mode='stretch_width')
+
+# Slider Section (90% width, 5% height) with 3 sliders in one row.
+slider_section = pn.Row(slider_Y_axis, slider_X_axis, slider_Radar, sizing_mode='stretch_width')
+
+# Graph Section (90% width, 85% height) arranged in a 2x3 grid.
+# Subsection 1: Four vertical sliders (EYR, ES, MP, Age)
+subsec1 = pn.Column(slider_EYR, slider_ES, slider_MP, slider_Age, sizing_mode='stretch_both')
+# Subsection 2: Time series for label 1 (inEgoLaneOOI)
+subsec2 = pane_ts1
+# Subsection 3: Empty
+subsec3 = pn.pane.Markdown("", sizing_mode='stretch_both')
+# Subsection 4: Time series for label 2 (inLeftEgoLaneOOI)
+subsec4 = pane_ts2
+# Subsection 5: Object plot
+subsec5 = pane_obj
+# Subsection 6: Time series for label 3 (inRightEgoLaneOOI)
+subsec6 = pane_ts3
+
+graph_grid = pn.GridSpec(sizing_mode='stretch_both', max_height=600)
+graph_grid[0, 0] = subsec1
+graph_grid[0, 1] = subsec2
+graph_grid[0, 2] = subsec3
+graph_grid[1, 0] = subsec4
+graph_grid[1, 1] = subsec5
+graph_grid[1, 2] = subsec6
+
+# Combine all sections into the main dashboard layout.
+dashboard = pn.Column(
+    heading,
+    slider_section,
+    graph_grid,
+    save_button,
+    sizing_mode='stretch_both',
+    margin=0
 )
 
-pn.extension()
-dash_layout.show(port=5006)
+# ---------------------------
+# 8. Serve and Open the Dashboard
+# ---------------------------
+dashboard.servable()
+dashboard.show(port=5006)
+print("Dashboard is available at: http://localhost:5006")
+webbrowser.open("http://localhost:5006")
