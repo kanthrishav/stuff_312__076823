@@ -16,19 +16,16 @@ from numba import njit, prange
 pn.extension()
 pn.config.raw_css.append("""
     .bk-root { font-family: "Courier New", monospace; }
-    body { margin: 0; padding: 0; background-color: #063337; }
-    /* Force main dashboard container to occupy full viewport height */
-    .main-dashboard {
-        height: 100vh;
-        overflow: hidden;
-    }
+    body { margin: 0; padding: 0; background-color: #CBCB24; }
+    /* Set slider section font colour */
+    .slider-section { color: #40400B; }
 """)
 print(f"[{time.time():.3f}] Panel extension loaded.")
 
 # ---------------------------
 # PARAMETERS & FILE PATHS
 # ---------------------------
-LOS_thresh = 0.035  # LOS threshold
+LOS_thresh = 0.035
 original_file_path = "data_original.feather"
 preprocessed_file_path = "data_preprocessed.feather"
 
@@ -39,19 +36,12 @@ start_total = time.time()
 preprocess_start = time.time()
 
 if os.path.exists(preprocessed_file_path):
-    print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed file found. Loading dataframe.")
     pdf = pd.read_feather(preprocessed_file_path)
 else:
-    print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed file not found. Reading original data.")
     pdf = pd.read_feather(original_file_path)
-    
-    # Basic quantities
     pdf['az'] = np.arctan2(pdf['y'].values, pdf['x'].values)
     pdf['r'] = np.hypot(pdf['x'].values, pdf['y'].values)
-    pdf['Motion'] = np.where(pdf['dp'].isin([1, 2, 5, 6]), 1, 0)
-    print(f"[{time.time()-preprocess_start:.3f} sec] Basic columns computed.")
-
-    # LOS computation (using Numba, parallelized)
+    pdf['Motion'] = np.where(pdf['dp'].isin([1,2,5,6]), 1, 0)
     @njit(parallel=True)
     def compute_all_los(sorted_az, sorted_r, group_start, group_end, thresh):
         n_groups = group_start.shape[0]
@@ -68,7 +58,6 @@ else:
                             break
                 los_sorted[j] = flag
         return los_sorted
-
     mc_arr = pdf['mc'].values
     order = np.argsort(mc_arr)
     sorted_mc = mc_arr[order]
@@ -79,14 +68,10 @@ else:
     for i in range(len(group_start)-1):
         group_end[i] = group_start[i+1]
     group_end[-1] = len(sorted_mc)
-    
     los_sorted = compute_all_los(sorted_az, sorted_r, group_start, group_end, LOS_thresh)
     los = np.empty_like(los_sorted)
     los[order] = los_sorted
     pdf['LOS'] = los
-    print(f"[{time.time()-preprocess_start:.3f} sec] LOS column computed.")
-
-    # Label computation: convert egoYawRate to deg/s and use absolute value
     mirrProb = pdf['mirrProb'].values
     egoYawRate = pdf['egoYawRate'].values
     egoSpeed = pdf['egoSpeed'].values
@@ -100,9 +85,6 @@ else:
     labels[np.where(cond & (y_vals >= -6) & (y_vals < -2))] = 2
     labels[np.where(cond & (y_vals > 2) & (y_vals <= 6))] = 3
     pdf['label'] = labels
-    print(f"[{time.time()-preprocess_start:.3f} sec] Label column computed.")
-
-    # OOI computation (vectorized)
     labels_arr = pdf['label'].values
     mc_arr = pdf['mc'].values
     r_arr = pdf['r'].values
@@ -116,15 +98,11 @@ else:
         unique_keys, unique_idx = np.unique(keys, axis=0, return_index=True)
         selected_indices = ordered_sel[unique_idx]
         pdf.loc[selected_indices, 'OOI'] = 1
-    print(f"[{time.time()-preprocess_start:.3f} sec] OOI column computed.")
-
     pdf.to_feather(preprocessed_file_path)
-    print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed dataframe saved.")
-
 print(f"[{time.time()-preprocess_start:.3f} sec] Data preprocessing complete.")
 print(f"[{time.time()-start_total:.3f} sec] Total initialization complete.")
 
-# Convert to Vaex dataframe for on-demand filtering
+# Convert to Vaex dataframe
 df = vaex.from_pandas(pdf)
 
 # ---------------------------
@@ -132,16 +110,12 @@ df = vaex.from_pandas(pdf)
 # ---------------------------
 dashboard_start = time.time()
 
-# Build Radar Cycle Slider from unique mc values (as integers)
 unique_mcs = sorted(list(set(pdf['mc'].astype(int).tolist())))
-radar_cycle_slider = pn.widgets.DiscreteSlider(
-    name='Radar Cycle Slider',
-    options=unique_mcs,
-    value=unique_mcs[0],
-    width=1400
-)
+radar_cycle_slider = pn.widgets.DiscreteSlider(name='Radar Cycle Slider',
+                                                options=unique_mcs,
+                                                value=unique_mcs[0],
+                                                width=1400)
 
-# New direct cycle input and "Go" button
 cycle_input = pn.widgets.TextInput(name="Cycle Input", value="", width=100)
 cycle_go_button = pn.widgets.Button(name="Go", button_type="primary")
 def go_to_cycle(event):
@@ -155,24 +129,22 @@ def go_to_cycle(event):
         print("Invalid cycle input:", e)
 cycle_go_button.on_click(go_to_cycle)
 
-# Filter Panel: sliders, azimuth filters, and stats pane.
 eyr_slider = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, value=2, step=0.01)
 es_slider = pn.widgets.FloatSlider(name='ES Slider', start=0, end=10, value=0.2, step=0.1)
 mp_slider = pn.widgets.FloatSlider(name='MP Slider', start=0, end=100, value=71, step=1)
 age_slider = pn.widgets.FloatSlider(name='Age Slider', start=0, end=100, value=0, step=1)
 x_axis_slider = pn.widgets.FloatSlider(name='X-axis Slider', start=1, end=30, value=10, step=1)
-y_axis_slider = pn.widgets.FloatSlider(name='Y-axis Slider', start=-50, end=200, value=100, step=1)
-min_az_input = pn.widgets.TextInput(name="Min Az (deg)", value="-180", width=100)
-max_az_input = pn.widgets.TextInput(name="Max Az (deg)", value="180", width=100)
+y_axis_slider = pn.widgets.FloatSlider(name='Y-axis Slider', start=-200, end=200, value=100, step=1)
+min_az_input = pn.widgets.TextInput(name="Min Az (deg)", value="-180", width=50)
+max_az_input = pn.widgets.TextInput(name="Max Az (deg)", value="180", width=50)
 stats_pane = pn.pane.Markdown("", sizing_mode="stretch_width")
 filter_panel = pn.Column(eyr_slider, es_slider, mp_slider, age_slider, x_axis_slider, y_axis_slider,
                            pn.Row(min_az_input, max_az_input), stats_pane, sizing_mode="stretch_width")
 
-# New Radar Cycle Navigation Controls: "<", ">", "Run", "Step Size", and red Stop button.
 prev_button = pn.widgets.Button(name="<", button_type="primary", width=30)
 step_button = pn.widgets.Button(name=">", button_type="primary", width=30)
 run_button = pn.widgets.Button(name="Run", button_type="success", width=40)
-step_size_input = pn.widgets.TextInput(name="Step Size (s)", value="2", width=100)
+step_size_input = pn.widgets.TextInput(name="Step Size (s)", value="2", width=50)
 stop_button = pn.widgets.Button(name="", button_type="danger", width=40)
 
 animate_callback = None
@@ -216,14 +188,14 @@ stop_button.on_click(stop_click)
 radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, prev_button, step_button,
                            run_button, step_size_input, stop_button, sizing_mode="stretch_width")
 
-# Save Button
 save_button = pn.widgets.Button(name='Save Current State', button_type="primary")
 
 # ---------------------------
 # Histogram Section (for complete preprocessed data)
 # ---------------------------
 def create_histogram_fig(title):
-    p = figure(title=title, sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", height=600)
+    p = figure(title=title, sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", height=600,
+               background_fill_color="#C1F6F3")
     return p
 
 left_hist = create_histogram_fig("LeftEgoHist")
@@ -311,7 +283,10 @@ birdseye_plot = figure(
     title="Bird's Eye View", 
     sizing_mode="stretch_both", 
     tools="pan,wheel_zoom,reset",
-    height=1000
+    height=1000,
+    background_fill_color="#545E5D",
+    outline_line_color="#838317",
+    outline_line_width=3
 )
 birdseye_plot.x_range.start = -x_axis_slider.value
 birdseye_plot.x_range.end = x_axis_slider.value
@@ -327,8 +302,8 @@ y_axis_slider.param.watch(lambda e: update_y_range(), 'value')
 for xv in [-6, -2, 2, 6]:
     span = Span(location=xv, dimension='height', line_color='purple', line_dash='dotted', line_width=1)
     birdseye_plot.add_layout(span)
-right_border = Span(location=birdseye_plot.x_range.end, dimension='height', line_color="black", line_width=3)
-top_border = Span(location=birdseye_plot.y_range.end, dimension='width', line_color="black", line_width=3)
+right_border = Span(location=birdseye_plot.x_range.end, dimension='height', line_color="#838317", line_width=3)
+top_border = Span(location=birdseye_plot.y_range.end, dimension='width', line_color="#838317", line_width=3)
 birdseye_plot.add_layout(right_border)
 birdseye_plot.add_layout(top_border)
 scatter_renderer = birdseye_plot.scatter('x', 'y', source=object_scatter_source,
@@ -336,6 +311,7 @@ scatter_renderer = birdseye_plot.scatter('x', 'y', source=object_scatter_source,
 rect_renderer = birdseye_plot.rect('rx', 'ry', width='rwidth', height='rheight', angle='rangle',
                                    source=object_rect_source, fill_color='rcolor', fill_alpha=0.4, line_color='rcolor', line_width=1)
 ego_renderer = birdseye_plot.scatter('x', 'y', source=ego_source, size=4, color='black', fill_alpha=1.0)
+# Use HTML <br> for line breaks in hover text.
 object_hover = HoverTool(tooltips=[("Details", "@hover")], renderers=[scatter_renderer])
 birdseye_plot.add_tools(object_hover)
 ego_hover = HoverTool(tooltips=[("Ego", "@hover")], renderers=[ego_renderer])
@@ -345,7 +321,10 @@ ts_plot_ego = figure(
     title="inEgoLaneOOI", 
     sizing_mode="stretch_both", 
     tools="pan,wheel_zoom,reset", 
-    y_range=(0, 100)
+    y_range=(0, 100),
+    background_fill_color="#C1F6F3",
+    outline_line_color="#838317",
+    outline_line_width=3
 )
 ts_plot_ego.line('mc', 'poe', source=ts_source_ego, line_width=1, color='blue')
 ts_plot_ego.circle('mc', 'poe', source=ts_source_ego, size=3, color='blue')
@@ -354,7 +333,10 @@ ts_plot_left = figure(
     title="inLeftEgoLaneOOI", 
     sizing_mode="stretch_both", 
     tools="pan,wheel_zoom,reset", 
-    y_range=(0, 100)
+    y_range=(0, 100),
+    background_fill_color="#C1F6F3",
+    outline_line_color="#838317",
+    outline_line_width=3
 )
 ts_plot_left.line('mc', 'poe', source=ts_source_left, line_width=1, color='green')
 ts_plot_left.circle('mc', 'poe', source=ts_source_left, size=3, color='green')
@@ -363,7 +345,10 @@ ts_plot_right = figure(
     title="inRightEgoLaneOOI", 
     sizing_mode="stretch_both", 
     tools="pan,wheel_zoom,reset", 
-    y_range=(0, 100)
+    y_range=(0, 100),
+    background_fill_color="#C1F6F3",
+    outline_line_color="#838317",
+    outline_line_width=3
 )
 ts_plot_right.line('mc', 'poe', source=ts_source_right, line_width=1, color='magenta')
 ts_plot_right.circle('mc', 'poe', source=ts_source_right, size=3, color='magenta')
@@ -422,9 +407,15 @@ def update_object_plot():
         else:
             col = "grey"
         size_val = 4 if row['OOI'] == 1 else 3
-        hover_text = (f"id: {int(row['id'])} | vx: {row['vx']:.2f} | vy: {row['vy']:.2f}\n"
-                      f"mirrProb: {int(row['mirrProb'])} | poe: {int(row['poe'])} | pfd: {row['pfd']:.4f}\n"
-                      f"dp: {int(row['dp'])} | lc: {int(row['lc'])} |")
+        # Map dp to new strings:
+        dp = int(row['dp'])
+        dp_map = {1:"M", 2:"O", 5:"CL", 6:"CR", 3:"STP", 4:"STAT"}
+        dp_str = dp_map.get(dp, str(dp))
+        orient_deg = math.degrees(row['orient'])
+        # Hover text with HTML breaks for three rows (each with three values)
+        hover_text = (f"id: {int(row['id'])} | vx: {row['vx']:.2f} | vy: {row['vy']:.2f}<br>"
+                      f"mirrProb: {int(row['mirrProb'])} | poe: {int(row['poe'])} | pfd: {row['pfd']:.4f}<br>"
+                      f"dp: {dp_str} | lc: {int(row['lc'])} | label: {int(row['label'])}, orient: {orient_deg:.1f}°, LOS: {int(row['LOS'])}")
         
         scatter_x.append(row['y'])
         scatter_y.append(row['x'])
@@ -445,10 +436,8 @@ def update_object_plot():
         rect_colors.append(col)
     
     object_scatter_source.data = dict(x=scatter_x, y=scatter_y, color=colors, size=sizes, hover=hovers)
-    object_rect_source.data = dict(
-        rx=rect_rx, ry=rect_ry, rwidth=rect_widths, rheight=rect_heights,
-        rangle=rect_angles, rcolor=rect_colors
-    )
+    object_rect_source.data = dict(rx=rect_rx, ry=rect_ry, rwidth=rect_widths, rheight=rect_heights,
+                                   rangle=rect_angles, rcolor=rect_colors)
     
     ego_info = filtered.iloc[0]
     ego_hover_text = (f"mc: {int(ego_info['mc'])}, egoSpeed: {ego_info['egoSpeed']:.3f}, "
@@ -507,10 +496,10 @@ def update_histograms_all():
         pct_ge_98 = np.sum((poe_array >= 98) & (poe_array < 99))/total*100
         pct_ge_70 = np.sum((poe_array >= 70) & (poe_array < 98))/total*100
         pct_lt_50 = np.sum(poe_array < 50)/total*100
-        return (f"Total: {total}\n"
-                f"% >= 99: {pct_ge_99:.4f}\n"
-                f"% >= 98 and < 99: {pct_ge_98:.4f}\n"
-                f"% >= 70 and < 98: {pct_ge_70:.4f}\n"
+        return (f"Total: {total}<br>"
+                f"% >= 99: {pct_ge_99:.4f}<br>"
+                f"% >= 98 and < 99: {pct_ge_98:.4f}<br>"
+                f"% >= 70 and < 98: {pct_ge_70:.4f}<br>"
                 f"% < 50: {pct_lt_50:.4f}")
     left_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 2)]['poe'].values)
     in_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 1)]['poe'].values)
@@ -557,7 +546,8 @@ header_section = pn.pane.Markdown(
 
 radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, prev_button, step_button,
                            run_button, step_size_input, stop_button, sizing_mode="stretch_width")
-slider_section = pn.Row(radar_control_row, sizing_mode="stretch_width", height=50)
+# Wrap slider section in a Div with font color set
+slider_section = pn.Row(radar_control_row, css_classes=["slider-section"], sizing_mode="stretch_width", height=50)
 
 grid = pn.GridSpec(sizing_mode='stretch_both', max_height=1000)
 grid[0, 0] = filter_panel
@@ -566,28 +556,29 @@ grid[0:2, 1] = birdseye_plot
 grid[0, 2] = ts_plot_ego
 grid[1, 2] = ts_plot_right
 
-# The main dashboard container (without histograms)
-main_dashboard = pn.Column(header_section, slider_section, grid, save_button, sizing_mode="stretch_both", css_classes=["main-dashboard"])
+# Main dashboard: header, slider section, grid, save button.
+main_dashboard = pn.Column(header_section, slider_section, grid, save_button, sizing_mode="stretch_both", margin=0)
 
-# Histogram section (for complete preprocessed data) is placed after the main dashboard.
+# Histogram section (for complete preprocessed data) on a separate tab.
 hist_row = pn.Row(
     pn.Column(left_hist, left_hist_stats, sizing_mode="stretch_both"),
     pn.Column(in_hist, in_hist_stats, sizing_mode="stretch_both"),
     pn.Column(right_hist, right_hist_stats, sizing_mode="stretch_both"),
     sizing_mode="stretch_width", height=600
 )
-hist_section = pn.Column(pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"), hist_row, sizing_mode="stretch_width")
+hist_section = pn.Column(pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"), 
+                         hist_row, sizing_mode="stretch_width")
 
-# Final dashboard layout: main dashboard stays on one screen; histograms appear below when scrolled.
-dashboard_layout = pn.Column(main_dashboard, hist_section, sizing_mode="stretch_both", margin=0)
+# Create tabs: one for main dashboard, one for histogram.
+tabs = pn.Tabs(
+    ("main", main_dashboard),
+    ("hist", hist_section)
+)
 
 update_all()
 pn.state.onload(lambda: update_all())
 
-dashboard_layout.servable()
+tabs.servable()
 print(f"[{time.time()-dashboard_start:.3f} sec] Dashboard creation complete.")
 
-# ---------------------------
-# LAUNCH THE DASHBOARD
-# ---------------------------
-pn.serve(dashboard_layout, show=True, start=True)
+pn.serve(tabs, show=True, start=True)
