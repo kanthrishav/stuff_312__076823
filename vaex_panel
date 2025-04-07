@@ -11,12 +11,17 @@ from bokeh.io import curdoc
 from numba import njit, prange
 
 # ---------------------------
-# INITIALIZE PANEL & SET BACKGROUND
+# INITIALIZE PANEL & SET GLOBAL CSS
 # ---------------------------
 pn.extension()
 pn.config.raw_css.append("""
     .bk-root { font-family: "Courier New", monospace; }
     body { margin: 0; padding: 0; background-color: #063337; }
+    /* Force main dashboard container to occupy full viewport height */
+    .main-dashboard {
+        height: 100vh;
+        overflow: hidden;
+    }
 """)
 print(f"[{time.time():.3f}] Panel extension loaded.")
 
@@ -40,13 +45,13 @@ else:
     print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed file not found. Reading original data.")
     pdf = pd.read_feather(original_file_path)
     
-    # Compute basic geometric quantities
+    # Basic quantities
     pdf['az'] = np.arctan2(pdf['y'].values, pdf['x'].values)
     pdf['r'] = np.hypot(pdf['x'].values, pdf['y'].values)
     pdf['Motion'] = np.where(pdf['dp'].isin([1, 2, 5, 6]), 1, 0)
     print(f"[{time.time()-preprocess_start:.3f} sec] Basic columns computed.")
 
-    # LOS computation using Numba (parallelized)
+    # LOS computation (using Numba, parallelized)
     @njit(parallel=True)
     def compute_all_los(sorted_az, sorted_r, group_start, group_end, thresh):
         n_groups = group_start.shape[0]
@@ -127,7 +132,7 @@ df = vaex.from_pandas(pdf)
 # ---------------------------
 dashboard_start = time.time()
 
-# Build Radar Cycle Slider using unique mc values (integers)
+# Build Radar Cycle Slider from unique mc values (as integers)
 unique_mcs = sorted(list(set(pdf['mc'].astype(int).tolist())))
 radar_cycle_slider = pn.widgets.DiscreteSlider(
     name='Radar Cycle Slider',
@@ -136,7 +141,7 @@ radar_cycle_slider = pn.widgets.DiscreteSlider(
     width=1400
 )
 
-# New direct cycle input
+# New direct cycle input and "Go" button
 cycle_input = pn.widgets.TextInput(name="Cycle Input", value="", width=100)
 cycle_go_button = pn.widgets.Button(name="Go", button_type="primary")
 def go_to_cycle(event):
@@ -150,7 +155,7 @@ def go_to_cycle(event):
         print("Invalid cycle input:", e)
 cycle_go_button.on_click(go_to_cycle)
 
-# Filter Panel: stack of sliders plus azimuth filters and a stats pane.
+# Filter Panel: sliders, azimuth filters, and stats pane.
 eyr_slider = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, value=2, step=0.01)
 es_slider = pn.widgets.FloatSlider(name='ES Slider', start=0, end=10, value=0.2, step=0.1)
 mp_slider = pn.widgets.FloatSlider(name='MP Slider', start=0, end=100, value=71, step=1)
@@ -163,7 +168,7 @@ stats_pane = pn.pane.Markdown("", sizing_mode="stretch_width")
 filter_panel = pn.Column(eyr_slider, es_slider, mp_slider, age_slider, x_axis_slider, y_axis_slider,
                            pn.Row(min_az_input, max_az_input), stats_pane, sizing_mode="stretch_width")
 
-# New Radar Cycle Navigation Controls
+# New Radar Cycle Navigation Controls: "<", ">", "Run", "Step Size", and red Stop button.
 prev_button = pn.widgets.Button(name="<", button_type="primary", width=30)
 step_button = pn.widgets.Button(name=">", button_type="primary", width=30)
 run_button = pn.widgets.Button(name="Run", button_type="success", width=40)
@@ -241,7 +246,6 @@ in_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
 right_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
 
 def update_histograms_all():
-    # Use the entire preprocessed data (pdf)
     df_all = pdf
     def compute_histogram(label_val):
         subset = df_all[df_all['OOI'] == 1]
@@ -303,7 +307,6 @@ ts_source_right = ColumnDataSource(data=dict(mc=[], poe=[]))
 # ---------------------------
 # Create Main Bokeh Figures
 # ---------------------------
-# Bird's Eye View plot
 birdseye_plot = figure(
     title="Bird's Eye View", 
     sizing_mode="stretch_both", 
@@ -469,7 +472,6 @@ def update_time_series(source, label_val, title_prefix):
         return f"{title_prefix} No Data"
 
 def update_histograms_all():
-    # Histogram for the entire preprocessed data (pdf)
     df_all = pdf
     def compute_histogram(label_val):
         subset = df_all[df_all['OOI'] == 1]
@@ -564,17 +566,20 @@ grid[0:2, 1] = birdseye_plot
 grid[0, 2] = ts_plot_ego
 grid[1, 2] = ts_plot_right
 
-# Histogram section: placed below the Save button.
-hist_section = pn.Column(
-    pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"),
-    pn.Row(pn.Column(left_hist, left_hist_stats, sizing_mode="stretch_both"),
-           pn.Column(in_hist, in_hist_stats, sizing_mode="stretch_both"),
-           pn.Column(right_hist, right_hist_stats, sizing_mode="stretch_both"),
-           sizing_mode="stretch_width", height=600),
-    sizing_mode="stretch_width"
-)
+# The main dashboard container (without histograms)
+main_dashboard = pn.Column(header_section, slider_section, grid, save_button, sizing_mode="stretch_both", css_classes=["main-dashboard"])
 
-dashboard_layout = pn.Column(header_section, slider_section, grid, save_button, hist_section, sizing_mode="stretch_both", margin=0)
+# Histogram section (for complete preprocessed data) is placed after the main dashboard.
+hist_row = pn.Row(
+    pn.Column(left_hist, left_hist_stats, sizing_mode="stretch_both"),
+    pn.Column(in_hist, in_hist_stats, sizing_mode="stretch_both"),
+    pn.Column(right_hist, right_hist_stats, sizing_mode="stretch_both"),
+    sizing_mode="stretch_width", height=600
+)
+hist_section = pn.Column(pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"), hist_row, sizing_mode="stretch_width")
+
+# Final dashboard layout: main dashboard stays on one screen; histograms appear below when scrolled.
+dashboard_layout = pn.Column(main_dashboard, hist_section, sizing_mode="stretch_both", margin=0)
 
 update_all()
 pn.state.onload(lambda: update_all())
