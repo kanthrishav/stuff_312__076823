@@ -6,7 +6,7 @@ import pandas as pd
 import vaex
 import panel as pn
 from bokeh.plotting import figure
-from bokeh.models import ColumnDataSource, HoverTool, Span
+from bokeh.models import ColumnDataSource, HoverTool, Span, Label
 from bokeh.io import curdoc
 from numba import njit, prange
 
@@ -17,7 +17,6 @@ pn.extension()
 pn.config.raw_css.append("""
     .bk-root { font-family: "Courier New", monospace; }
     body { margin: 0; padding: 0; background-color: #CBCB24; }
-    /* Set slider section font colour */
     .slider-section { color: #40400B; }
 """)
 print(f"[{time.time():.3f}] Panel extension loaded.")
@@ -42,6 +41,8 @@ else:
     pdf['az'] = np.arctan2(pdf['y'].values, pdf['x'].values)
     pdf['r'] = np.hypot(pdf['x'].values, pdf['y'].values)
     pdf['Motion'] = np.where(pdf['dp'].isin([1,2,5,6]), 1, 0)
+    print(f"[{time.time()-preprocess_start:.3f} sec] Basic columns computed.")
+    
     @njit(parallel=True)
     def compute_all_los(sorted_az, sorted_r, group_start, group_end, thresh):
         n_groups = group_start.shape[0]
@@ -53,11 +54,12 @@ else:
                 flag = 1
                 for k in range(start, end):
                     if j != k:
-                        if sorted_r[k] < sorted_r[j] and math.fabs(sorted_az[k] - sorted_az[j]) < thresh:
+                        if sorted_r[k] < sorted_r[j] and math.fabs(sorted_az[k]-sorted_az[j]) < thresh:
                             flag = 0
                             break
                 los_sorted[j] = flag
         return los_sorted
+    
     mc_arr = pdf['mc'].values
     order = np.argsort(mc_arr)
     sorted_mc = mc_arr[order]
@@ -72,6 +74,8 @@ else:
     los = np.empty_like(los_sorted)
     los[order] = los_sorted
     pdf['LOS'] = los
+    print(f"[{time.time()-preprocess_start:.3f} sec] LOS column computed.")
+    
     mirrProb = pdf['mirrProb'].values
     egoYawRate = pdf['egoYawRate'].values
     egoSpeed = pdf['egoSpeed'].values
@@ -85,6 +89,8 @@ else:
     labels[np.where(cond & (y_vals >= -6) & (y_vals < -2))] = 2
     labels[np.where(cond & (y_vals > 2) & (y_vals <= 6))] = 3
     pdf['label'] = labels
+    print(f"[{time.time()-preprocess_start:.3f} sec] Label column computed.")
+    
     labels_arr = pdf['label'].values
     mc_arr = pdf['mc'].values
     r_arr = pdf['r'].values
@@ -98,7 +104,11 @@ else:
         unique_keys, unique_idx = np.unique(keys, axis=0, return_index=True)
         selected_indices = ordered_sel[unique_idx]
         pdf.loc[selected_indices, 'OOI'] = 1
+    print(f"[{time.time()-preprocess_start:.3f} sec] OOI column computed.")
+    
     pdf.to_feather(preprocessed_file_path)
+    print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed dataframe saved.")
+
 print(f"[{time.time()-preprocess_start:.3f} sec] Data preprocessing complete.")
 print(f"[{time.time()-start_total:.3f} sec] Total initialization complete.")
 
@@ -145,7 +155,7 @@ prev_button = pn.widgets.Button(name="<", button_type="primary", width=30)
 step_button = pn.widgets.Button(name=">", button_type="primary", width=30)
 run_button = pn.widgets.Button(name="Run", button_type="success", width=40)
 step_size_input = pn.widgets.TextInput(name="Step Size (s)", value="2", width=50)
-stop_button = pn.widgets.Button(name="", button_type="danger", width=40)
+stop_button = pn.widgets.Button(name="", button_type="danger", width=40, height=run_button.height)
 
 animate_callback = None
 def step_callback(event):
@@ -191,11 +201,30 @@ radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, pre
 save_button = pn.widgets.Button(name='Save Current State', button_type="primary")
 
 # ---------------------------
-# Histogram Section (for complete preprocessed data)
+# Histogram Tab Controls
+# ---------------------------
+# Additional text boxes for filtering histogram data
+hist_motion = pn.widgets.TextInput(name="Motion", value="1", width=50)
+hist_ooi = pn.widgets.TextInput(name="OOI", value="1", width=50)
+hist_los = pn.widgets.TextInput(name="LOS", value="1", width=50)
+hist_filter_row = pn.Row(hist_motion, hist_ooi, hist_los, sizing_mode="stretch_width")
+
+hist_mp = pn.widgets.FloatSlider(name="MP", start=0, end=100, value=71, step=1)
+hist_age = pn.widgets.FloatSlider(name="Age", start=1, end=500, value=20, step=1)
+hist_slider_col = pn.Column(hist_mp, hist_age, sizing_mode="stretch_width")
+
+binLow_input = pn.widgets.TextInput(name="binLow", value="0", width=50)
+binHigh_input = pn.widgets.TextInput(name="binHigh", value="100", width=50)
+bin_filter_row = pn.Row(binLow_input, binHigh_input, sizing_mode="stretch_width")
+
+# The histogram filtering will use these controls (see update_histograms_all)
+
+# ---------------------------
+# Histogram Section
 # ---------------------------
 def create_histogram_fig(title):
     p = figure(title=title, sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", height=600,
-               background_fill_color="#C1F6F3")
+               background_fill_color="#545E5D", outline_line_color="#49490D", outline_line_width=4)
     return p
 
 left_hist = create_histogram_fig("LeftEgoHist")
@@ -207,63 +236,11 @@ in_hist_source = ColumnDataSource(data=dict(top=[], left=[], right=[]))
 right_hist_source = ColumnDataSource(data=dict(top=[], left=[], right=[]))
 
 left_hist.quad(top='top', bottom=0, left='left', right='right', source=left_hist_source,
-               fill_color="blue", line_color="blue")
+               fill_color="#CE3C2E", line_color="#CE3C2E")
 in_hist.quad(top='top', bottom=0, left='left', right='right', source=in_hist_source,
-             fill_color="blue", line_color="blue")
+             fill_color="#CE3C2E", line_color="#CE3C2E")
 right_hist.quad(top='top', bottom=0, left='left', right='right', source=right_hist_source,
-                fill_color="blue", line_color="blue")
-
-left_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
-in_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
-right_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
-
-def update_histograms_all():
-    df_all = pdf
-    def compute_histogram(label_val):
-        subset = df_all[df_all['OOI'] == 1]
-        subset = subset[subset['label'] == label_val]
-        if subset.empty:
-            return np.array([]), np.array([])
-        poe_vals = subset['poe'].values
-        counts, bins = np.histogram(poe_vals, bins=100)
-        total = counts.sum()
-        if total > 0:
-            pct = (counts/total)*100
-        else:
-            pct = counts
-        return pct, bins
-    left_pct, left_bins = compute_histogram(2)
-    in_pct, in_bins = compute_histogram(1)
-    right_pct, right_bins = compute_histogram(3)
-    def update_hist_source(source, pct, bins):
-        if pct.size == 0:
-            source.data = dict(top=[], left=[], right=[])
-        else:
-            lefts = bins[:-1]
-            rights = bins[1:]
-            source.data = dict(top=pct.tolist(), left=lefts.tolist(), right=rights.tolist())
-    update_hist_source(left_hist_source, left_pct, left_bins)
-    update_hist_source(in_hist_source, in_pct, in_bins)
-    update_hist_source(right_hist_source, right_pct, right_bins)
-    def compute_stats(poe_array):
-        total = poe_array.size
-        if total == 0:
-            return "No data"
-        pct_ge_99 = np.sum(poe_array >= 99)/total*100
-        pct_ge_98 = np.sum((poe_array >= 98) & (poe_array < 99))/total*100
-        pct_ge_70 = np.sum((poe_array >= 70) & (poe_array < 98))/total*100
-        pct_lt_50 = np.sum(poe_array < 50)/total*100
-        return (f"Total: {total}\n"
-                f"% >= 99: {pct_ge_99:.4f}\n"
-                f"% >= 98 and < 99: {pct_ge_98:.4f}\n"
-                f"% >= 70 and < 98: {pct_ge_70:.4f}\n"
-                f"% < 50: {pct_lt_50:.4f}")
-    left_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 2)]['poe'].values)
-    in_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 1)]['poe'].values)
-    right_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 3)]['poe'].values)
-    left_hist_stats.object = left_stats
-    in_hist_stats.object = in_stats
-    right_hist_stats.object = right_stats
+                fill_color="#CE3C2E", line_color="#CE3C2E")
 
 # ---------------------------
 # Prepare ColumnDataSources for Main Plots
@@ -271,7 +248,6 @@ def update_histograms_all():
 object_scatter_source = ColumnDataSource(data=dict(x=[], y=[], color=[], size=[], hover=[]))
 object_rect_source = ColumnDataSource(data=dict(rx=[], ry=[], rwidth=[], rheight=[], rangle=[], rcolor=[]))
 ego_source = ColumnDataSource(data=dict(x=[0], y=[0], hover=[""]))
-
 ts_source_ego = ColumnDataSource(data=dict(mc=[], poe=[]))
 ts_source_left = ColumnDataSource(data=dict(mc=[], poe=[]))
 ts_source_right = ColumnDataSource(data=dict(mc=[], poe=[]))
@@ -285,8 +261,8 @@ birdseye_plot = figure(
     tools="pan,wheel_zoom,reset",
     height=1000,
     background_fill_color="#545E5D",
-    outline_line_color="#838317",
-    outline_line_width=3
+    outline_line_color="#49490D",
+    outline_line_width=4
 )
 birdseye_plot.x_range.start = -x_axis_slider.value
 birdseye_plot.x_range.end = x_axis_slider.value
@@ -299,19 +275,47 @@ def update_y_range():
         birdseye_plot.y_range.end = 10
 update_y_range()
 y_axis_slider.param.watch(lambda e: update_y_range(), 'value')
+# Draw vertical lane lines in Bird's Eye View
 for xv in [-6, -2, 2, 6]:
-    span = Span(location=xv, dimension='height', line_color='purple', line_dash='dotted', line_width=1)
+    span = Span(location=xv, dimension='height', line_color="#CBCB24", line_dash='dotted', line_width=1)
     birdseye_plot.add_layout(span)
-right_border = Span(location=birdseye_plot.x_range.end, dimension='height', line_color="#838317", line_width=3)
-top_border = Span(location=birdseye_plot.y_range.end, dimension='width', line_color="#838317", line_width=3)
+right_border = Span(location=birdseye_plot.x_range.end, dimension='height', line_color="#49490D", line_width=4)
+top_border = Span(location=birdseye_plot.y_range.end, dimension='width', line_color="#49490D", line_width=4)
 birdseye_plot.add_layout(right_border)
 birdseye_plot.add_layout(top_border)
+# Additional azimuth lines based on min_az and max_az
+az_line_min_source = ColumnDataSource(data=dict(x=[], y=[]))
+az_line_max_source = ColumnDataSource(data=dict(x=[], y=[]))
+az_line_min = birdseye_plot.line('x', 'y', source=az_line_min_source, line_dash="dotted", line_color="#CBCB24", line_width=2)
+az_line_max = birdseye_plot.line('x', 'y', source=az_line_max_source, line_dash="dotted", line_color="#CBCB24", line_width=2)
+def update_az_lines():
+    try:
+        min_az = int(min_az_input.value)
+        max_az = int(max_az_input.value)
+    except:
+        min_az, max_az = -180, 180
+    # Convert degrees to radians
+    min_rad = np.radians(min_az)
+    max_rad = np.radians(max_az)
+    # Compute endpoints; use length = max(x_range end, y_range end)*2 for safety.
+    length = max(x_axis_slider.value, y_axis_slider.value)*2
+    def compute_line(angle):
+        # Global: (x, y) = (length*cos(angle), length*sin(angle))
+        # In plot: x = global y, y = global x.
+        return [0, length*math.sin(angle)], [0, length*math.cos(angle)]
+    x_min, y_min = compute_line(min_rad)
+    x_max, y_max = compute_line(max_rad)
+    az_line_min_source.data = dict(x=x_min, y=y_min)
+    az_line_max_source.data = dict(x=x_max, y=y_max)
+update_az_lines()
+min_az_input.param.watch(lambda e: update_az_lines(), 'value')
+max_az_input.param.watch(lambda e: update_az_lines(), 'value')
+
 scatter_renderer = birdseye_plot.scatter('x', 'y', source=object_scatter_source,
                                            size='size', color='color', fill_alpha=0.6)
 rect_renderer = birdseye_plot.rect('rx', 'ry', width='rwidth', height='rheight', angle='rangle',
                                    source=object_rect_source, fill_color='rcolor', fill_alpha=0.4, line_color='rcolor', line_width=1)
 ego_renderer = birdseye_plot.scatter('x', 'y', source=ego_source, size=4, color='black', fill_alpha=1.0)
-# Use HTML <br> for line breaks in hover text.
 object_hover = HoverTool(tooltips=[("Details", "@hover")], renderers=[scatter_renderer])
 birdseye_plot.add_tools(object_hover)
 ego_hover = HoverTool(tooltips=[("Ego", "@hover")], renderers=[ego_renderer])
@@ -322,42 +326,39 @@ ts_plot_ego = figure(
     sizing_mode="stretch_both", 
     tools="pan,wheel_zoom,reset", 
     y_range=(0, 100),
-    background_fill_color="#C1F6F3",
-    outline_line_color="#838317",
-    outline_line_width=3
+    background_fill_color="#545E5D",
+    outline_line_color="#49490D",
+    outline_line_width=4
 )
-ts_plot_ego.line('mc', 'poe', source=ts_source_ego, line_width=1, color='blue')
-ts_plot_ego.circle('mc', 'poe', source=ts_source_ego, size=3, color='blue')
+ts_plot_ego.line('mc', 'poe', source=ts_source_ego, line_width=1, color="#CE3C2E")
+ts_plot_ego.circle('mc', 'poe', source=ts_source_ego, size=3, color="#CE3C2E")
 
 ts_plot_left = figure(
     title="inLeftEgoLaneOOI", 
     sizing_mode="stretch_both", 
     tools="pan,wheel_zoom,reset", 
     y_range=(0, 100),
-    background_fill_color="#C1F6F3",
-    outline_line_color="#838317",
-    outline_line_width=3
+    background_fill_color="#545E5D",
+    outline_line_color="#49490D",
+    outline_line_width=4
 )
-ts_plot_left.line('mc', 'poe', source=ts_source_left, line_width=1, color='green')
-ts_plot_left.circle('mc', 'poe', source=ts_source_left, size=3, color='green')
+ts_plot_left.line('mc', 'poe', source=ts_source_left, line_width=1, color="#CE3C2E")
+ts_plot_left.circle('mc', 'poe', source=ts_source_left, size=3, color="#CE3C2E")
 
 ts_plot_right = figure(
     title="inRightEgoLaneOOI", 
     sizing_mode="stretch_both", 
     tools="pan,wheel_zoom,reset", 
     y_range=(0, 100),
-    background_fill_color="#C1F6F3",
-    outline_line_color="#838317",
-    outline_line_width=3
+    background_fill_color="#545E5D",
+    outline_line_color="#49490D",
+    outline_line_width=4
 )
-ts_plot_right.line('mc', 'poe', source=ts_source_right, line_width=1, color='magenta')
-ts_plot_right.circle('mc', 'poe', source=ts_source_right, size=3, color='magenta')
+ts_plot_right.line('mc', 'poe', source=ts_source_right, line_width=1, color="#CE3C2E")
+ts_plot_right.circle('mc', 'poe', source=ts_source_right, size=3, color="#CE3C2E")
 
 empty_plot = figure(sizing_mode="stretch_both", toolbar_location=None)
 
-# ---------------------------
-# Callback Functions
-# ---------------------------
 def update_object_plot():
     current_mc = radar_cycle_slider.value
     x_lim = x_axis_slider.value
@@ -367,7 +368,8 @@ def update_object_plot():
     update_y_range()
     right_border.location = birdseye_plot.x_range.end
     top_border.location = birdseye_plot.y_range.end
-
+    update_az_lines()
+    
     df_cycle = df[df.mc == current_mc].to_pandas_df()
     filtered = df_cycle[
         (df_cycle.egoYawRate < np.radians(2)) &
@@ -405,17 +407,15 @@ def update_object_plot():
         elif (row['LOS'] == 1) and (row['label'] in [1,2,3]):
             col = "blue"
         else:
-            col = "grey"
+            col = "#648A87"
         size_val = 4 if row['OOI'] == 1 else 3
-        # Map dp to new strings:
         dp = int(row['dp'])
         dp_map = {1:"M", 2:"O", 5:"CL", 6:"CR", 3:"STP", 4:"STAT"}
         dp_str = dp_map.get(dp, str(dp))
         orient_deg = math.degrees(row['orient'])
-        # Hover text with HTML breaks for three rows (each with three values)
         hover_text = (f"id: {int(row['id'])} | vx: {row['vx']:.2f} | vy: {row['vy']:.2f}<br>"
                       f"mirrProb: {int(row['mirrProb'])} | poe: {int(row['poe'])} | pfd: {row['pfd']:.4f}<br>"
-                      f"dp: {dp_str} | lc: {int(row['lc'])} | label: {int(row['label'])}, orient: {orient_deg:.1f}°, LOS: {int(row['LOS'])}")
+                      f"dp: {dp_str} | lc: {int(row['lc'])} | orient: {orient_deg:.1f}° | LOS: {int(row['LOS'])}")
         
         scatter_x.append(row['y'])
         scatter_y.append(row['x'])
@@ -461,14 +461,47 @@ def update_time_series(source, label_val, title_prefix):
         return f"{title_prefix} No Data"
 
 def update_histograms_all():
-    df_all = pdf
+    # Filter the complete dataset based on hist tab controls.
+    df_all = pdf.copy()
+    try:
+        motion_val = int(hist_motion.value)
+    except:
+        motion_val = None
+    try:
+        ooi_val = int(hist_ooi.value)
+    except:
+        ooi_val = None
+    try:
+        los_val = int(hist_los.value)
+    except:
+        los_val = None
+    if motion_val is not None:
+        df_all = df_all[df_all['Motion'] == motion_val]
+    if ooi_val is not None:
+        df_all = df_all[df_all['OOI'] == ooi_val]
+    if los_val is not None:
+        df_all = df_all[df_all['LOS'] == los_val]
+    # Also filter by MP and Age from hist tab sliders
+    df_all = df_all[df_all['mirrProb'] < hist_mp.value]
+    df_all = df_all[df_all['lc'] > hist_age.value]
+    
+    # Limit histogram x-axis using binLow and binHigh.
+    try:
+        binLow = float(binLow_input.value)
+    except:
+        binLow = 0
+    try:
+        binHigh = float(binHigh_input.value)
+    except:
+        binHigh = 100
+    
     def compute_histogram(label_val):
         subset = df_all[df_all['OOI'] == 1]
         subset = subset[subset['label'] == label_val]
         if subset.empty:
             return np.array([]), np.array([])
         poe_vals = subset['poe'].values
-        counts, bins = np.histogram(poe_vals, bins=100)
+        counts, bins = np.histogram(poe_vals, bins=100, range=(binLow, binHigh))
         total = counts.sum()
         if total > 0:
             pct = (counts/total)*100
@@ -504,9 +537,18 @@ def update_histograms_all():
     left_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 2)]['poe'].values)
     in_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 1)]['poe'].values)
     right_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 3)]['poe'].values)
-    left_hist_stats.object = left_stats
-    in_hist_stats.object = in_stats
-    right_hist_stats.object = right_stats
+    # Add Bokeh Labels inside histogram plots (clear previous ones first)
+    for p in [left_hist, in_hist, right_hist]:
+        p.renderers = [r for r in p.renderers if not hasattr(r, 'name') or r.name != "stats_label"]
+    left_label = Label(x=10, y=left_hist.y_range.end-10, x_units='screen', y_units='screen',
+                       text=left_stats, text_color="white", text_font_size="10pt", name="stats_label")
+    in_label = Label(x=10, y=in_hist.y_range.end-10, x_units='screen', y_units='screen',
+                     text=in_stats, text_color="white", text_font_size="10pt", name="stats_label")
+    right_label = Label(x=10, y=right_hist.y_range.end-10, x_units='screen', y_units='screen',
+                        text=right_stats, text_color="white", text_font_size="10pt", name="stats_label")
+    left_hist.add_layout(left_label)
+    in_hist.add_layout(in_label)
+    right_hist.add_layout(right_label)
 
 def update_all(event=None):
     update_object_plot()
@@ -546,7 +588,6 @@ header_section = pn.pane.Markdown(
 
 radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, prev_button, step_button,
                            run_button, step_size_input, stop_button, sizing_mode="stretch_width")
-# Wrap slider section in a Div with font color set
 slider_section = pn.Row(radar_control_row, css_classes=["slider-section"], sizing_mode="stretch_width", height=50)
 
 grid = pn.GridSpec(sizing_mode='stretch_both', max_height=1000)
@@ -556,20 +597,24 @@ grid[0:2, 1] = birdseye_plot
 grid[0, 2] = ts_plot_ego
 grid[1, 2] = ts_plot_right
 
-# Main dashboard: header, slider section, grid, save button.
 main_dashboard = pn.Column(header_section, slider_section, grid, save_button, sizing_mode="stretch_both", margin=0)
 
-# Histogram section (for complete preprocessed data) on a separate tab.
+hist_controls = pn.Column(
+    pn.Row(hist_motion, hist_ooi, hist_los, sizing_mode="stretch_width"),
+    hist_slider_col,
+    bin_filter_row,
+    sizing_mode="stretch_width"
+)
+
 hist_row = pn.Row(
-    pn.Column(left_hist, left_hist_stats, sizing_mode="stretch_both"),
-    pn.Column(in_hist, in_hist_stats, sizing_mode="stretch_both"),
-    pn.Column(right_hist, right_hist_stats, sizing_mode="stretch_both"),
+    pn.Column(left_hist, sizing_mode="stretch_both"),
+    pn.Column(in_hist, sizing_mode="stretch_both"),
+    pn.Column(right_hist, sizing_mode="stretch_both"),
     sizing_mode="stretch_width", height=600
 )
-hist_section = pn.Column(pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"), 
-                         hist_row, sizing_mode="stretch_width")
+hist_section = pn.Column(pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"),
+                         hist_row, hist_controls, sizing_mode="stretch_width")
 
-# Create tabs: one for main dashboard, one for histogram.
 tabs = pn.Tabs(
     ("main", main_dashboard),
     ("hist", hist_section)
