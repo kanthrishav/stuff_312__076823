@@ -6,7 +6,7 @@ import pandas as pd
 import vaex
 import panel as pn
 from bokeh.plotting import figure
-from bokeh.models import ColumnDataSource, HoverTool, Span
+from bokeh.models import ColumnDataSource, HoverTool, Span, Label
 from bokeh.io import curdoc
 from numba import njit, prange
 
@@ -148,7 +148,6 @@ y_axis_slider = pn.widgets.FloatSlider(name='Y-axis Slider', start=-200, end=200
 min_az_input = pn.widgets.TextInput(name="Min Az (deg)", value="-180", width=50)
 max_az_input = pn.widgets.TextInput(name="Max Az (deg)", value="180", width=50)
 stats_pane = pn.pane.Markdown("", sizing_mode="stretch_width")
-# Add a bottom margin so ego values (displayed below) have a small gap from the next plot.
 filter_panel = pn.Column(eyr_slider, es_slider, mp_slider, age_slider, x_axis_slider, y_axis_slider,
                            pn.Row(min_az_input, max_az_input), stats_pane, sizing_mode="stretch_width", margin=(0,0,10,0))
 
@@ -204,7 +203,7 @@ save_button = pn.widgets.Button(name='Save Current State', button_type="primary"
 # ---------------------------
 # Histogram Tab Controls
 # ---------------------------
-# In the hist tab, all 5 text boxes and 2 slider bars will be placed in one row.
+# Arrange all 5 text boxes and 2 slider bars in one row.
 hist_motion = pn.widgets.TextInput(name="Motion", value="1", width=50)
 hist_ooi = pn.widgets.TextInput(name="OOI", value="1", width=50)
 hist_los = pn.widgets.TextInput(name="LOS", value="1", width=50)
@@ -214,9 +213,11 @@ hist_mp = pn.widgets.FloatSlider(name="MP", start=0, end=100, value=71, step=1)
 hist_age = pn.widgets.FloatSlider(name="Age", start=1, end=500, value=20, step=1)
 hist_controls = pn.Row(hist_motion, hist_ooi, hist_los, binLow_input, binHigh_input, hist_mp, hist_age, sizing_mode="stretch_width")
 
-# Add watchers so that histogram plots update live when any of these controls change.
+# Ensure histogram plots update instantly when any input changes.
+def hist_callback(event):
+    update_histograms_all()
 for widget in [hist_motion, hist_ooi, hist_los, binLow_input, binHigh_input, hist_mp, hist_age]:
-    widget.param.watch(lambda event: update_histograms_all(), 'value')
+    widget.param.watch(hist_callback, 'value')
 
 # ---------------------------
 # Histogram Section
@@ -224,7 +225,7 @@ for widget in [hist_motion, hist_ooi, hist_los, binLow_input, binHigh_input, his
 def create_histogram_fig(title):
     p = figure(title=title, sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", height=480,
                background_fill_color="#545E5D", outline_line_color="#49490D", outline_line_width=4)
-    # Set fixed axis ranges for the histogram plots.
+    # Fixed axis ranges.
     p.x_range.start = -5
     p.x_range.end = 105
     p.y_range.start = -5
@@ -246,7 +247,7 @@ in_hist.quad(top='top', bottom=0, left='left', right='right', source=in_hist_sou
 right_hist.quad(top='top', bottom=0, left='left', right='right', source=right_hist_source,
                 fill_color="#CE3C2E", line_color="#CE3C2E")
 
-# Create external panes for histogram stats (to place text outside the plot area)
+# Create external panes for histogram stats (displayed outside the plot area)
 left_stats_pane = pn.pane.Markdown("", width=300)
 in_stats_pane = pn.pane.Markdown("", width=300)
 right_stats_pane = pn.pane.Markdown("", width=300)
@@ -284,7 +285,7 @@ def update_y_range():
         birdseye_plot.y_range.end = 10
 update_y_range()
 y_axis_slider.param.watch(lambda e: update_y_range(), 'value')
-# Draw vertical lane lines in Bird's Eye View
+# Draw vertical lane lines
 for xv in [-6, -2, 2, 6]:
     span = Span(location=xv, dimension='height', line_color="#CBCB24", line_dash='dotted', line_width=1)
     birdseye_plot.add_layout(span)
@@ -303,10 +304,8 @@ def update_az_lines():
         max_az = int(max_az_input.value)
     except:
         min_az, max_az = -180, 180
-    # Convert degrees to radians
     min_rad = np.radians(min_az)
     max_rad = np.radians(max_az)
-    # Compute endpoints; use length = max(x_range end, y_range end)*2 for safety.
     length = max(x_axis_slider.value, y_axis_slider.value)*2
     def compute_line(angle):
         return [0, length*math.sin(angle)], [0, length*math.cos(angle)]
@@ -402,7 +401,6 @@ def update_object_plot():
 
     if not filtered.empty:
         first = filtered.iloc[0]
-        # Highlight ego values with a complementary colour.
         stats_text = (f"<span style='color:#24CBCB;'>egoYawRate: {math.degrees(first['egoYawRate']):.3f} deg/s</span>, "
                       f"<span style='color:#24CBCB;'>egoSpeed: {first['egoSpeed']:.3f} m/s</span>")
     else:
@@ -426,7 +424,6 @@ def update_object_plot():
         dp_map = {1:"M", 2:"O", 5:"CL", 6:"CR", 3:"STP", 4:"STAT"}
         dp_str = dp_map.get(dp, str(dp))
         orient_deg = math.degrees(row['orient'])
-        # Use newline characters so hover text displays in multiple lines.
         hover_text = (f"id: {int(row['id'])} | vx: {row['vx']:.2f} | vy: {row['vy']:.2f}\n"
                       f"mirrProb: {int(row['mirrProb'])} | poe: {int(row['poe'])} | pfd: {row['pfd']:.4f}\n"
                       f"dp: {dp_str} | lc: {int(row['lc'])} | orient: {orient_deg:.1f}° | LOS: {int(row['LOS'])}")
@@ -475,7 +472,6 @@ def update_time_series(source, label_val, title_prefix):
         return f"{title_prefix} No Data"
 
 def update_histograms_all():
-    # Filter the complete dataset based on hist tab controls.
     df_all = pdf.copy()
     try:
         motion_val = int(hist_motion.value)
@@ -495,11 +491,9 @@ def update_histograms_all():
         df_all = df_all[df_all['OOI'] == ooi_val]
     if los_val is not None:
         df_all = df_all[df_all['LOS'] == los_val]
-    # Also filter by MP and Age from hist tab sliders
     df_all = df_all[df_all['mirrProb'] < hist_mp.value]
     df_all = df_all[df_all['lc'] > hist_age.value]
     
-    # Limit histogram x-axis using binLow and binHigh.
     try:
         binLow = float(binLow_input.value)
     except:
@@ -551,7 +545,6 @@ def update_histograms_all():
     left_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 2)]['poe'].values)
     in_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 1)]['poe'].values)
     right_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 3)]['poe'].values)
-    # Update the external Markdown panes for stats.
     left_stats_pane.object = left_stats
     in_stats_pane.object = in_stats
     right_stats_pane.object = right_stats
@@ -579,7 +572,7 @@ def save_callback(event):
             print("Error stopping animation:", e)
         animate_callback = None
     update_all()
-    pn.panel(dashboard_layout).save('dashboard_state.html', resources='inline')
+    pn.panel(tabs).save('dashboard_state.html', resources='inline')
     print(f"[{time.time()-dashboard_start:.3f} sec] Dashboard state saved.")
 
 save_button.on_click(save_callback)
@@ -592,24 +585,16 @@ header_section = pn.pane.Markdown(
     sizing_mode="stretch_width", height=50
 )
 
-# Main tab layout: add a vertical spacer between slider row and grid for extra margin.
-main_dashboard = pn.Column(
-    header_section,
-    radar_control_row,
-    pn.Spacer(height=10),
-    # Construct a grid where we add spacers in specific cells for vertical margins.
-    pn.GridSpec(sizing_mode='stretch_both', max_height=1000, mode='flex') \
-      .append({(0, 0): filter_panel,
-               (1, 0): pn.Column(pn.Spacer(height=10), ts_plot_left),
-               (0, 1): birdseye_plot,
-               (0, 2): pn.Column(pn.Spacer(height=10), ts_plot_ego),
-               (1, 2): ts_plot_right}),
-    save_button,
-    sizing_mode="stretch_both",
-    margin=0
-)
+# Use a valid mode ('warn') instead of 'flex' for GridSpec.
+grid = pn.GridSpec(sizing_mode='stretch_both', max_height=1000, mode='warn')
+grid[0, 0] = filter_panel
+grid[1, 0] = pn.Column(pn.Spacer(height=10), ts_plot_left)
+grid[0, 1] = birdseye_plot
+grid[0, 2] = pn.Column(pn.Spacer(height=10), ts_plot_ego)
+grid[1, 2] = ts_plot_right
 
-# Create a row for histogram stats (external text, not inside the plots)
+main_dashboard = pn.Column(header_section, radar_control_row, pn.Spacer(height=10), grid, save_button, sizing_mode="stretch_both", margin=0)
+
 stats_row = pn.Row(left_stats_pane, in_stats_pane, right_stats_pane, sizing_mode="stretch_width")
 hist_row = pn.Row(
     pn.Column(left_hist, sizing_mode="stretch_both"),
@@ -617,13 +602,11 @@ hist_row = pn.Row(
     pn.Column(right_hist, sizing_mode="stretch_both"),
     sizing_mode="stretch_width", height=480
 )
-hist_section = pn.Column(
-    pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"),
-    stats_row,
-    hist_row,
-    hist_controls,
-    sizing_mode="stretch_width"
-)
+hist_section = pn.Column(pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"),
+                         stats_row,
+                         hist_row,
+                         hist_controls,
+                         sizing_mode="stretch_width")
 
 tabs = pn.Tabs(
     ("main", main_dashboard),
