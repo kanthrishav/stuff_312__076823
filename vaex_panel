@@ -6,7 +6,7 @@ import pandas as pd
 import vaex
 import panel as pn
 from bokeh.plotting import figure
-from bokeh.models import ColumnDataSource, HoverTool, Span, Quad
+from bokeh.models import ColumnDataSource, HoverTool, Span
 from bokeh.io import curdoc
 from numba import njit, prange
 
@@ -40,13 +40,13 @@ else:
     print(f"[{time.time()-preprocess_start:.3f} sec] Preprocessed file not found. Reading original data.")
     pdf = pd.read_feather(original_file_path)
     
-    # Basic quantities
+    # Compute basic geometric quantities
     pdf['az'] = np.arctan2(pdf['y'].values, pdf['x'].values)
     pdf['r'] = np.hypot(pdf['x'].values, pdf['y'].values)
     pdf['Motion'] = np.where(pdf['dp'].isin([1, 2, 5, 6]), 1, 0)
     print(f"[{time.time()-preprocess_start:.3f} sec] Basic columns computed.")
 
-    # LOS computation (using Numba, parallelized)
+    # LOS computation using Numba (parallelized)
     @njit(parallel=True)
     def compute_all_los(sorted_az, sorted_r, group_start, group_end, thresh):
         n_groups = group_start.shape[0]
@@ -81,7 +81,7 @@ else:
     pdf['LOS'] = los
     print(f"[{time.time()-preprocess_start:.3f} sec] LOS column computed.")
 
-    # Label computation: using absolute egoYawRate in deg/s
+    # Label computation: convert egoYawRate to deg/s and use absolute value
     mirrProb = pdf['mirrProb'].values
     egoYawRate = pdf['egoYawRate'].values
     egoSpeed = pdf['egoSpeed'].values
@@ -127,7 +127,7 @@ df = vaex.from_pandas(pdf)
 # ---------------------------
 dashboard_start = time.time()
 
-# Radar cycle slider built from unique mc values (integers)
+# Build Radar Cycle Slider using unique mc values (integers)
 unique_mcs = sorted(list(set(pdf['mc'].astype(int).tolist())))
 radar_cycle_slider = pn.widgets.DiscreteSlider(
     name='Radar Cycle Slider',
@@ -136,7 +136,7 @@ radar_cycle_slider = pn.widgets.DiscreteSlider(
     width=1400
 )
 
-# New text input and "Go" button for direct cycle input
+# New direct cycle input
 cycle_input = pn.widgets.TextInput(name="Cycle Input", value="", width=100)
 cycle_go_button = pn.widgets.Button(name="Go", button_type="primary")
 def go_to_cycle(event):
@@ -150,7 +150,7 @@ def go_to_cycle(event):
         print("Invalid cycle input:", e)
 cycle_go_button.on_click(go_to_cycle)
 
-# Filter Panel: vertical stack of filter sliders plus X- and Y-axis sliders and azimuth filters.
+# Filter Panel: stack of sliders plus azimuth filters and a stats pane.
 eyr_slider = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, value=2, step=0.01)
 es_slider = pn.widgets.FloatSlider(name='ES Slider', start=0, end=10, value=0.2, step=0.1)
 mp_slider = pn.widgets.FloatSlider(name='MP Slider', start=0, end=100, value=71, step=1)
@@ -215,7 +215,7 @@ radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, pre
 save_button = pn.widgets.Button(name='Save Current State', button_type="primary")
 
 # ---------------------------
-# Histogram Section
+# Histogram Section (for complete preprocessed data)
 # ---------------------------
 def create_histogram_fig(title):
     p = figure(title=title, sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", height=600)
@@ -240,6 +240,55 @@ left_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
 in_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
 right_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
 
+def update_histograms_all():
+    # Use the entire preprocessed data (pdf)
+    df_all = pdf
+    def compute_histogram(label_val):
+        subset = df_all[df_all['OOI'] == 1]
+        subset = subset[subset['label'] == label_val]
+        if subset.empty:
+            return np.array([]), np.array([])
+        poe_vals = subset['poe'].values
+        counts, bins = np.histogram(poe_vals, bins=100)
+        total = counts.sum()
+        if total > 0:
+            pct = (counts/total)*100
+        else:
+            pct = counts
+        return pct, bins
+    left_pct, left_bins = compute_histogram(2)
+    in_pct, in_bins = compute_histogram(1)
+    right_pct, right_bins = compute_histogram(3)
+    def update_hist_source(source, pct, bins):
+        if pct.size == 0:
+            source.data = dict(top=[], left=[], right=[])
+        else:
+            lefts = bins[:-1]
+            rights = bins[1:]
+            source.data = dict(top=pct.tolist(), left=lefts.tolist(), right=rights.tolist())
+    update_hist_source(left_hist_source, left_pct, left_bins)
+    update_hist_source(in_hist_source, in_pct, in_bins)
+    update_hist_source(right_hist_source, right_pct, right_bins)
+    def compute_stats(poe_array):
+        total = poe_array.size
+        if total == 0:
+            return "No data"
+        pct_ge_99 = np.sum(poe_array >= 99)/total*100
+        pct_ge_98 = np.sum((poe_array >= 98) & (poe_array < 99))/total*100
+        pct_ge_70 = np.sum((poe_array >= 70) & (poe_array < 98))/total*100
+        pct_lt_50 = np.sum(poe_array < 50)/total*100
+        return (f"Total: {total}\n"
+                f"% >= 99: {pct_ge_99:.4f}\n"
+                f"% >= 98 and < 99: {pct_ge_98:.4f}\n"
+                f"% >= 70 and < 98: {pct_ge_70:.4f}\n"
+                f"% < 50: {pct_lt_50:.4f}")
+    left_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 2)]['poe'].values)
+    in_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 1)]['poe'].values)
+    right_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 3)]['poe'].values)
+    left_hist_stats.object = left_stats
+    in_hist_stats.object = in_stats
+    right_hist_stats.object = right_stats
+
 # ---------------------------
 # Prepare ColumnDataSources for Main Plots
 # ---------------------------
@@ -263,7 +312,6 @@ birdseye_plot = figure(
 )
 birdseye_plot.x_range.start = -x_axis_slider.value
 birdseye_plot.x_range.end = x_axis_slider.value
-# Update y_range based on Y-axis slider: if value >=0: y_min=-5, else y_min = slider value, y_max accordingly.
 def update_y_range():
     if y_axis_slider.value >= 0:
         birdseye_plot.y_range.start = -5
@@ -273,7 +321,6 @@ def update_y_range():
         birdseye_plot.y_range.end = 10
 update_y_range()
 y_axis_slider.param.watch(lambda e: update_y_range(), 'value')
-
 for xv in [-6, -2, 2, 6]:
     span = Span(location=xv, dimension='height', line_color='purple', line_dash='dotted', line_width=1)
     birdseye_plot.add_layout(span)
@@ -342,7 +389,6 @@ def update_object_plot():
     ]
     if not filtered.empty:
         filtered = filtered[np.abs(np.degrees(filtered['egoYawRate'])) < 2]
-    # Apply azimuth filter
     try:
         min_az = int(min_az_input.value)
         max_az = int(max_az_input.value)
@@ -396,8 +442,10 @@ def update_object_plot():
         rect_colors.append(col)
     
     object_scatter_source.data = dict(x=scatter_x, y=scatter_y, color=colors, size=sizes, hover=hovers)
-    object_rect_source.data = dict(rx=rect_rx, ry=rect_ry, rwidth=rect_widths, rheight=rect_heights,
-                                   rangle=rect_angles, rcolor=rect_colors)
+    object_rect_source.data = dict(
+        rx=rect_rx, ry=rect_ry, rwidth=rect_widths, rheight=rect_heights,
+        rangle=rect_angles, rcolor=rect_colors
+    )
     
     ego_info = filtered.iloc[0]
     ego_hover_text = (f"mc: {int(ego_info['mc'])}, egoSpeed: {ego_info['egoSpeed']:.3f}, "
@@ -420,12 +468,12 @@ def update_time_series(source, label_val, title_prefix):
         source.data = dict(mc=[], poe=[])
         return f"{title_prefix} No Data"
 
-def update_histograms():
-    current_mc = radar_cycle_slider.value
-    df_cycle = df[df.mc == current_mc].to_pandas_df()
-    df_cycle = df_cycle[df_cycle.OOI == 1]
+def update_histograms_all():
+    # Histogram for the entire preprocessed data (pdf)
+    df_all = pdf
     def compute_histogram(label_val):
-        subset = df_cycle[df_cycle.label == label_val]
+        subset = df_all[df_all['OOI'] == 1]
+        subset = subset[subset['label'] == label_val]
         if subset.empty:
             return np.array([]), np.array([])
         poe_vals = subset['poe'].values
@@ -462,16 +510,16 @@ def update_histograms():
                 f"% >= 98 and < 99: {pct_ge_98:.4f}\n"
                 f"% >= 70 and < 98: {pct_ge_70:.4f}\n"
                 f"% < 50: {pct_lt_50:.4f}")
-    left_stats = compute_stats(df_cycle[df_cycle.label == 2]['poe'].values) if not df_cycle[df_cycle.label == 2].empty else "No data"
-    in_stats = compute_stats(df_cycle[df_cycle.label == 1]['poe'].values) if not df_cycle[df_cycle.label == 1].empty else "No data"
-    right_stats = compute_stats(df_cycle[df_cycle.label == 3]['poe'].values) if not df_cycle[df_cycle.label == 3].empty else "No data"
+    left_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 2)]['poe'].values)
+    in_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 1)]['poe'].values)
+    right_stats = compute_stats(df_all[(df_all['OOI'] == 1) & (df_all['label'] == 3)]['poe'].values)
     left_hist_stats.object = left_stats
     in_hist_stats.object = in_stats
     right_hist_stats.object = right_stats
 
 def update_all(event=None):
     update_object_plot()
-    update_histograms()
+    update_histograms_all()
     title_ego = update_time_series(ts_source_ego, 1, "inEgoLaneOOI")
     title_left = update_time_series(ts_source_left, 2, "inLeftEgoLaneOOI")
     title_right = update_time_series(ts_source_right, 3, "inRightEgoLaneOOI")
@@ -509,7 +557,6 @@ radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, pre
                            run_button, step_size_input, stop_button, sizing_mode="stretch_width")
 slider_section = pn.Row(radar_control_row, sizing_mode="stretch_width", height=50)
 
-# Main grid: 2 rows x 3 columns.
 grid = pn.GridSpec(sizing_mode='stretch_both', max_height=1000)
 grid[0, 0] = filter_panel
 grid[1, 0] = ts_plot_left
@@ -517,15 +564,15 @@ grid[0:2, 1] = birdseye_plot
 grid[0, 2] = ts_plot_ego
 grid[1, 2] = ts_plot_right
 
-# Histogram section: a row with three columns; let them share width equally.
-hist_row = pn.Row(
-    pn.Column(left_hist, left_hist_stats, sizing_mode="stretch_both"),
-    pn.Column(in_hist, in_hist_stats, sizing_mode="stretch_both"),
-    pn.Column(right_hist, right_hist_stats, sizing_mode="stretch_both"),
-    sizing_mode="stretch_width",
-    height=600
+# Histogram section: placed below the Save button.
+hist_section = pn.Column(
+    pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"),
+    pn.Row(pn.Column(left_hist, left_hist_stats, sizing_mode="stretch_both"),
+           pn.Column(in_hist, in_hist_stats, sizing_mode="stretch_both"),
+           pn.Column(right_hist, right_hist_stats, sizing_mode="stretch_both"),
+           sizing_mode="stretch_width", height=600),
+    sizing_mode="stretch_width"
 )
-hist_section = pn.Column(pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"), hist_row, sizing_mode="stretch_both")
 
 dashboard_layout = pn.Column(header_section, slider_section, grid, save_button, hist_section, sizing_mode="stretch_both", margin=0)
 
