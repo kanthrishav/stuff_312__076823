@@ -46,7 +46,7 @@ else:
     pdf['Motion'] = np.where(pdf['dp'].isin([1, 2, 5, 6]), 1, 0)
     print(f"[{time.time()-preprocess_start:.3f} sec] Basic columns computed.")
 
-    # LOS computation (Numba parallelized)
+    # LOS computation (using Numba, parallelized)
     @njit(parallel=True)
     def compute_all_los(sorted_az, sorted_r, group_start, group_end, thresh):
         n_groups = group_start.shape[0]
@@ -81,7 +81,7 @@ else:
     pdf['LOS'] = los
     print(f"[{time.time()-preprocess_start:.3f} sec] LOS column computed.")
 
-    # Label: Convert egoYawRate to deg/s and use absolute value
+    # Label computation: using absolute egoYawRate in deg/s
     mirrProb = pdf['mirrProb'].values
     egoYawRate = pdf['egoYawRate'].values
     egoSpeed = pdf['egoSpeed'].values
@@ -97,7 +97,7 @@ else:
     pdf['label'] = labels
     print(f"[{time.time()-preprocess_start:.3f} sec] Label column computed.")
 
-    # OOI computation
+    # OOI computation (vectorized)
     labels_arr = pdf['label'].values
     mc_arr = pdf['mc'].values
     r_arr = pdf['r'].values
@@ -119,7 +119,7 @@ else:
 print(f"[{time.time()-preprocess_start:.3f} sec] Data preprocessing complete.")
 print(f"[{time.time()-start_total:.3f} sec] Total initialization complete.")
 
-# Use Vaex for on-demand filtering
+# Convert to Vaex dataframe for on-demand filtering
 df = vaex.from_pandas(pdf)
 
 # ---------------------------
@@ -127,7 +127,7 @@ df = vaex.from_pandas(pdf)
 # ---------------------------
 dashboard_start = time.time()
 
-# Radar cycle slider from actual unique mc values (as integers)
+# Radar cycle slider built from unique mc values (integers)
 unique_mcs = sorted(list(set(pdf['mc'].astype(int).tolist())))
 radar_cycle_slider = pn.widgets.DiscreteSlider(
     name='Radar Cycle Slider',
@@ -136,7 +136,7 @@ radar_cycle_slider = pn.widgets.DiscreteSlider(
     width=1400
 )
 
-# New direct cycle input
+# New text input and "Go" button for direct cycle input
 cycle_input = pn.widgets.TextInput(name="Cycle Input", value="", width=100)
 cycle_go_button = pn.widgets.Button(name="Go", button_type="primary")
 def go_to_cycle(event):
@@ -150,31 +150,27 @@ def go_to_cycle(event):
         print("Invalid cycle input:", e)
 cycle_go_button.on_click(go_to_cycle)
 
-# Filter Panel (vertical stack of sliders)
+# Filter Panel: vertical stack of filter sliders plus X- and Y-axis sliders and azimuth filters.
 eyr_slider = pn.widgets.FloatSlider(name='EYR Slider', start=0, end=5, value=2, step=0.01)
 es_slider = pn.widgets.FloatSlider(name='ES Slider', start=0, end=10, value=0.2, step=0.1)
 mp_slider = pn.widgets.FloatSlider(name='MP Slider', start=0, end=100, value=71, step=1)
 age_slider = pn.widgets.FloatSlider(name='Age Slider', start=0, end=100, value=0, step=1)
 x_axis_slider = pn.widgets.FloatSlider(name='X-axis Slider', start=1, end=30, value=10, step=1)
 y_axis_slider = pn.widgets.FloatSlider(name='Y-axis Slider', start=-50, end=200, value=100, step=1)
-# Azimuth filter text boxes (in degrees)
 min_az_input = pn.widgets.TextInput(name="Min Az (deg)", value="-180", width=100)
 max_az_input = pn.widgets.TextInput(name="Max Az (deg)", value="180", width=100)
-# Stats pane for egoYawRate and egoSpeed
 stats_pane = pn.pane.Markdown("", sizing_mode="stretch_width")
 filter_panel = pn.Column(eyr_slider, es_slider, mp_slider, age_slider, x_axis_slider, y_axis_slider,
-                           pn.Row(min_az_input, max_az_input, sizing_mode="stretch_width"),
-                           stats_pane, sizing_mode="stretch_width")
+                           pn.Row(min_az_input, max_az_input), stats_pane, sizing_mode="stretch_width")
 
-# New navigation controls
+# New Radar Cycle Navigation Controls
 prev_button = pn.widgets.Button(name="<", button_type="primary", width=30)
 step_button = pn.widgets.Button(name=">", button_type="primary", width=30)
 run_button = pn.widgets.Button(name="Run", button_type="success", width=40)
 step_size_input = pn.widgets.TextInput(name="Step Size (s)", value="2", width=100)
-stop_button = pn.widgets.Button(name="", button_type="danger", width=40)  # no text
+stop_button = pn.widgets.Button(name="", button_type="danger", width=40)
 
-animate_callback = None  # to hold periodic callback id
-
+animate_callback = None
 def step_callback(event):
     current_value = radar_cycle_slider.value
     idx = unique_mcs.index(current_value)
@@ -182,7 +178,6 @@ def step_callback(event):
         radar_cycle_slider.value = unique_mcs[idx + 1]
     else:
         radar_cycle_slider.value = unique_mcs[0]
-
 def prev_callback(event):
     current_value = radar_cycle_slider.value
     idx = unique_mcs.index(current_value)
@@ -190,13 +185,10 @@ def prev_callback(event):
         radar_cycle_slider.value = unique_mcs[idx - 1]
     else:
         radar_cycle_slider.value = unique_mcs[-1]
-
 prev_button.on_click(prev_callback)
 step_button.on_click(step_callback)
-
 def animate_func():
     step_callback(None)
-
 def run_click(event):
     global animate_callback
     try:
@@ -205,9 +197,7 @@ def run_click(event):
         val = 2.0
     period = int(1000 / val)
     animate_callback = curdoc().add_periodic_callback(animate_func, period)
-
 run_button.on_click(run_click)
-
 def stop_click(event):
     global animate_callback
     if animate_callback is not None:
@@ -216,21 +206,17 @@ def stop_click(event):
         except Exception as e:
             print("Error stopping animation:", e)
         animate_callback = None
-
 stop_button.on_click(stop_click)
 
-# Arrange radar control row
-radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button,
-                           prev_button, step_button, run_button, step_size_input, stop_button,
-                           sizing_mode="stretch_width")
+radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, prev_button, step_button,
+                           run_button, step_size_input, stop_button, sizing_mode="stretch_width")
 
-# Save Button.
+# Save Button
 save_button = pn.widgets.Button(name='Save Current State', button_type="primary")
 
 # ---------------------------
-# Histogram Figures and Stats Panes
+# Histogram Section
 # ---------------------------
-# Create three histogram figures (using Quad glyph) and corresponding text panes.
 def create_histogram_fig(title):
     p = figure(title=title, sizing_mode="stretch_both", tools="pan,wheel_zoom,reset", height=600)
     return p
@@ -239,21 +225,23 @@ left_hist = create_histogram_fig("LeftEgoHist")
 in_hist = create_histogram_fig("InEgoHist")
 right_hist = create_histogram_fig("RightEgoHist")
 
-# We'll update these histograms in a callback.
 left_hist_source = ColumnDataSource(data=dict(top=[], left=[], right=[]))
 in_hist_source = ColumnDataSource(data=dict(top=[], left=[], right=[]))
 right_hist_source = ColumnDataSource(data=dict(top=[], left=[], right=[]))
 
-left_hist.quad(top='top', bottom=0, left='left', right='right', source=left_hist_source, fill_color="blue", line_color="blue")
-in_hist.quad(top='top', bottom=0, left='left', right='right', source=in_hist_source, fill_color="blue", line_color="blue")
-right_hist.quad(top='top', bottom=0, left='left', right='right', source=right_hist_source, fill_color="blue", line_color="blue")
+left_hist.quad(top='top', bottom=0, left='left', right='right', source=left_hist_source,
+               fill_color="blue", line_color="blue")
+in_hist.quad(top='top', bottom=0, left='left', right='right', source=in_hist_source,
+             fill_color="blue", line_color="blue")
+right_hist.quad(top='top', bottom=0, left='left', right='right', source=right_hist_source,
+                fill_color="blue", line_color="blue")
 
 left_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
 in_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
 right_hist_stats = pn.pane.Markdown("", sizing_mode="stretch_width")
 
 # ---------------------------
-# Prepare ColumnDataSources for main plots
+# Prepare ColumnDataSources for Main Plots
 # ---------------------------
 object_scatter_source = ColumnDataSource(data=dict(x=[], y=[], color=[], size=[], hover=[]))
 object_rect_source = ColumnDataSource(data=dict(rx=[], ry=[], rwidth=[], rheight=[], rangle=[], rcolor=[]))
@@ -264,9 +252,9 @@ ts_source_left = ColumnDataSource(data=dict(mc=[], poe=[]))
 ts_source_right = ColumnDataSource(data=dict(mc=[], poe=[]))
 
 # ---------------------------
-# Create Bokeh Figures for Main Plots
+# Create Main Bokeh Figures
 # ---------------------------
-# Bird's Eye View (object plot)
+# Bird's Eye View plot
 birdseye_plot = figure(
     title="Bird's Eye View", 
     sizing_mode="stretch_both", 
@@ -275,7 +263,7 @@ birdseye_plot = figure(
 )
 birdseye_plot.x_range.start = -x_axis_slider.value
 birdseye_plot.x_range.end = x_axis_slider.value
-# Set y-range based on Y-axis slider value:
+# Update y_range based on Y-axis slider: if value >=0: y_min=-5, else y_min = slider value, y_max accordingly.
 def update_y_range():
     if y_axis_slider.value >= 0:
         birdseye_plot.y_range.start = -5
@@ -333,7 +321,7 @@ ts_plot_right.circle('mc', 'poe', source=ts_source_right, size=3, color='magenta
 empty_plot = figure(sizing_mode="stretch_both", toolbar_location=None)
 
 # ---------------------------
-# Callback Functions for Main Plots and Histograms
+# Callback Functions
 # ---------------------------
 def update_object_plot():
     current_mc = radar_cycle_slider.value
@@ -346,7 +334,6 @@ def update_object_plot():
     top_border.location = birdseye_plot.y_range.end
 
     df_cycle = df[df.mc == current_mc].to_pandas_df()
-    # Apply filters: egoYawRate, egoSpeed, mirrProb, lc, and azimuth.
     filtered = df_cycle[
         (df_cycle.egoYawRate < np.radians(2)) &
         (df_cycle.egoSpeed > es_slider.value) &
@@ -366,7 +353,6 @@ def update_object_plot():
     if filtered.empty:
         filtered = df_cycle
 
-    # Update stats pane with egoYawRate and egoSpeed of first object
     if not filtered.empty:
         first = filtered.iloc[0]
         stats_text = f"egoYawRate: {math.degrees(first['egoYawRate']):.3f} deg/s, egoSpeed: {first['egoSpeed']:.3f} m/s"
@@ -378,7 +364,6 @@ def update_object_plot():
     rect_rx, rect_ry, rect_widths, rect_heights, rect_angles, rect_colors = [], [], [], [], [], []
     
     for _, row in filtered.iterrows():
-        # Colour rule: if mirrProb > 70 -> orange; else if OOI==1 -> red; else if LOS==1 and label in [1,2,3] and OOI==0 -> blue; else grey.
         if row['mirrProb'] > 70:
             col = "orange"
         elif row['OOI'] == 1:
@@ -388,12 +373,9 @@ def update_object_plot():
         else:
             col = "grey"
         size_val = 4 if row['OOI'] == 1 else 3
-
-        # Format hover text in three rows (3 columns each)
-        # Row 1: id, vx, vy; Row 2: mirrProb, poe, pfd; Row 3: dp, lc, (blank)
         hover_text = (f"id: {int(row['id'])} | vx: {row['vx']:.2f} | vy: {row['vy']:.2f}\n"
                       f"mirrProb: {int(row['mirrProb'])} | poe: {int(row['poe'])} | pfd: {row['pfd']:.4f}\n"
-                      f"dp: {int(row['dp'])} | lc: {int(row['lc'])} | ")
+                      f"dp: {int(row['dp'])} | lc: {int(row['lc'])} |")
         
         scatter_x.append(row['y'])
         scatter_y.append(row['x'])
@@ -401,7 +383,6 @@ def update_object_plot():
         sizes.append(size_val)
         hovers.append(hover_text)
         
-        # Bounding box via rect glyph.
         rwidth = row['wl'] + row['wr']
         rheight = row['lf'] + row['lr']
         rx = row['y']
@@ -415,10 +396,8 @@ def update_object_plot():
         rect_colors.append(col)
     
     object_scatter_source.data = dict(x=scatter_x, y=scatter_y, color=colors, size=sizes, hover=hovers)
-    object_rect_source.data = dict(
-        rx=rect_rx, ry=rect_ry, rwidth=rect_widths, rheight=rect_heights,
-        rangle=rect_angles, rcolor=rect_colors
-    )
+    object_rect_source.data = dict(rx=rect_rx, ry=rect_ry, rwidth=rect_widths, rheight=rect_heights,
+                                   rangle=rect_angles, rcolor=rect_colors)
     
     ego_info = filtered.iloc[0]
     ego_hover_text = (f"mc: {int(ego_info['mc'])}, egoSpeed: {ego_info['egoSpeed']:.3f}, "
@@ -442,10 +421,8 @@ def update_time_series(source, label_val, title_prefix):
         return f"{title_prefix} No Data"
 
 def update_histograms():
-    # For each histogram (LeftEgoHist: label==2, InEgoHist: label==1, RightEgoHist: label==3)
     current_mc = radar_cycle_slider.value
     df_cycle = df[df.mc == current_mc].to_pandas_df()
-    # Filter only objects with OOI==1
     df_cycle = df_cycle[df_cycle.OOI == 1]
     def compute_histogram(label_val):
         subset = df_cycle[df_cycle.label == label_val]
@@ -472,7 +449,6 @@ def update_histograms():
     update_hist_source(left_hist_source, left_pct, left_bins)
     update_hist_source(in_hist_source, in_pct, in_bins)
     update_hist_source(right_hist_source, right_pct, right_bins)
-    # Now, compute stats for each histogram.
     def compute_stats(poe_array):
         total = poe_array.size
         if total == 0:
@@ -508,11 +484,13 @@ for widget in [radar_cycle_slider, x_axis_slider, y_axis_slider, eyr_slider, es_
     widget.param.watch(update_all, 'value')
 
 def save_callback(event):
-    try:
-        if animate_callback is not None:
+    global animate_callback
+    if animate_callback is not None:
+        try:
             curdoc().remove_periodic_callback(animate_callback)
-    except Exception as e:
-        print("Error stopping animation:", e)
+        except Exception as e:
+            print("Error stopping animation:", e)
+        animate_callback = None
     update_all()
     pn.panel(dashboard_layout).save('dashboard_state.html', resources='inline')
     print(f"[{time.time()-dashboard_start:.3f} sec] Dashboard state saved.")
@@ -528,7 +506,7 @@ header_section = pn.pane.Markdown(
 )
 
 radar_control_row = pn.Row(radar_cycle_slider, cycle_input, cycle_go_button, prev_button, step_button,
-                             run_button, step_size_input, stop_button, sizing_mode="stretch_width")
+                           run_button, step_size_input, stop_button, sizing_mode="stretch_width")
 slider_section = pn.Row(radar_control_row, sizing_mode="stretch_width", height=50)
 
 # Main grid: 2 rows x 3 columns.
@@ -539,19 +517,17 @@ grid[0:2, 1] = birdseye_plot
 grid[0, 2] = ts_plot_ego
 grid[1, 2] = ts_plot_right
 
-# Histogram section: one row with three columns (each 31% width, height 60% of screen, e.g., 600px)
-hist_grid = pn.Row(
-    pn.Column(left_hist, left_hist_stats, width="31%"),
-    pn.Column(in_hist, in_hist_stats, width="31%"),
-    pn.Column(right_hist, right_hist_stats, width="31%"),
+# Histogram section: a row with three columns; let them share width equally.
+hist_row = pn.Row(
+    pn.Column(left_hist, left_hist_stats, sizing_mode="stretch_both"),
+    pn.Column(in_hist, in_hist_stats, sizing_mode="stretch_both"),
+    pn.Column(right_hist, right_hist_stats, sizing_mode="stretch_both"),
     sizing_mode="stretch_width",
     height=600
 )
-hist_section = pn.Column(pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"), hist_grid, sizing_mode="stretch_both")
+hist_section = pn.Column(pn.pane.Markdown("<h2 style='color:white;'>Histogram</h2>", sizing_mode="stretch_width"), hist_row, sizing_mode="stretch_both")
 
 dashboard_layout = pn.Column(header_section, slider_section, grid, save_button, hist_section, sizing_mode="stretch_both", margin=0)
-
-# Set background for dashboard_layout via raw CSS (already set in pn.config)
 
 update_all()
 pn.state.onload(lambda: update_all())
