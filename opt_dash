@@ -1,0 +1,2102 @@
+"""
+RECTANGLE PLACEMENT OPTIMIZER + LIVE DASHBOARD
+
+=======================================================================
+HOW TO RUN
+-----------------------------------------------------------------------
+1. Install dependencies (example):
+
+   pip install panel bokeh vaex-core scipy numpy pandas pygad torch
+
+   (pygad and torch are optional, but needed for Genetic Algorithm
+    and Adam respectively. The code will warn gracefully if missing.)
+
+2. Save this file as, for example:  rect_placement_dashboard.py
+
+3. Start the dashboard:
+
+   panel serve rect_placement_dashboard.py --show
+
+4. On the dashboard:
+   - Upload a JSON config file (see template below).
+   - Choose optimizer and parameters on the first tab.
+   - Click "Run" to start, "Pause", "Continue", "Stop" as needed.
+   - Use "Save State" / "Load State" to persist and resume.
+   - Use "Save Dashboard as HTML" to export a static HTML file.
+
+=======================================================================
+JSON CONFIG TEMPLATE (EXAMPLE)
+-----------------------------------------------------------------------
+{
+  "canvas": {
+    "width": 1000.0,
+    "height": 800.0
+  },
+  "rectangles": [
+    {
+      "id": "R1",
+      "width": 120.0,
+      "height": 80.0,
+      "initial_center": [150.0, 150.0]
+    },
+    {
+      "id": "R2",
+      "width": 100.0,
+      "height": 100.0,
+      "initial_center": [350.0, 200.0]
+    }
+  ],
+  "constraints": {
+    "bbox_aspect_ratio": {
+      "enabled": true,
+      "type": "less_than",                 // or "greater_than"
+      "threshold": 1.5,
+      "penalty_weight": 50.0
+    },
+    "no_overlap": {
+      "enabled": true,
+      "penalty_weight": 1000.0
+    },
+    "min_spacing": {
+      "enabled": true,
+      "min_dx": 10.0,
+      "min_dy": 10.0,
+      "penalty_weight": 500.0
+    },
+    "canvas_boundary": {
+      "enabled": true,
+      "penalty_weight": 500.0
+    }
+  },
+  "objective": {
+    "weights": {
+      "hpwl": 1.0,
+      "bbox_aspect": 0.5,
+      "bbox_area": 0.01
+    }
+  },
+  "optimizer": {
+    "algorithm": "Differential Evolution",
+    "params": {
+      "maxiter": 80,
+      "popsize": 15,
+      "seed": 42
+    }
+  }
+}
+
+=======================================================================
+HIGH-LEVEL DESIGN
+-----------------------------------------------------------------------
+- Positions are rectangle centres.
+- Input is read from a structured JSON file.
+- Constraints (overlap, spacing, aspect ratio, boundary) are read from JSON.
+- Objective = w1 * HPWL + w2 * BBox Aspect Ratio + w3 * BBox Area
+- Constraints are enforced via penalty terms added to the objective.
+- Optimizers (at least 10) are provided via existing Python libraries,
+  not re-implemented manually, wherever possible:
+
+  1. Adam (PyTorch)
+  2. Genetic Algorithm (pygad)
+  3. Differential Evolution (scipy.optimize.differential_evolution)
+  4. Dual Annealing (Simulated Annealing variant, scipy.optimize.dual_annealing)
+  5. Basin Hopping (Simulated Annealing style, scipy.optimize.basinhopping)
+  6. Nelder-Mead (scipy.optimize.minimize)
+  7. Powell (scipy.optimize.minimize)
+  8. Conjugate Gradient (CG) (scipy.optimize.minimize)
+  9. L-BFGS-B (scipy.optimize.minimize)
+ 10. SLSQP (scipy.optimize.minimize)
+ 11. Trust-Constr (used as a Quadratic-Programming-like optimizer)
+
+- The optimization runs in a separate thread from the dashboard.
+- Where the underlying library supports it, internal parallel workers
+  are used to exploit multiple CPU cores.
+- A multi-tab Panel + Bokeh dashboard provides:
+  * Tab 1: Inputs & Controls (ALL INPUTS ARE HERE)
+  * Tab 2: Canvas View (live rectangle placement)
+  * Tab 3: Objective Plots (per-term + combined)
+  * Tab 4: Constraint Plots (per-constraint)
+  * Tab 5: Logs (full history table)
+
+- Vaex is used to hold the optimization history in an efficient table,
+  and Panel + Bokeh visualize it.
+- Live updates are done via a 20 ms periodic callback.
+- The color palette and fonts are configured to be visually appealing,
+  emphasizing NK57 Monospace Condensed Thin with complementary colors.
+"""
+
+import json
+import math
+import os
+import threading
+import time
+import uuid
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+
+# External libraries used for dashboard & data
+import panel as pn
+from bokeh.models import ColumnDataSource, HoverTool
+from bokeh.plotting import figure
+import vaex
+import pandas as pd
+
+# External libraries used for optimization
+from scipy.optimize import (
+    minimize,
+    differential_evolution,
+    dual_annealing,
+    basinhopping,
+)
+
+# Optional libraries for extra optimizers
+try:
+    import pygad
+except Exception:
+    pygad = None
+
+try:
+    import torch
+except Exception:
+    torch = None
+
+# ---------------------------------------------------------------------
+# PANEL / BOKEH EXTENSION & THEME
+# ---------------------------------------------------------------------
+
+# Visual theme: dark-ish background with complementary accents
+DASHBOARD_CSS = r"""
+html, body {
+  background-color: #050816;
+  color: #ECEFF1;
+  font-family: "NK57 Monospace Condensed Thin","Roboto Mono",monospace;
+  margin: 0;
+  padding: 0;
+}
+
+/* Simple global tweaks for Bokeh / Panel widgets */
+.bk {
+  font-family: "NK57 Monospace Condensed Thin","Roboto Mono",monospace;
+}
+
+.bk.bk-btn {
+  border-radius: 10px;
+  font-weight: 400;
+}
+
+.bk.bk-input-group, .bk.bk-input, .bk.bk-select {
+  background-color: #0b1020;
+  color: #ECEFF1;
+  border-radius: 6px;
+}
+
+/* Tabs look */
+.bk.bk-tabs-header {
+  background-color: #050816;
+  border-bottom: 1px solid #1f2937;
+}
+"""
+
+pn.extension(
+    "tabulator",
+    sizing_mode="stretch_width",
+    raw_css=[DASHBOARD_CSS],
+)
+
+# Global color palette
+COLORS = {
+    "bg": "#050816",
+    "panel_bg": "#0b1020",
+    "primary": "#FFB300",
+    "secondary": "#29B6F6",
+    "accent": "#AB47BC",
+    "muted": "#546E7A",
+    "text": "#ECEFF1",
+    "grid": "#263238",
+    "rect_fill": "#29B6F6",
+    "rect_line": "#ECEFF1",
+    "bbox_line": "#FF7043",
+}
+
+
+# ---------------------------------------------------------------------
+# DATA STRUCTURES
+# ---------------------------------------------------------------------
+
+@dataclass
+class RectangleDef:
+    """Rectangle definition from JSON configuration."""
+    rect_id: str
+    width: float
+    height: float
+    init_cx: float
+    init_cy: float
+
+
+class PlacementProblem:
+    """
+    Encapsulates the rectangle placement problem:
+    - canvas size
+    - rectangle definitions
+    - constraints and objective weights
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+
+        canvas_cfg = config.get("canvas", {})
+        self.canvas_width: float = float(canvas_cfg.get("width", 1000.0))
+        self.canvas_height: float = float(canvas_cfg.get("height", 800.0))
+
+        rects_cfg = config.get("rectangles", [])
+        self.rectangles: List[RectangleDef] = []
+        for i, r in enumerate(rects_cfg):
+            rid = r.get("id", f"R{i}")
+            w = float(r["width"])
+            h = float(r["height"])
+            cx, cy = r["initial_center"]
+            self.rectangles.append(
+                RectangleDef(
+                    rect_id=rid,
+                    width=w,
+                    height=h,
+                    init_cx=float(cx),
+                    init_cy=float(cy),
+                )
+            )
+
+        self.n_rects = len(self.rectangles)
+
+        # Constraints and objective weights
+        self.constraints_cfg = config.get("constraints", {})
+        self.objective_cfg = config.get("objective", {})
+        self.obj_weights = self.objective_cfg.get("weights", {})
+        self.weight_hpwl = float(self.obj_weights.get("hpwl", 1.0))
+        self.weight_bbox_aspect = float(self.obj_weights.get("bbox_aspect", 0.5))
+        self.weight_bbox_area = float(self.obj_weights.get("bbox_area", 0.01))
+
+    # ------------------------ basic helpers ----------------------------
+
+    def num_variables(self) -> int:
+        """Number of optimization variables = 2 * number of rectangles."""
+        return 2 * self.n_rects
+
+    def initial_vector(self) -> np.ndarray:
+        """
+        Flattened vector of initial centres:
+        [cx_0, cy_0, cx_1, cy_1, ..., cx_{N-1}, cy_{N-1}]
+        """
+        vec = []
+        for r in self.rectangles:
+            vec.extend([r.init_cx, r.init_cy])
+        return np.array(vec, dtype=float)
+
+    def bounds(self) -> List[Tuple[float, float]]:
+        """
+        Bounds for each center coordinate, ensuring rectangles stay inside
+        the canvas (hard geometric bounds; further boundary penalties can
+        still be applied).
+        """
+        bnds: List[Tuple[float, float]] = []
+        for r in self.rectangles:
+            half_w = r.width / 2.0
+            half_h = r.height / 2.0
+            # x bounds
+            x_min = half_w
+            x_max = self.canvas_width - half_w
+            # y bounds
+            y_min = half_h
+            y_max = self.canvas_height - half_h
+            bnds.append((x_min, x_max))
+            bnds.append((y_min, y_max))
+        return bnds
+
+    def decode_centres(self, x: np.ndarray) -> List[Tuple[float, float]]:
+        """
+        Convert flattened vector into list of (cx, cy) per rectangle.
+        """
+        centres: List[Tuple[float, float]] = []
+        for i in range(self.n_rects):
+            cx = float(x[2 * i])
+            cy = float(x[2 * i + 1])
+            centres.append((cx, cy))
+        return centres
+
+    # --------------------- objective & constraints ---------------------
+
+    def _compute_bounding_box(
+        self, centres: List[Tuple[float, float]]
+    ) -> Tuple[float, float, float, float]:
+        """
+        Compute the bounding box that tightly encloses all rectangles.
+        Returns (min_x, min_y, max_x, max_y).
+        """
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = -float("inf")
+        max_y = -float("inf")
+
+        for (cx, cy), r in zip(centres, self.rectangles):
+            half_w = r.width / 2.0
+            half_h = r.height / 2.0
+            left = cx - half_w
+            right = cx + half_w
+            bottom = cy - half_h
+            top = cy + half_h
+            if left < min_x:
+                min_x = left
+            if right > max_x:
+                max_x = right
+            if bottom < min_y:
+                min_y = bottom
+            if top > max_y:
+                max_y = top
+
+        return min_x, min_y, max_x, max_y
+
+    def _compute_hpwl(self, centres: List[Tuple[float, float]]) -> float:
+        """
+        HPWL for a single 'net' connecting all rectangle centres.
+        HPWL = (max_x - min_x) + (max_y - min_y)
+        """
+        xs = [c[0] for c in centres]
+        ys = [c[1] for c in centres]
+        return (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+    def _constraints_from_centres(
+        self, centres: List[Tuple[float, float]]
+    ) -> Dict[str, float]:
+        """
+        Evaluate constraint terms for the given centres.
+
+        Returns a dict with:
+          - "overlap_max_ratio"
+          - "spacing_x_violation"
+          - "spacing_y_violation"
+          - "bbox_ar_violation"
+          - "boundary_violation"
+        """
+        cons_cfg = self.constraints_cfg
+
+        # Prepare some flags / weights
+        no_ov = cons_cfg.get("no_overlap", {}).get("enabled", True)
+        min_sp = cons_cfg.get("min_spacing", {}).get("enabled", True)
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+        bbox_ar_enabled = bbox_ar_cfg.get("enabled", False)
+        boundary_enabled = boundary_cfg.get("enabled", True)
+
+        min_dx = float(cons_cfg.get("min_spacing", {}).get("min_dx", 0.0))
+        min_dy = float(cons_cfg.get("min_spacing", {}).get("min_dy", 0.0))
+
+        # Overlap & spacing
+        overlap_max_ratio = 0.0
+        spacing_x_violation = 0.0
+        spacing_y_violation = 0.0
+
+        # Precompute edges
+        edges = []
+        for (cx, cy), r in zip(centres, self.rectangles):
+            half_w = r.width / 2.0
+            half_h = r.height / 2.0
+            left = cx - half_w
+            right = cx + half_w
+            bottom = cy - half_h
+            top = cy + half_h
+            edges.append((left, right, bottom, top, r.width, r.height))
+
+        n = self.n_rects
+        for i in range(n):
+            left_i, right_i, bottom_i, top_i, wi, hi = edges[i]
+            area_i = wi * hi
+            for j in range(i + 1, n):
+                left_j, right_j, bottom_j, top_j, wj, hj = edges[j]
+                area_j = wj * hj
+
+                # Overlap check
+                overlap_x = max(0.0, min(right_i, right_j) - max(left_i, left_j))
+                overlap_y = max(0.0, min(top_i, top_j) - max(bottom_i, bottom_j))
+                overlap_area = overlap_x * overlap_y
+                if no_ov and overlap_area > 0.0:
+                    smaller_area = min(area_i, area_j)
+                    ratio = overlap_area / smaller_area if smaller_area > 0 else 1.0
+                    if ratio > overlap_max_ratio:
+                        overlap_max_ratio = ratio
+
+                # Spacing in x
+                horiz_gap = 0.0
+                if right_i <= left_j:
+                    horiz_gap = left_j - right_i
+                elif right_j <= left_i:
+                    horiz_gap = left_i - right_j
+                else:
+                    horiz_gap = 0.0  # Overlap or touching in x
+
+                # Spacing in y
+                vert_gap = 0.0
+                if top_i <= bottom_j:
+                    vert_gap = bottom_j - top_i
+                elif top_j <= bottom_i:
+                    vert_gap = bottom_i - top_j
+                else:
+                    vert_gap = 0.0  # Overlap or touching in y
+
+                if min_sp:
+                    if horiz_gap < min_dx:
+                        spacing_x_violation = max(
+                            spacing_x_violation, (min_dx - horiz_gap)
+                        )
+                    if vert_gap < min_dy:
+                        spacing_y_violation = max(
+                            spacing_y_violation, (min_dy - vert_gap)
+                        )
+
+        # Bounding box aspect ratio constraint
+        bbox_ar_violation = 0.0
+        if bbox_ar_enabled:
+            min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+            width = max_x - min_x
+            height = max_y - min_y
+            if height <= 0 or width <= 0:
+                ar = 1.0
+            else:
+                ar = width / height
+
+            ar_type = bbox_ar_cfg.get("type", "less_than")
+            thr = float(bbox_ar_cfg.get("threshold", 1.0))
+
+            if ar_type == "less_than":
+                bbox_ar_violation = max(0.0, ar - thr)
+            else:  # greater_than
+                bbox_ar_violation = max(0.0, thr - ar)
+
+        # Canvas boundary constraint
+        boundary_violation = 0.0
+        if boundary_enabled:
+            for (cx, cy), r in zip(centres, self.rectangles):
+                half_w = r.width / 2.0
+                half_h = r.height / 2.0
+                left = cx - half_w
+                right = cx + half_w
+                bottom = cy - half_h
+                top = cy + half_h
+
+                if left < 0.0:
+                    boundary_violation += -left
+                if right > self.canvas_width:
+                    boundary_violation += (right - self.canvas_width)
+                if bottom < 0.0:
+                    boundary_violation += -bottom
+                if top > self.canvas_height:
+                    boundary_violation += (top - self.canvas_height)
+
+        return {
+            "overlap_max_ratio": float(overlap_max_ratio if no_ov else 0.0),
+            "spacing_x_violation": float(spacing_x_violation if min_sp else 0.0),
+            "spacing_y_violation": float(spacing_y_violation if min_sp else 0.0),
+            "bbox_ar_violation": float(bbox_ar_violation if bbox_ar_enabled else 0.0),
+            "boundary_violation": float(boundary_violation if boundary_enabled else 0.0),
+        }
+
+    def compute_metrics(self, x: np.ndarray) -> Dict[str, float]:
+        """
+        Compute all metrics:
+          - hpwl
+          - bbox_aspect
+          - bbox_area
+          - objective_pure
+          - augmented objective (with penalties)
+          - each constraint term
+        """
+        centres = self.decode_centres(x)
+
+        # Objective terms
+        hpwl = self._compute_hpwl(centres)
+        min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+        bbox_width = max_x - min_x
+        bbox_height = max_y - min_y
+        if bbox_height <= 0 or bbox_width <= 0:
+            bbox_aspect = 1.0
+            bbox_area = 0.0
+        else:
+            bbox_aspect = bbox_width / bbox_height
+            bbox_area = bbox_width * bbox_height
+
+        pure_obj = (
+            self.weight_hpwl * hpwl
+            + self.weight_bbox_aspect * bbox_aspect
+            + self.weight_bbox_area * bbox_area
+        )
+
+        # Constraint contributions
+        cons = self._constraints_from_centres(centres)
+        overlap_max_ratio = cons["overlap_max_ratio"]
+        spacing_x_violation = cons["spacing_x_violation"]
+        spacing_y_violation = cons["spacing_y_violation"]
+        bbox_ar_violation = cons["bbox_ar_violation"]
+        boundary_violation = cons["boundary_violation"]
+
+        # Penalty weights
+        no_ov_cfg = self.constraints_cfg.get("no_overlap", {})
+        min_sp_cfg = self.constraints_cfg.get("min_spacing", {})
+        bbox_ar_cfg = self.constraints_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = self.constraints_cfg.get("canvas_boundary", {})
+
+        w_overlap = float(no_ov_cfg.get("penalty_weight", 1000.0))
+        w_spacing = float(min_sp_cfg.get("penalty_weight", 500.0))
+        w_bbox_ar_con = float(bbox_ar_cfg.get("penalty_weight", 50.0))
+        w_boundary = float(boundary_cfg.get("penalty_weight", 500.0))
+
+        penalty = 0.0
+        penalty += w_overlap * (overlap_max_ratio ** 2)
+        penalty += w_spacing * ((spacing_x_violation ** 2) + (spacing_y_violation ** 2))
+        penalty += w_bbox_ar_con * (bbox_ar_violation ** 2)
+        penalty += w_boundary * (boundary_violation ** 2)
+
+        augmented_obj = pure_obj + penalty
+
+        metrics = {
+            "hpwl": float(hpwl),
+            "bbox_aspect": float(bbox_aspect),
+            "bbox_area": float(bbox_area),
+            "objective_pure": float(pure_obj),
+            "objective_augmented": float(augmented_obj),
+            "overlap_max_ratio": float(overlap_max_ratio),
+            "spacing_x_violation": float(spacing_x_violation),
+            "spacing_y_violation": float(spacing_y_violation),
+            "bbox_ar_violation": float(bbox_ar_violation),
+            "boundary_violation": float(boundary_violation),
+        }
+
+        return metrics
+
+    def make_rectangle_shapes(
+        self, x: np.ndarray
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Convert a placement vector into per-rectangle shapes and bounding box
+        info suitable for Bokeh plotting.
+
+        Returns (rectangles_list, bbox_dict)
+        """
+        centres = self.decode_centres(x)
+        rect_shapes: List[Dict[str, Any]] = []
+        min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+        bbox_width = max_x - min_x
+        bbox_height = max_y - min_y
+        bbox_cx = min_x + bbox_width / 2.0
+        bbox_cy = min_y + bbox_height / 2.0
+
+        for (cx, cy), r in zip(centres, self.rectangles):
+            rect_shapes.append(
+                {
+                    "x": cx,
+                    "y": cy,
+                    "w": r.width,
+                    "h": r.height,
+                    "rect_id": r.rect_id,
+                }
+            )
+
+        bbox_shape = {
+            "x": bbox_cx,
+            "y": bbox_cy,
+            "w": bbox_width,
+            "h": bbox_height,
+        }
+
+        return rect_shapes, bbox_shape
+
+
+# ---------------------------------------------------------------------
+# OPTIMIZATION MANAGER
+# ---------------------------------------------------------------------
+
+class OptimizationManager:
+    """
+    Coordinates:
+      - the placement problem
+      - optimizer execution (in a worker thread)
+      - shared state for live dashboard (Bokeh datasources + Vaex
+        history + logging)
+      - pause/continue/stop behaviour
+      - save/load state for resuming
+    """
+
+    def __init__(self):
+        self.problem: Optional[PlacementProblem] = None
+        self.config: Optional[Dict[str, Any]] = None
+
+        # Core state
+        self.current_algorithm: Optional[str] = None
+        self.current_params: Dict[str, Any] = {}
+        self.thread: Optional[threading.Thread] = None
+        self.running: bool = False
+
+        # Control flags (pause/stop)
+        self._pause_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+
+        # Iteration / placement counters
+        self.iteration: int = 0
+        self.placement_counter: int = 0
+
+        # Keep best solution
+        self.best_x: Optional[np.ndarray] = None
+        self.best_metrics: Optional[Dict[str, float]] = None
+
+        # Pending steps buffer (used for periodic dashboard updates)
+        self._pending_steps: List[Dict[str, Any]] = []
+
+        # History stored as Vaex DataFrame (created lazily)
+        self._history_records: List[Dict[str, Any]] = []
+        self.history_vaex: Optional[vaex.dataframe.DataFrame] = None
+
+        # -----------------------------------------------------------------
+        # Bokeh data sources for live plots
+        # -----------------------------------------------------------------
+        self.obj_source = ColumnDataSource(
+            data=dict(
+                iteration=[],
+                placement_id=[],
+                algo=[],
+                hpwl=[],
+                bbox_aspect=[],
+                bbox_area=[],
+                objective_pure=[],
+                objective_augmented=[],
+            )
+        )
+
+        self.constraint_source = ColumnDataSource(
+            data=dict(
+                iteration=[],
+                placement_id=[],
+                algo=[],
+                overlap_max_ratio=[],
+                spacing_x_violation=[],
+                spacing_y_violation=[],
+                bbox_ar_violation=[],
+                boundary_violation=[],
+            )
+        )
+
+        # Rectangle canvas view
+        self.canvas_source = ColumnDataSource(
+            data=dict(
+                x=[],
+                y=[],
+                w=[],
+                h=[],
+                rect_id=[],
+                placement_id=[],
+            )
+        )
+
+        self.bbox_source = ColumnDataSource(
+            data=dict(
+                x=[],
+                y=[],
+                w=[],
+                h=[],
+            )
+        )
+
+        # Placement ID display
+        self.placement_label_source = ColumnDataSource(
+            data=dict(x=[0.0], y=[0.0], text=["Placement: -"])
+        )
+
+        # For a small "status" display
+        self.status_text = pn.pane.Markdown(
+            "",
+            style={"color": COLORS["text"], "font-size": "11pt"},
+            sizing_mode="stretch_width",
+            margin=(5, 5, 5, 5),
+        )
+
+        # Log table (Panel Tabulator uses pandas DataFrame)
+        self.log_table = pn.widgets.Tabulator(
+            pd.DataFrame(
+                columns=[
+                    "iteration",
+                    "placement_id",
+                    "algo",
+                    "objective_augmented",
+                    "hpwl",
+                    "bbox_aspect",
+                    "bbox_area",
+                ]
+            ),
+            height=400,
+            pagination="local",
+            page_size=15,
+            theme="fast",
+        )
+
+    # ------------------------------ LOAD / SAVE ------------------------
+
+    def load_config_from_json_str(self, json_str: str):
+        """
+        Load configuration from JSON string and initialize PlacementProblem.
+        """
+        cfg = json.loads(json_str)
+        self.config = cfg
+        self.problem = PlacementProblem(cfg)
+        self._reset_state()
+        self._update_status("Configuration loaded. Ready to run.")
+
+    def _reset_state(self):
+        """
+        Reset internal optimization state (not the configuration).
+        """
+        with self._lock:
+            self.iteration = 0
+            self.placement_counter = 0
+            self.best_x = None
+            self.best_metrics = None
+            self._pending_steps.clear()
+            self._history_records.clear()
+            self.history_vaex = None
+
+            # Clear Bokeh datasources
+            self.obj_source.data = {k: [] for k in self.obj_source.data.keys()}
+            self.constraint_source.data = {
+                k: [] for k in self.constraint_source.data.keys()
+            }
+            self.canvas_source.data = {k: [] for k in self.canvas_source.data.keys()}
+            self.bbox_source.data = {k: [] for k in self.bbox_source.data.keys()}
+            self.placement_label_source.data = dict(
+                x=[0.0], y=[0.0], text=["Placement: -"]
+            )
+
+            # Reset log table
+            self.log_table.value = pd.DataFrame(
+                columns=[
+                    "iteration",
+                    "placement_id",
+                    "algo",
+                    "objective_augmented",
+                    "hpwl",
+                    "bbox_aspect",
+                    "bbox_area",
+                ]
+            )
+
+    def save_state_to_file(self, path: str):
+        """
+        Save the current optimization state to a JSON file so that it can
+        be resumed later.
+        Only serializable objects are stored (positions, metrics, history,
+        configuration, algorithm choice, etc.).
+        """
+        if self.problem is None or self.config is None:
+            self._update_status("No problem loaded, cannot save state.")
+            return
+
+        with self._lock:
+            state = {
+                "config": self.config,
+                "current_algorithm": self.current_algorithm,
+                "current_params": self.current_params,
+                "iteration": self.iteration,
+                "placement_counter": self.placement_counter,
+                "best_x": self.best_x.tolist() if self.best_x is not None else None,
+                "best_metrics": self.best_metrics,
+                "history_records": self._history_records,
+            }
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+
+        self._update_status(f"State saved to {path}")
+
+    def load_state_from_file(self, path: str):
+        """
+        Load a previously saved state and rebuild internal structures.
+        """
+        if not os.path.exists(path):
+            self._update_status(f"State file not found: {path}")
+            return
+
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+
+        cfg = state["config"]
+        self.config = cfg
+        self.problem = PlacementProblem(cfg)
+
+        with self._lock:
+            self.current_algorithm = state.get("current_algorithm")
+            self.current_params = state.get("current_params", {})
+            self.iteration = int(state.get("iteration", 0))
+            self.placement_counter = int(state.get("placement_counter", 0))
+            best_x_list = state.get("best_x")
+            self.best_x = np.array(best_x_list) if best_x_list is not None else None
+            self.best_metrics = state.get("best_metrics")
+            self._history_records = state.get("history_records", [])
+
+            # Rebuild Vaex DF and Bokeh datasources from history
+            if self._history_records:
+                self.history_vaex = vaex.from_dict(self._history_records)
+                df = self.history_vaex.to_pandas_df()
+                self.log_table.value = df[
+                    [
+                        "iteration",
+                        "placement_id",
+                        "algo",
+                        "objective_augmented",
+                        "hpwl",
+                        "bbox_aspect",
+                        "bbox_area",
+                    ]
+                ]
+            else:
+                self.history_vaex = None
+                self.log_table.value = pd.DataFrame(
+                    columns=[
+                        "iteration",
+                        "placement_id",
+                        "algo",
+                        "objective_augmented",
+                        "hpwl",
+                        "bbox_aspect",
+                        "bbox_area",
+                    ]
+                )
+
+            # Update Bokeh sources with last placement / metrics if available
+            self._refresh_datasources_from_history_locked()
+
+        self._update_status(f"State loaded from {path}")
+
+    def _refresh_datasources_from_history_locked(self):
+        """
+        Internal helper: reconstruct Bokeh sources from full history.
+        Assumes self._lock already acquired.
+        """
+        if not self._history_records:
+            return
+
+        # Objective + constraint sources
+        obj_data = {k: [] for k in self.obj_source.data.keys()}
+        con_data = {k: [] for k in self.constraint_source.data.keys()}
+
+        for rec in self._history_records:
+            obj_data["iteration"].append(rec["iteration"])
+            obj_data["placement_id"].append(rec["placement_id"])
+            obj_data["algo"].append(rec["algo"])
+            obj_data["hpwl"].append(rec["hpwl"])
+            obj_data["bbox_aspect"].append(rec["bbox_aspect"])
+            obj_data["bbox_area"].append(rec["bbox_area"])
+            obj_data["objective_pure"].append(rec["objective_pure"])
+            obj_data["objective_augmented"].append(rec["objective_augmented"])
+
+            con_data["iteration"].append(rec["iteration"])
+            con_data["placement_id"].append(rec["placement_id"])
+            con_data["algo"].append(rec["algo"])
+            con_data["overlap_max_ratio"].append(rec["overlap_max_ratio"])
+            con_data["spacing_x_violation"].append(rec["spacing_x_violation"])
+            con_data["spacing_y_violation"].append(rec["spacing_y_violation"])
+            con_data["bbox_ar_violation"].append(rec["bbox_ar_violation"])
+            con_data["boundary_violation"].append(rec["boundary_violation"])
+
+        self.obj_source.data = obj_data
+        self.constraint_source.data = con_data
+
+        # Canvas view from last record
+        last_rec = self._history_records[-1]
+        x_vec = np.array(last_rec["x_vector"])
+        rect_shapes, bbox_shape = self.problem.make_rectangle_shapes(x_vec)
+
+        self.canvas_source.data = dict(
+            x=[r["x"] for r in rect_shapes],
+            y=[r["y"] for r in rect_shapes],
+            w=[r["w"] for r in rect_shapes],
+            h=[r["h"] for r in rect_shapes],
+            rect_id=[r["rect_id"] for r in rect_shapes],
+            placement_id=[last_rec["placement_id"]] * len(rect_shapes),
+        )
+
+        self.bbox_source.data = dict(
+            x=[bbox_shape["x"]],
+            y=[bbox_shape["y"]],
+            w=[bbox_shape["w"]],
+            h=[bbox_shape["h"]],
+        )
+
+        self.placement_label_source.data = dict(
+            x=[bbox_shape["x"]],
+            y=[bbox_shape["y"] + bbox_shape["h"] * 0.6],
+            text=[f"Placement: {last_rec['placement_id']}"],
+        )
+
+    # ------------------------------ STATUS -----------------------------
+
+    def _update_status(self, msg: str):
+        """
+        Update the status text widget (on the main UI thread).
+        """
+        timestamp = time.strftime("%H:%M:%S")
+        self.status_text.object = f"**[{timestamp}]** {msg}"
+
+    # ------------------------- PAUSE / CONTINUE / STOP -----------------
+
+    def pause(self):
+        """Request a pause at next iteration boundary."""
+        if self.running:
+            self._pause_event.set()
+            self._update_status("Pause requested.")
+
+    def resume(self):
+        """Resume from a paused state."""
+        if self.running and self._pause_event.is_set():
+            self._pause_event.clear()
+            self._update_status("Resuming optimization.")
+        elif not self.running and self.best_x is not None:
+            # If completely stopped but we have a best_x, start a new run
+            self._update_status(
+                "Optimization is stopped. Use the 'Run' button with 'Resume from Best' option."
+            )
+
+    def stop(self):
+        """Request a complete stop."""
+        if self.running:
+            self._stop_event.set()
+            self._update_status("Stop requested.")
+
+    # --------------------------- RECORDING STEPS -----------------------
+
+    def register_step(self, algo_name: str, x: np.ndarray):
+        """
+        Called from the optimizer thread at iteration boundaries.
+        Computes metrics, updates best solution, and pushes a
+        'pending step' entry for the dashboard to consume.
+        """
+        if self.problem is None:
+            return
+
+        with self._lock:
+            self.iteration += 1
+            self.placement_counter += 1
+            iteration = self.iteration
+            placement_id = self.placement_counter
+
+            metrics = self.problem.compute_metrics(x)
+
+            # Best solution tracking
+            if (
+                self.best_metrics is None
+                or metrics["objective_augmented"]
+                < self.best_metrics["objective_augmented"]
+            ):
+                self.best_x = np.array(x, dtype=float)
+                self.best_metrics = metrics
+
+            # Consolidate record
+            rec = {
+                "iteration": iteration,
+                "placement_id": placement_id,
+                "algo": algo_name,
+                "objective_pure": metrics["objective_pure"],
+                "objective_augmented": metrics["objective_augmented"],
+                "hpwl": metrics["hpwl"],
+                "bbox_aspect": metrics["bbox_aspect"],
+                "bbox_area": metrics["bbox_area"],
+                "overlap_max_ratio": metrics["overlap_max_ratio"],
+                "spacing_x_violation": metrics["spacing_x_violation"],
+                "spacing_y_violation": metrics["spacing_y_violation"],
+                "bbox_ar_violation": metrics["bbox_ar_violation"],
+                "boundary_violation": metrics["boundary_violation"],
+                # Store the whole placement vector for later reconstruction
+                "x_vector": x.tolist(),
+            }
+
+            self._history_records.append(rec)
+            # Vaex history (out-of-core) – build/extend lazily
+            try:
+                if self.history_vaex is None:
+                    self.history_vaex = vaex.from_dict(rec)
+                else:
+                    self.history_vaex = self.history_vaex.concat(
+                        vaex.from_dict(rec)
+                    )
+            except Exception:
+                # Vaex errors should not break the dashboard
+                pass
+
+            # Add record to pending buffer for periodic callback
+            self._pending_steps.append(rec)
+
+    def pop_pending_steps(self) -> List[Dict[str, Any]]:
+        """
+        Called from the dashboard's periodic callback to get all
+        new steps since last update, in a thread-safe way.
+        """
+        with self._lock:
+            steps = list(self._pending_steps)
+            self._pending_steps.clear()
+        return steps
+
+    # ----------------------- DASHBOARD UPDATE LOOP ---------------------
+
+    def periodic_update(self):
+        """
+        Periodic callback (called every ~20ms) to:
+          - stream new objective / constraint data into Bokeh sources
+          - update the canvas view
+          - update the log table
+          - refresh the "best" summary
+        """
+        steps = self.pop_pending_steps()
+        if not steps:
+            return
+
+        # Objective + constraints update
+        obj_stream = {k: [] for k in self.obj_source.data.keys()}
+        con_stream = {k: [] for k in self.constraint_source.data.keys()}
+
+        for rec in steps:
+            obj_stream["iteration"].append(rec["iteration"])
+            obj_stream["placement_id"].append(rec["placement_id"])
+            obj_stream["algo"].append(rec["algo"])
+            obj_stream["hpwl"].append(rec["hpwl"])
+            obj_stream["bbox_aspect"].append(rec["bbox_aspect"])
+            obj_stream["bbox_area"].append(rec["bbox_area"])
+            obj_stream["objective_pure"].append(rec["objective_pure"])
+            obj_stream["objective_augmented"].append(rec["objective_augmented"])
+
+            con_stream["iteration"].append(rec["iteration"])
+            con_stream["placement_id"].append(rec["placement_id"])
+            con_stream["algo"].append(rec["algo"])
+            con_stream["overlap_max_ratio"].append(rec["overlap_max_ratio"])
+            con_stream["spacing_x_violation"].append(rec["spacing_x_violation"])
+            con_stream["spacing_y_violation"].append(rec["spacing_y_violation"])
+            con_stream["bbox_ar_violation"].append(rec["bbox_ar_violation"])
+            con_stream["boundary_violation"].append(rec["boundary_violation"])
+
+        self.obj_source.stream(obj_stream, rollover=2000)
+        self.constraint_source.stream(con_stream, rollover=2000)
+
+        # Update canvas and placement label using the latest record only
+        last = steps[-1]
+        if self.problem is not None:
+            x_vec = np.array(last["x_vector"])
+            rect_shapes, bbox_shape = self.problem.make_rectangle_shapes(x_vec)
+
+            self.canvas_source.data = dict(
+                x=[r["x"] for r in rect_shapes],
+                y=[r["y"] for r in rect_shapes],
+                w=[r["w"] for r in rect_shapes],
+                h=[r["h"] for r in rect_shapes],
+                rect_id=[r["rect_id"] for r in rect_shapes],
+                placement_id=[last["placement_id"]] * len(rect_shapes),
+            )
+
+            self.bbox_source.data = dict(
+                x=[bbox_shape["x"]],
+                y=[bbox_shape["y"]],
+                w=[bbox_shape["w"]],
+                h=[bbox_shape["h"]],
+            )
+
+            self.placement_label_source.data = dict(
+                x=[bbox_shape["x"]],
+                y=[bbox_shape["y"] + bbox_shape["h"] * 0.6],
+                text=[f"Placement: {last['placement_id']}"],
+            )
+
+        # Update log table – only small columns for speed
+        df_small = pd.DataFrame(
+            [
+                {
+                    "iteration": rec["iteration"],
+                    "placement_id": rec["placement_id"],
+                    "algo": rec["algo"],
+                    "objective_augmented": rec["objective_augmented"],
+                    "hpwl": rec["hpwl"],
+                    "bbox_aspect": rec["bbox_aspect"],
+                    "bbox_area": rec["bbox_area"],
+                }
+                for rec in self._history_records
+            ]
+        )
+        self.log_table.value = df_small
+
+        # Update summary status (best metrics)
+        if self.best_metrics is not None:
+            bm = self.best_metrics
+            self.status_text.object = (
+                f"**Best Objective:** {bm['objective_augmented']:.4f}  "
+                f"(HPWL={bm['hpwl']:.2f},  "
+                f"AR={bm['bbox_aspect']:.3f}, "
+                f"Area={bm['bbox_area']:.1f})  | "
+                f"Iterations: {self.iteration}"
+            )
+
+    # ------------------------------ RUNNING OPTIMIZERS -----------------
+
+    def start_run(
+        self,
+        algorithm: str,
+        params: Dict[str, Any],
+        resume_from_best: bool = False,
+    ):
+        """
+        Entry point called from the 'Run' button on the UI.
+        Spawns a worker thread that executes the chosen optimizer.
+        """
+        if self.problem is None:
+            self._update_status("Load a JSON configuration first.")
+            return
+
+        if self.running:
+            self._update_status("Optimization already running.")
+            return
+
+        self.current_algorithm = algorithm
+        self.current_params = params
+
+        # If not resuming, reset internal state.
+        if not resume_from_best:
+            self._reset_state()
+            x0 = self.problem.initial_vector()
+        else:
+            with self._lock:
+                if self.best_x is None:
+                    x0 = self.problem.initial_vector()
+                else:
+                    x0 = np.array(self.best_x, dtype=float)
+
+        self._pause_event.clear()
+        self._stop_event.clear()
+        self.running = True
+
+        # Create and start the worker thread
+        worker = threading.Thread(
+            target=self._run_optimizer_worker,
+            args=(algorithm, params, x0),
+            daemon=True,
+        )
+        self.thread = worker
+        worker.start()
+        self._update_status(f"Optimization started with '{algorithm}'.")
+
+    def _check_pause_and_stop(self) -> bool:
+        """
+        To be called inside optimizer callbacks / loops.
+        Handles pause (blocking) and stop (return True to abort).
+        """
+        # Pause: block until pause_event is cleared
+        while self._pause_event.is_set():
+            time.sleep(0.05)
+        # Stop: if set, request termination
+        if self._stop_event.is_set():
+            return True
+        return False
+
+    def _run_optimizer_worker(
+        self,
+        algorithm: str,
+        params: Dict[str, Any],
+        x0: np.ndarray,
+    ):
+        """
+        The actual optimizer runner executed inside a worker thread.
+        Uses existing optimization APIs wherever possible.
+        """
+        try:
+            if algorithm == "Differential Evolution":
+                self._run_differential_evolution(params)
+            elif algorithm == "Dual Annealing (Simulated Annealing)":
+                self._run_dual_annealing(params, x0)
+            elif algorithm == "Basin Hopping (Simulated Annealing)":
+                self._run_basinhopping(params, x0)
+            elif algorithm in {
+                "Nelder-Mead",
+                "Powell",
+                "CG",
+                "L-BFGS-B",
+                "SLSQP",
+                "Trust-Constr (Quadratic Programming-like)",
+            }:
+                self._run_scipy_minimize(algorithm, params, x0)
+            elif algorithm == "Adam (PyTorch)":
+                self._run_adam_torch(params, x0)
+            elif algorithm == "Genetic Algorithm (pygad)":
+                self._run_genetic_pygad(params)
+            else:
+                self._update_status(
+                    f"Unknown algorithm '{algorithm}'. Nothing was run."
+                )
+        except Exception as e:
+            self._update_status(f"Error in optimizer: {e}")
+        finally:
+            self.running = False
+            if self._stop_event.is_set():
+                self._update_status("Optimization stopped.")
+            elif self._pause_event.is_set():
+                self._update_status("Optimization paused at iteration boundary.")
+            else:
+                self._update_status("Optimization finished.")
+
+    # ------------------- SPECIFIC OPTIMIZER RUNNERS --------------------
+
+    def _objective_augmented(self, x: np.ndarray) -> float:
+        """Small helper for SciPy-based optimizers."""
+        metrics = self.problem.compute_metrics(x)
+        return metrics["objective_augmented"]
+
+    # Differential Evolution (global, population-based)
+    def _run_differential_evolution(self, params: Dict[str, Any]):
+        bounds = self.problem.bounds()
+        algo_name = "Differential Evolution"
+
+        maxiter = int(params.get("maxiter", 80))
+        popsize = int(params.get("popsize", 15))
+        seed = int(params.get("seed", 42))
+        workers = int(params.get("workers", os.cpu_count() or 1))
+
+        def callback(xk, convergence):
+            # Register new step and handle pause/stop.
+            self.register_step(algo_name, np.array(xk, dtype=float))
+            return self._check_pause_and_stop()
+
+        differential_evolution(
+            self._objective_augmented,
+            bounds=bounds,
+            maxiter=maxiter,
+            popsize=popsize,
+            seed=seed,
+            workers=workers,     # internal parallelism
+            updating="deferred",  # suitable with workers
+            callback=callback,
+        )
+
+    # Dual Annealing (Simulated Annealing variant)
+    def _run_dual_annealing(self, params: Dict[str, Any], x0: np.ndarray):
+        bounds = self.problem.bounds()
+        algo_name = "Dual Annealing (Simulated Annealing)"
+
+        maxiter = int(params.get("maxiter", 200))
+        initial_temp = float(params.get("initial_temp", 5230.0))
+        seed = int(params.get("seed", 42))
+
+        def callback(x, f, context):
+            # context flags different phases; we ignore for now
+            self.register_step(algo_name, np.array(x, dtype=float))
+            return self._check_pause_and_stop()
+
+        dual_annealing(
+            self._objective_augmented,
+            bounds=bounds,
+            maxiter=maxiter,
+            initial_temp=initial_temp,
+            seed=seed,
+            callback=callback,
+        )
+
+    # Basin Hopping (Simulated Annealing style)
+    def _run_basinhopping(self, params: Dict[str, Any], x0: np.ndarray):
+        algo_name = "Basin Hopping (Simulated Annealing)"
+
+        niter = int(params.get("niter", 50))
+        stepsize = float(params.get("stepsize", 10.0))
+
+        # Local minimizer configuration for each basin step
+        minimizer_kwargs = {
+            "method": "L-BFGS-B",
+            "bounds": self.problem.bounds(),
+        }
+
+        def local_fun(x):
+            return self._objective_augmented(x)
+
+        def callback(x, f, accept):
+            self.register_step(algo_name, np.array(x, dtype=float))
+            return self._check_pause_and_stop()
+
+        basinhopping(
+            local_fun,
+            x0,
+            niter=niter,
+            stepsize=stepsize,
+            minimizer_kwargs=minimizer_kwargs,
+            callback=callback,
+        )
+
+    # SciPy minimize family (Nelder-Mead, Powell, CG, L-BFGS-B, SLSQP, Trust-Constr)
+    def _run_scipy_minimize(
+        self,
+        algorithm: str,
+        params: Dict[str, Any],
+        x0: np.ndarray,
+    ):
+        bounds = self.problem.bounds()
+
+        # Map from label to SciPy method
+        method_map = {
+            "Nelder-Mead": "Nelder-Mead",
+            "Powell": "Powell",
+            "CG": "CG",
+            "L-BFGS-B": "L-BFGS-B",
+            "SLSQP": "SLSQP",
+            "Trust-Constr (Quadratic Programming-like)": "trust-constr",
+        }
+        method = method_map[algorithm]
+        algo_name = algorithm
+
+        maxiter = int(params.get("maxiter", 200))
+
+        options = {"maxiter": maxiter}
+
+        def callback(xk):
+            self.register_step(algo_name, np.array(xk, dtype=float))
+            return self._check_pause_and_stop()
+
+        minimize(
+            self._objective_augmented,
+            x0,
+            method=method,
+            bounds=bounds if method != "trust-constr" else None,
+            callback=callback,
+            options=options,
+        )
+
+    # Adam optimizer via PyTorch (gradient-based)
+    def _run_adam_torch(self, params: Dict[str, Any], x0: np.ndarray):
+        if torch is None:
+            self._update_status(
+                "PyTorch not installed; Adam optimizer is unavailable."
+            )
+            return
+
+        algo_name = "Adam (PyTorch)"
+        lr = float(params.get("lr", 0.01))
+        maxiter = int(params.get("maxiter", 200))
+
+        # Create torch parameter
+        x_t = torch.tensor(x0, dtype=torch.float32, requires_grad=True)
+        optimizer = torch.optim.Adam([x_t], lr=lr)
+
+        for it in range(1, maxiter + 1):
+            if self._check_pause_and_stop():
+                break
+
+            optimizer.zero_grad()
+            x_np = x_t.detach().cpu().numpy()
+            # Objective computed in NumPy, then turned into torch scalar
+            metrics = self.problem.compute_metrics(x_np)
+            loss_value = metrics["objective_augmented"]
+            loss = torch.tensor(loss_value, dtype=torch.float32)
+            loss.backward()
+            optimizer.step()
+
+            # Clamp to bounds to keep rectangles inside canvas
+            bnds = self.problem.bounds()
+            with torch.no_grad():
+                for idx, (lo, hi) in enumerate(bnds):
+                    x_t[idx].clamp_(float(lo), float(hi))
+
+            self.register_step(algo_name, x_t.detach().cpu().numpy())
+
+    # Genetic Algorithm via pygad
+    def _run_genetic_pygad(self, params: Dict[str, Any]):
+        if pygad is None:
+            self._update_status(
+                "pygad not installed; Genetic Algorithm is unavailable."
+            )
+            return
+
+        algo_name = "Genetic Algorithm (pygad)"
+
+        num_genes = self.problem.num_variables()
+        bnds = self.problem.bounds()
+        gene_space = [{"low": lo, "high": hi} for (lo, hi) in bnds]
+
+        num_generations = int(params.get("num_generations", 80))
+        sol_per_pop = int(params.get("sol_per_pop", 20))
+        num_parents_mating = int(params.get("num_parents_mating", 10))
+        parent_selection_type = params.get("parent_selection_type", "sss")
+        mutation_percent_genes = int(params.get("mutation_percent_genes", 10))
+
+        # We want to MINIMIZE, but pygad MAXIMIZES fitness by default.
+        # So we define fitness = -objective_augmented.
+        def fitness_func(ga_instance, solution, solution_idx):
+            x = np.array(solution, dtype=float)
+            return -self._objective_augmented(x)
+
+        def on_generation(ga_instance):
+            # Called at the end of each generation – good place to log a step.
+            best_solution, best_fitness, _ = ga_instance.best_solution()
+            x = np.array(best_solution, dtype=float)
+            self.register_step(algo_name, x)
+            return self._check_pause_and_stop()
+
+        ga = pygad.GA(
+            num_generations=num_generations,
+            num_parents_mating=num_parents_mating,
+            fitness_func=fitness_func,
+            sol_per_pop=sol_per_pop,
+            num_genes=num_genes,
+            gene_space=gene_space,
+            parent_selection_type=parent_selection_type,
+            mutation_percent_genes=mutation_percent_genes,
+            on_generation=on_generation,
+        )
+
+        ga.run()
+
+
+# ---------------------------------------------------------------------
+# DASHBOARD CONSTRUCTION
+# ---------------------------------------------------------------------
+
+manager = OptimizationManager()
+
+# ------------------------------ Widgets (Inputs) ----------------------
+
+# JSON configuration file input
+config_file_input = pn.widgets.FileInput(
+    name="Upload Configuration JSON",
+    accept=".json",
+    multiple=False,
+    width=400,
+)
+
+load_config_button = pn.widgets.Button(
+    name="Load Config from JSON",
+    button_type="primary",
+    width=250,
+)
+
+# Optimizer selection (single choice, but a rich set)
+optimizer_options = [
+    "Differential Evolution",
+    "Dual Annealing (Simulated Annealing)",
+    "Basin Hopping (Simulated Annealing)",
+    "Nelder-Mead",
+    "Powell",
+    "CG",
+    "L-BFGS-B",
+    "SLSQP",
+    "Trust-Constr (Quadratic Programming-like)",
+    "Adam (PyTorch)",
+    "Genetic Algorithm (pygad)",
+]
+
+optimizer_select = pn.widgets.RadioButtonGroup(
+    name="Optimizer",
+    options=optimizer_options,
+    button_type="success",
+    inline=False,
+)
+
+# Optimizer parameters as JSON text for full flexibility
+optimizer_params_input = pn.widgets.TextAreaInput(
+    name="Optimizer Parameters (JSON dict)",
+    placeholder=(
+        '{\n  "maxiter": 100,\n  "popsize": 20,\n  "seed": 42\n}'
+        "   # Example; varies with algorithm\n"
+    ),
+    sizing_mode="stretch_width",
+    height=150,
+)
+
+# Run behavior options
+resume_checkbox = pn.widgets.Checkbox(
+    name="Resume from current best placement (if available)",
+    value=False,
+)
+
+# Buttons to control optimization
+run_button = pn.widgets.Button(
+    name="Run Optimization",
+    button_type="primary",
+    width=180,
+)
+
+pause_button = pn.widgets.Button(
+    name="Pause",
+    button_type="warning",
+    width=120,
+)
+
+continue_button = pn.widgets.Button(
+    name="Continue",
+    button_type="success",
+    width=120,
+)
+
+stop_button = pn.widgets.Button(
+    name="Stop & Save Current State",
+    button_type="danger",
+    width=220,
+)
+
+# Save/Load state
+state_filename_input = pn.widgets.TextInput(
+    name="State File Path",
+    value="optimizer_state.json",
+    sizing_mode="stretch_width",
+)
+
+save_state_button = pn.widgets.Button(
+    name="Save State Now",
+    button_type="primary",
+    width=150,
+)
+
+load_state_button = pn.widgets.Button(
+    name="Load State",
+    button_type="default",
+    width=150,
+)
+
+# Save HTML dashboard
+html_filename_input = pn.widgets.TextInput(
+    name="Export Dashboard HTML Filename",
+    value="placement_dashboard.html",
+    sizing_mode="stretch_width",
+)
+
+save_html_button = pn.widgets.Button(
+    name="Save Dashboard as HTML",
+    button_type="primary",
+    width=220,
+)
+
+# Some additional toggles/sliders to show broader UI elements
+show_constraints_checkbox = pn.widgets.Checkbox(
+    name="Show Constraint Plots",
+    value=True,
+)
+
+refresh_interval_slider = pn.widgets.IntSlider(
+    name="Dashboard Refresh Interval [ms]",
+    start=10,
+    end=100,
+    step=5,
+    value=20,
+)
+
+
+# ------------------------- Widget Callbacks ---------------------------
+
+def _parse_optimizer_params() -> Dict[str, Any]:
+    """
+    Parse the JSON dict typed into the optimizer_params_input box.
+    If parsing fails, return an empty dict and update status.
+    """
+    text = optimizer_params_input.value.strip()
+    if not text:
+        return {}
+
+    try:
+        params = json.loads(text)
+        if not isinstance(params, dict):
+            raise ValueError("Optimizer parameters must be a JSON object (dict).")
+        return params
+    except Exception as e:
+        manager._update_status(f"Error parsing optimizer parameters: {e}")
+        return {}
+
+
+def on_load_config_click(event):
+    """Load configuration from the uploaded JSON file."""
+    if not config_file_input.value:
+        manager._update_status("Please upload a JSON configuration file first.")
+        return
+
+    try:
+        raw = config_file_input.value
+        if isinstance(raw, bytes):
+            json_str = raw.decode("utf-8")
+        else:
+            json_str = str(raw)
+        manager.load_config_from_json_str(json_str)
+    except Exception as e:
+        manager._update_status(f"Failed to load JSON: {e}")
+
+
+def on_run_click(event):
+    """Start optimization with selected algorithm and parameters."""
+    algo = optimizer_select.value
+    params = _parse_optimizer_params()
+    resume = bool(resume_checkbox.value)
+    manager.start_run(algo, params, resume_from_best=resume)
+
+
+def on_pause_click(event):
+    manager.pause()
+
+
+def on_continue_click(event):
+    manager.resume()
+
+
+def on_stop_click(event):
+    """
+    Stop optimization and immediately save state using the filename
+    provided.
+    """
+    manager.stop()
+    # Give the optimizer a moment to react to stop
+    time.sleep(0.2)
+    if state_filename_input.value:
+        manager.save_state_to_file(state_filename_input.value)
+
+
+def on_save_state_click(event):
+    if state_filename_input.value:
+        manager.save_state_to_file(state_filename_input.value)
+
+
+def on_load_state_click(event):
+    if state_filename_input.value:
+        manager.load_state_from_file(state_filename_input.value)
+
+
+def on_save_html_click(event):
+    """
+    Save the full dashboard (all tabs) as a static HTML file.
+    """
+    filename = html_filename_input.value or "placement_dashboard.html"
+    # 'dashboard' will be defined later once the layout is built.
+    try:
+        pn.io.save(dashboard, filename)
+        manager._update_status(f"Dashboard saved as HTML: {filename}")
+    except Exception as e:
+        manager._update_status(f"Failed to save dashboard HTML: {e}")
+
+
+# Wire callbacks
+load_config_button.on_click(on_load_config_click)
+run_button.on_click(on_run_click)
+pause_button.on_click(on_pause_click)
+continue_button.on_click(on_continue_click)
+stop_button.on_click(on_stop_click)
+save_state_button.on_click(on_save_state_click)
+load_state_button.on_click(on_load_state_click)
+save_html_button.on_click(on_save_html_click)
+
+
+# ---------------------- BOKEH FIGURES (PLOTS) -------------------------
+
+def make_objective_fig():
+    """
+    Create the objective plot with separate lines for each term and the
+    total objective.
+    """
+    fig = figure(
+        height=300,
+        width=700,
+        title="Objective Terms vs Iteration",
+        x_axis_label="Iteration",
+        y_axis_label="Value",
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
+        toolbar_location="right",
+    )
+    fig.grid.grid_line_color = COLORS["grid"]
+    fig.axis.axis_label_text_color = COLORS["text"]
+    fig.axis.major_label_text_color = COLORS["text"]
+    fig.title.text_color = COLORS["primary"]
+
+    # HPWL
+    fig.line(
+        "iteration",
+        "hpwl",
+        source=manager.obj_source,
+        legend_label="HPWL",
+        line_width=2,
+        alpha=0.8,
+    )
+    # BBox Aspect
+    fig.line(
+        "iteration",
+        "bbox_aspect",
+        source=manager.obj_source,
+        legend_label="BBox Aspect",
+        line_width=2,
+        line_dash="dashed",
+        alpha=0.8,
+    )
+    # BBox Area
+    fig.line(
+        "iteration",
+        "bbox_area",
+        source=manager.obj_source,
+        legend_label="BBox Area",
+        line_width=2,
+        line_dash="dotdash",
+        alpha=0.8,
+    )
+    # Augmented Objective
+    fig.line(
+        "iteration",
+        "objective_augmented",
+        source=manager.obj_source,
+        legend_label="Augmented Objective",
+        line_width=3,
+        line_dash="solid",
+        alpha=0.9,
+    )
+
+    fig.legend.location = "top_right"
+    fig.legend.click_policy = "hide"
+    fig.add_tools(
+        HoverTool(
+            tooltips=[
+                ("Iter", "@iteration"),
+                ("Placement", "@placement_id"),
+                ("Algo", "@algo"),
+                ("HPWL", "@hpwl{0.00}"),
+                ("AR", "@bbox_aspect{0.00}"),
+                ("Area", "@bbox_area{0.00}"),
+                ("Obj", "@objective_augmented{0.00}"),
+            ]
+        )
+    )
+    return fig
+
+
+def make_constraint_fig():
+    """
+    Create the constraint violation plots for each constraint term.
+    """
+    fig = figure(
+        height=300,
+        width=700,
+        title="Constraint Terms vs Iteration",
+        x_axis_label="Iteration",
+        y_axis_label="Violation",
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
+        toolbar_location="right",
+    )
+    fig.grid.grid_line_color = COLORS["grid"]
+    fig.axis.axis_label_text_color = COLORS["text"]
+    fig.axis.major_label_text_color = COLORS["text"]
+    fig.title.text_color = COLORS["secondary"]
+
+    fig.line(
+        "iteration",
+        "overlap_max_ratio",
+        source=manager.constraint_source,
+        legend_label="Max Overlap Ratio",
+        line_width=2,
+        alpha=0.8,
+    )
+    fig.line(
+        "iteration",
+        "spacing_x_violation",
+        source=manager.constraint_source,
+        legend_label="Spacing X Violation",
+        line_width=2,
+        line_dash="dashed",
+        alpha=0.8,
+    )
+    fig.line(
+        "iteration",
+        "spacing_y_violation",
+        source=manager.constraint_source,
+        legend_label="Spacing Y Violation",
+        line_width=2,
+        line_dash="dotdash",
+        alpha=0.8,
+    )
+    fig.line(
+        "iteration",
+        "bbox_ar_violation",
+        source=manager.constraint_source,
+        legend_label="BBox Aspect Violation",
+        line_width=2,
+        line_dash="dotted",
+        alpha=0.8,
+    )
+    fig.line(
+        "iteration",
+        "boundary_violation",
+        source=manager.constraint_source,
+        legend_label="Boundary Violation",
+        line_width=2,
+        line_dash="dashdot",
+        alpha=0.8,
+    )
+
+    fig.legend.location = "top_right"
+    fig.legend.click_policy = "hide"
+    fig.add_tools(
+        HoverTool(
+            tooltips=[
+                ("Iter", "@iteration"),
+                ("Placement", "@placement_id"),
+                ("Algo", "@algo"),
+                ("Overlap", "@overlap_max_ratio{0.000}"),
+                ("dx_violation", "@spacing_x_violation{0.000}"),
+                ("dy_violation", "@spacing_y_violation{0.000}"),
+                ("AR_viol", "@bbox_ar_violation{0.000}"),
+                ("Boundary", "@boundary_violation{0.000}"),
+            ]
+        )
+    )
+    return fig
+
+
+def make_canvas_fig():
+    """
+    Create the canvas view figure with rectangles and bounding box.
+    """
+    fig = figure(
+        height=550,
+        width=850,
+        title="Canvas View: Rectangle Placement",
+        match_aspect=True,
+        tools="pan,wheel_zoom,reset",
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
+        toolbar_location="right",
+    )
+    fig.grid.grid_line_color = COLORS["grid"]
+    fig.title.text_color = COLORS["primary"]
+
+    # Rectangle glyphs (fill with low opacity)
+    fig.rect(
+        x="x",
+        y="y",
+        width="w",
+        height="h",
+        source=manager.canvas_source,
+        fill_alpha=0.25,
+        line_alpha=0.9,
+        fill_color=COLORS["rect_fill"],
+        line_color=COLORS["rect_line"],
+    )
+
+    # Bounding box (dotted line, transparent fill)
+    fig.rect(
+        x="x",
+        y="y",
+        width="w",
+        height="h",
+        source=manager.bbox_source,
+        fill_alpha=0.0,
+        line_alpha=0.7,
+        line_dash="dashed",
+        line_width=2,
+        line_color=COLORS["bbox_line"],
+    )
+
+    # Placement label
+    fig.text(
+        x="x",
+        y="y",
+        text="text",
+        source=manager.placement_label_source,
+        text_color=COLORS["accent"],
+        text_font_size="12pt",
+    )
+
+    fig.add_tools(
+        HoverTool(
+            tooltips=[
+                ("Rect", "@rect_id"),
+                ("x", "@x{0.0}"),
+                ("y", "@y{0.0}"),
+                ("w", "@w{0.0}"),
+                ("h", "@h{0.0}"),
+                ("Placement", "@placement_id"),
+            ]
+        )
+    )
+
+    return fig
+
+
+objective_fig = make_objective_fig()
+constraint_fig = make_constraint_fig()
+canvas_fig = make_canvas_fig()
+
+# -------------------------- LAYOUT (TABS) -----------------------------
+
+# TAB 1: Inputs & Controls (ALL INPUTS LIVE HERE)
+controls_layout = pn.Column(
+    pn.pane.Markdown(
+        "## Rectangle Placement Dashboard\n"
+        "All inputs live on this tab. Upload configuration, choose optimizer, "
+        "tune parameters, and control the optimization run.",
+        style={"color": COLORS["primary"]},
+    ),
+    pn.layout.Divider(),
+    pn.Row(
+        pn.Column(
+            config_file_input,
+            load_config_button,
+            background=COLORS["panel_bg"],
+            margin=(5, 5, 5, 5),
+        ),
+        sizing_mode="stretch_width",
+    ),
+    pn.layout.Divider(),
+    pn.Row(
+        pn.Column(
+            pn.pane.Markdown("### Optimizer Selection", style={"color": COLORS["text"]}),
+            optimizer_select,
+            resume_checkbox,
+            background=COLORS["panel_bg"],
+            margin=(5, 5, 5, 5),
+        ),
+        pn.Spacer(width=20),
+        pn.Column(
+            pn.pane.Markdown(
+                "### Optimizer Parameters\n"
+                "Provide a JSON dict of algorithm-specific parameters.",
+                style={"color": COLORS["text"]},
+            ),
+            optimizer_params_input,
+            background=COLORS["panel_bg"],
+            margin=(5, 5, 5, 5),
+        ),
+        sizing_mode="stretch_width",
+    ),
+    pn.layout.Divider(),
+    pn.Row(
+        run_button,
+        pause_button,
+        continue_button,
+        stop_button,
+        sizing_mode="stretch_width",
+        margin=(5, 5, 5, 5),
+    ),
+    pn.Row(
+        pn.Column(
+            pn.pane.Markdown("### Save / Load State", style={"color": COLORS["text"]}),
+            state_filename_input,
+            pn.Row(save_state_button, load_state_button),
+            background=COLORS["panel_bg"],
+            margin=(5, 5, 5, 5),
+        ),
+        pn.Spacer(width=20),
+        pn.Column(
+            pn.pane.Markdown("### Dashboard Export", style={"color": COLORS["text"]}),
+            html_filename_input,
+            save_html_button,
+            background=COLORS["panel_bg"],
+            margin=(5, 5, 5, 5),
+        ),
+        sizing_mode="stretch_width",
+    ),
+    pn.Row(
+        pn.Column(
+            pn.pane.Markdown("### Additional Settings", style={"color": COLORS["text"]}),
+            show_constraints_checkbox,
+            refresh_interval_slider,
+            background=COLORS["panel_bg"],
+            margin=(5, 5, 5, 5),
+        ),
+        sizing_mode="stretch_width",
+    ),
+    pn.layout.Divider(),
+    pn.Column(
+        pn.pane.Markdown("### Optimization Status", style={"color": COLORS["text"]}),
+        manager.status_text,
+        background=COLORS["panel_bg"],
+        margin=(5, 5, 5, 5),
+    ),
+    sizing_mode="stretch_width",
+)
+
+# TAB 2: Canvas View
+canvas_tab = pn.Column(
+    pn.pane.Markdown(
+        "## Canvas View\n"
+        "Current placement of rectangles and enclosing bounding box.",
+        style={"color": COLORS["primary"]},
+    ),
+    pn.layout.Divider(),
+    canvas_fig,
+    sizing_mode="stretch_both",
+    margin=(0, 5, 5, 5),
+)
+
+# TAB 3: Objective Plots
+objective_tab = pn.Column(
+    pn.pane.Markdown(
+        "## Objective Evolution\n"
+        "Live evolution of each term in the objective function and the combined augmented objective.",
+        style={"color": COLORS["primary"]},
+    ),
+    pn.layout.Divider(),
+    objective_fig,
+    sizing_mode="stretch_both",
+    margin=(0, 5, 5, 5),
+)
+
+# TAB 4: Constraint Plots
+constraint_tab = pn.Column(
+    pn.pane.Markdown(
+        "## Constraint Evolution\n"
+        "Live evolution of each constraint term (overlap, spacing, aspect ratio, boundary).",
+        style={"color": COLORS["primary"]},
+    ),
+    pn.layout.Divider(),
+    constraint_fig,
+    sizing_mode="stretch_both",
+    margin=(0, 5, 5, 5),
+)
+
+# TAB 5: Logs
+logs_tab = pn.Column(
+    pn.pane.Markdown(
+        "## Placement Log\n"
+        "For each recorded placement, see iteration, placement ID, algorithm, and objective breakdown.",
+        style={"color": COLORS["primary"]},
+    ),
+    pn.layout.Divider(),
+    manager.log_table,
+    sizing_mode="stretch_both",
+    margin=(0, 5, 5, 5),
+)
+
+# Collect tabs in intuitive order
+dashboard = pn.Tabs(
+    ("1. Controls & Overview", controls_layout),
+    ("2. Canvas View", canvas_tab),
+    ("3. Objective Plots", objective_tab),
+    ("4. Constraint Plots", constraint_tab),
+    ("5. Logs", logs_tab),
+)
+
+# ---------------------------------------------------------------------
+# PERIODIC CALLBACK FOR LIVE UPDATES
+# ---------------------------------------------------------------------
+
+# Start a periodic callback to refresh the Bokeh sources every 20ms
+# (or user-defined value via slider). This ensures sub-20ms-ish
+# dashboard refresh intervals when possible.
+callback = pn.state.add_periodic_callback(
+    manager.periodic_update,
+    period=refresh_interval_slider.value,
+    start=True,
+)
+
+
+def _on_refresh_interval_change(event):
+    """
+    When the slider changes, update the periodic callback period.
+    """
+    callback.period = refresh_interval_slider.value
+
+
+refresh_interval_slider.param.watch(_on_refresh_interval_change, "value")
+
+# ---------------------------------------------------------------------
+# SERVE THE DASHBOARD
+# ---------------------------------------------------------------------
+
+# Ensure the dashboard is "servable" when run via `panel serve`
+dashboard.servable("Rectangle Placement Dashboard")
