@@ -1,103 +1,63 @@
 """
-placement_dashboard.py
+PLACEMENT DASHBOARD (RUN WITH: python placement_dashboard.py)
 
-Rectangle placement optimization dashboard with:
+This script creates a multi-tab dashboard for:
+1. Optimizing rectangle placements on a canvas under constraints.
+2. Interactively creating a config file (rectangles + canvas) in the
+   "Input Placement" tab.
+3. Viewing logs of optimization runs.
 
-- Config-driven rectangle placement problem.
-- Multiple optimizers (SciPy, Differential Evolution, GA via pygad, Adam via PyTorch or pure NumPy).
-- Live canvas view + objective/constraint plots.
-- State save/load, automatic optimized-config writing.
-- Extra "Input Placement" tab for interactively building config files.
+The dashboard is served via Panel/Bokeh and opens a browser automatically.
 
-RUN AS:
-    python placement_dashboard.py
+======================================================================
+UI CONFIGURATION (ALL TUNABLES HERE)
+======================================================================
+The following constants control fonts, colors, dimensions and sizing
+fractions. They are used consistently throughout the app.
 
-This will start a Panel server and open your browser automatically.
+- All main section sizes are expressed as fractions of the viewport size
+  (via CSS using vw/vh OR via dynamic resizing using viewport info).
+
+You can adjust these values to tweak the look & feel.
 """
 
-# =====================================================================
-# UI CONFIGURATION (ALL DASHBOARD UI CONTROLS ARE HERE)
-# =====================================================================
+# --------------------------- UI CONFIG -------------------------------
 
-# Base "virtual" screen size used for layouts (in pixels).
-# Panel/Bokeh use absolute pixel sizes; these are scaled fractions of this base.
-SCREEN_WIDTH = 1200
-SCREEN_HEIGHT = 720  # keep small enough to avoid vertical scroll on typical screens
+# Fonts & Colors
+UI_FONT_FAMILY = "NK57 Monospace Condensed Thin, Roboto Mono, monospace"
+UI_TEXT_COLOR = "#FFFFFF"
+UI_BG_COLOR = "#050816"
+UI_PANEL_BG_COLOR = "#0b1020"
+UI_ACCENT_COLOR_PRIMARY = "#FFB300"
+UI_ACCENT_COLOR_SECONDARY = "#29B6F6"
+UI_ACCENT_COLOR_TERTIARY = "#AB47BC"
+UI_GRID_COLOR = "#263238"
 
-# Fractions for main tab layout (first tab)
-PARAM_WIDTH_FRAC = 1 / 3           # left "Parameters" section
-LIVE_WIDTH_FRAC = 2 / 3           # right "Live updates" section
+# Parameter panel sizing (first tab left side)
+PARAM_SECTION_WIDTH_FRACTION = 0.33  # ~1/3 of screen width
+LIVE_SECTION_WIDTH_FRACTION = 0.67   # ~2/3 of screen width
+PARAM_PANEL_FONT_SIZE = "9pt"        # small font for dense controls
 
-PARAM_WIDTH = int(SCREEN_WIDTH * PARAM_WIDTH_FRAC)
-PARAM_HEIGHT = SCREEN_HEIGHT
+# Input Placement tab parameter panel fractions
+INPUT_PARAM_SECTION_WIDTH_FRACTION = 0.25  # 1/4 of screen
+INPUT_CANVAS_SECTION_WIDTH_FRACTION = 0.75 # 3/4 of screen
 
-LIVE_WIDTH = int(SCREEN_WIDTH * LIVE_WIDTH_FRAC)
-LIVE_HEIGHT = SCREEN_HEIGHT
+# Graph height fractions (relative to viewport height)
+CANVAS_VIEW_HEIGHT_FRACTION = 0.5   # upper half of live section
+OBJ_GRAPH_HEIGHT_FRACTION = 0.25    # lower-left quarter
+CON_GRAPH_HEIGHT_FRACTION = 0.25    # lower-right quarter
 
-# Live Updates split (within LIVE section)
-LIVE_CANVAS_HEIGHT_FRAC = 0.5     # top half for canvas
-LIVE_LOWER_HEIGHT_FRAC = 0.5      # bottom half for objectives/constraints
+# Default viewport (used before we know real size)
+DEFAULT_VIEWPORT_WIDTH = 1400
+DEFAULT_VIEWPORT_HEIGHT = 800
 
-LIVE_CANVAS_HEIGHT = int(LIVE_HEIGHT * LIVE_CANVAS_HEIGHT_FRAC)
-LIVE_LOWER_HEIGHT = int(LIVE_HEIGHT * LIVE_LOWER_HEIGHT_FRAC)
-
-OBJECTIVE_WIDTH = int(LIVE_WIDTH * 0.5)
-CONSTRAINT_WIDTH = int(LIVE_WIDTH * 0.5)
-OBJECTIVE_HEIGHT = int(LIVE_LOWER_HEIGHT)
-CONSTRAINT_HEIGHT = int(LIVE_LOWER_HEIGHT)
-
-# Second tab ("Logs") sizing
-LOGS_TAB_WIDTH = SCREEN_WIDTH
-LOGS_TAB_HEIGHT = SCREEN_HEIGHT
-
-# Third tab ("Input Placement") layout fractions
-INPUT_PARAM_WIDTH_FRAC = 1 / 4
-INPUT_CANVAS_WIDTH_FRAC = 3 / 4
-
-INPUT_PARAM_WIDTH = int(SCREEN_WIDTH * INPUT_PARAM_WIDTH_FRAC)
-INPUT_PARAM_HEIGHT = SCREEN_HEIGHT
-
-INPUT_CANVAS_WIDTH = int(SCREEN_WIDTH * INPUT_CANVAS_WIDTH_FRAC)
-INPUT_CANVAS_HEIGHT = SCREEN_HEIGHT
-
-# Fonts, colors, basic style
-FONT_FAMILY = '"NK57 Monospace Condensed Thin","Roboto Mono",monospace'
-PARAM_FONT_SIZE = "9pt"           # small text in left parameter panel
-LIVE_FONT_SIZE = "10pt"           # slightly larger in right panel/plots
-BUTTON_FONT_SIZE = "9pt"
-
-COLOR_BG = "#050816"
-COLOR_PANEL_BG = "#0b1020"
-COLOR_TEXT = "#ECEFF1"
-COLOR_MUTED = "#546E7A"
-COLOR_PRIMARY = "#FFB300"
-COLOR_SECONDARY = "#29B6F6"
-COLOR_ACCENT = "#AB47BC"
-COLOR_GRID = "#263238"
-
-COLOR_RECT_FILL = "#29B6F6"
-COLOR_RECT_LINE = "#ECEFF1"
-COLOR_BBOX_LINE = "#FF7043"
-
-# Widget sizes (height in px, widths as fraction of parameter section)
-WIDGET_HEIGHT = 24
-BUTTON_HEIGHT = 26
-PARAM_ROW_HEIGHT = 30  # approximate per-row height to keep 9 rows within panel
-
-PARAM_WIDGET_WIDTH_SMALL = int(PARAM_WIDTH * 0.3)
-PARAM_WIDGET_WIDTH_MED = int(PARAM_WIDTH * 0.45)
-PARAM_WIDGET_WIDTH_LARGE = int(PARAM_WIDTH * 0.6)
-
-# Plot borders to reduce empty space
-PLOT_MIN_BORDER = 5
-
-# Legend styling (approximate "small" and 40% transparent)
+# Legend appearance
 LEGEND_FONT_SIZE = "7pt"
-LEGEND_BG_ALPHA = 0.4
+LEGEND_BACKGROUND_ALPHA = 0.4
 
-# =====================================================================
+# --------------------------------------------------------------------
 # IMPORTS
-# =====================================================================
+# --------------------------------------------------------------------
 
 import json
 import math
@@ -114,9 +74,9 @@ from bokeh.models import (
     ColumnDataSource,
     HoverTool,
     BoxEditTool,
-    TapTool,
 )
 from bokeh.plotting import figure
+import pandas as pd
 
 from scipy.optimize import (
     minimize,
@@ -125,64 +85,125 @@ from scipy.optimize import (
     basinhopping,
 )
 
-# Optional libraries
 try:
-    import vaex  # for large log handling
+    import torch
 except Exception:
-    vaex = None
+    torch = None  # PyTorch optional
 
-try:
-    import pygad  # for Genetic Algorithm
-except Exception:
-    pygad = None
+# --------------------------------------------------------------------
+# PANEL EXTENSION & GLOBAL CSS
+# --------------------------------------------------------------------
 
-try:
-    import torch  # for Adam optimizer
-except Exception:
-    torch = None
-
-# =====================================================================
-# PANEL SETUP & GLOBAL CSS
-# =====================================================================
-
-DASHBOARD_CSS = rf"""
+# Use custom CSS to:
+#  - Set fonts & colors
+#  - Fix section layout as fractions of viewport (vw/vh)
+#  - Set non-scrollable top-level tabs (except internal scroll in logs)
+DASHBOARD_CSS = fr"""
 html, body {{
   margin: 0;
   padding: 0;
-  background-color: {COLOR_BG};
-  color: {COLOR_TEXT};
-  font-family: {FONT_FAMILY};
+  background-color: {UI_BG_COLOR};
+  color: {UI_TEXT_COLOR};
+  font-family: {UI_FONT_FAMILY};
+  overflow: hidden;  /* Avoid global page scroll */
 }}
 
 .bk {{
-  font-family: {FONT_FAMILY};
+  font-family: {UI_FONT_FAMILY};
 }}
 
-.parameters-panel {{
-  font-size: {PARAM_FONT_SIZE};
-  color: {COLOR_TEXT};
+.parameters-section {{
+  float: left;
+  width: {PARAM_SECTION_WIDTH_FRACTION*100:.1f}vw;
+  height: 100vh;
+  overflow: hidden;
+  padding: 4px;
+  box-sizing: border-box;
+  background-color: {UI_PANEL_BG_COLOR};
+  color: {UI_TEXT_COLOR};
+  font-size: {PARAM_PANEL_FONT_SIZE};
 }}
 
-.live-panel {{
-  font-size: {LIVE_FONT_SIZE};
-  color: {COLOR_TEXT};
+.live-section {{
+  float: right;
+  width: {LIVE_SECTION_WIDTH_FRACTION*100:.1f}vw;
+  height: 100vh;
+  overflow: hidden;
+  padding: 4px;
+  box-sizing: border-box;
+  background-color: {UI_BG_COLOR};
 }}
 
-.bk-btn {{
-  font-size: {BUTTON_FONT_SIZE};
+.input-param-section {{
+  float: left;
+  width: {INPUT_PARAM_SECTION_WIDTH_FRACTION*100:.1f}vw;
+  height: 100vh;
+  overflow: hidden;
+  padding: 4px;
+  box-sizing: border-box;
+  background-color: {UI_PANEL_BG_COLOR};
+  color: {UI_TEXT_COLOR};
+  font-size: {PARAM_PANEL_FONT_SIZE};
 }}
 
-.bk-input, .bk-select {{
-  background-color: #111827;
-  color: {COLOR_TEXT};
+.input-canvas-section {{
+  float: right;
+  width: {INPUT_CANVAS_SECTION_WIDTH_FRACTION*100:.1f}vw;
+  height: 100vh;
+  overflow: hidden;
+  padding: 4px;
+  box-sizing: border-box;
+  background-color: {UI_BG_COLOR};
 }}
+
+.param-row {{
+  margin-top: 4px;
+  margin-bottom: 4px;
+}}
+
+.logs-tab {{
+  width: 100vw;
+  height: 100vh;
+  box-sizing: border-box;
+  padding: 4px;
+  overflow: hidden;
+}}
+
+.logs-table-container {{
+  width: 100%;
+  height: 90vh;
+  overflow-y: auto;
+}}
+
+.bk.bk-btn {{
+  border-radius: 4px;
+  font-size: 9pt;
+}}
+
+.bk.bk-input {{
+  font-size: 9pt;
+}}
+
 """
 
-pn.extension(sizing_mode="fixed", raw_css=[DASHBOARD_CSS])
+pn.extension("tabulator", raw_css=[DASHBOARD_CSS])
 
-# =====================================================================
+# Color dictionary for plots
+COLORS = {
+    "bg": UI_BG_COLOR,
+    "panel_bg": UI_PANEL_BG_COLOR,
+    "primary": UI_ACCENT_COLOR_PRIMARY,
+    "secondary": UI_ACCENT_COLOR_SECONDARY,
+    "accent": UI_ACCENT_COLOR_TERTIARY,
+    "grid": UI_GRID_COLOR,
+    "rect_fill": "#29B6F6",
+    "rect_line": "#ECEFF1",
+    "bbox_line": "#FF7043",
+}
+
+# --------------------------------------------------------------------
 # PROBLEM DEFINITION
-# =====================================================================
+# --------------------------------------------------------------------
 
 @dataclass
 class RectangleDef:
@@ -195,18 +216,20 @@ class RectangleDef:
 
 class PlacementProblem:
     """
-    Placement problem built from a JSON config dict.
+    Encapsulates:
+      - canvas size
+      - rectangle list
+      - objective weights
+      - constraint configuration
     """
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
 
-        # Canvas
         canvas_cfg = config.get("canvas", {})
-        self.canvas_width: float = float(canvas_cfg.get("width", 1000.0))
-        self.canvas_height: float = float(canvas_cfg.get("height", 800.0))
+        self.canvas_width = float(canvas_cfg.get("width", 1000.0))
+        self.canvas_height = float(canvas_cfg.get("height", 800.0))
 
-        # Rectangles
         rects_cfg = config.get("rectangles", [])
         self.rectangles: List[RectangleDef] = []
         for i, r in enumerate(rects_cfg):
@@ -226,7 +249,7 @@ class PlacementProblem:
 
         self.n_rects = len(self.rectangles)
 
-        # Constraints & objective weights
+        # Constraints & objective
         self.constraints_cfg = config.get("constraints", {})
         self.objective_cfg = config.get("objective", {})
         weights = self.objective_cfg.get("weights", {})
@@ -238,10 +261,10 @@ class PlacementProblem:
         return 2 * self.n_rects
 
     def initial_vector(self) -> np.ndarray:
-        vec = []
+        arr: List[float] = []
         for r in self.rectangles:
-            vec.extend([r.init_cx, r.init_cy])
-        return np.array(vec, dtype=float)
+            arr.extend([r.init_cx, r.init_cy])
+        return np.array(arr, dtype=float)
 
     def bounds(self) -> List[Tuple[float, float]]:
         bnds: List[Tuple[float, float]] = []
@@ -259,12 +282,10 @@ class PlacementProblem:
     def decode_centres(self, x: np.ndarray) -> List[Tuple[float, float]]:
         centres: List[Tuple[float, float]] = []
         for i in range(self.n_rects):
-            cx = float(x[2 * i])
-            cy = float(x[2 * i + 1])
-            centres.append((cx, cy))
+            centres.append((float(x[2 * i]), float(x[2 * i + 1])))
         return centres
 
-    # ------------- geometry / objective helpers -----------------------
+    # ------------------ geometry / objective helpers ------------------
 
     def _compute_bounding_box(
         self, centres: List[Tuple[float, float]]
@@ -273,6 +294,7 @@ class PlacementProblem:
         min_y = float("inf")
         max_x = -float("inf")
         max_y = -float("inf")
+
         for (cx, cy), r in zip(centres, self.rectangles):
             half_w = r.width / 2.0
             half_h = r.height / 2.0
@@ -288,6 +310,7 @@ class PlacementProblem:
                 min_y = bottom
             if top > max_y:
                 max_y = top
+
         return min_x, min_y, max_x, max_y
 
     def _compute_hpwl(self, centres: List[Tuple[float, float]]) -> float:
@@ -295,7 +318,7 @@ class PlacementProblem:
         ys = [c[1] for c in centres]
         return (max(xs) - min(xs)) + (max(ys) - min(ys))
 
-    # ------------- constraints & metrics ------------------------------
+    # ------------------- constraints and penalties --------------------
 
     def _constraints_from_centres(
         self, centres: List[Tuple[float, float]]
@@ -316,6 +339,7 @@ class PlacementProblem:
         spacing_x_violation = 0.0
         spacing_y_violation = 0.0
 
+        # Precompute edges
         edges = []
         for (cx, cy), r in zip(centres, self.rectangles):
             half_w = r.width / 2.0
@@ -360,9 +384,13 @@ class PlacementProblem:
 
                 if min_sp:
                     if horiz_gap < min_dx:
-                        spacing_x_violation = max(spacing_x_violation, (min_dx - horiz_gap))
+                        spacing_x_violation = max(
+                            spacing_x_violation, (min_dx - horiz_gap)
+                        )
                     if vert_gap < min_dy:
-                        spacing_y_violation = max(spacing_y_violation, (min_dy - vert_gap))
+                        spacing_y_violation = max(
+                            spacing_y_violation, (min_dy - vert_gap)
+                        )
 
         bbox_ar_violation = 0.0
         if bbox_ar_enabled:
@@ -389,7 +417,6 @@ class PlacementProblem:
                 right = cx + half_w
                 bottom = cy - half_h
                 top = cy + half_h
-
                 if left < 0.0:
                     boundary_violation += -left
                 if right > self.canvas_width:
@@ -470,7 +497,8 @@ class PlacementProblem:
         self, x: np.ndarray
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         centres = self.decode_centres(x)
-        rect_shapes: List[Dict[str, Any]] = []
+        rects: List[Dict[str, Any]] = []
+
         min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
         width = max_x - min_x
         height = max_y - min_y
@@ -478,33 +506,31 @@ class PlacementProblem:
         bbox_cy = min_y + height / 2.0
 
         for (cx, cy), r in zip(centres, self.rectangles):
-            rect_shapes.append(
-                {
-                    "x": cx,
-                    "y": cy,
-                    "w": r.width,
-                    "h": r.height,
-                    "rect_id": r.rect_id,
-                }
+            rects.append(
+                {"x": cx, "y": cy, "w": r.width, "h": r.height, "rect_id": r.rect_id}
             )
 
-        bbox_shape = {"x": bbox_cx, "y": bbox_cy, "w": width, "h": height}
-        return rect_shapes, bbox_shape
+        bbox = {"x": bbox_cx, "y": bbox_cy, "w": width, "h": height}
+        return rects, bbox
 
-
-# =====================================================================
+# --------------------------------------------------------------------
 # OPTIMIZATION MANAGER
-# =====================================================================
+# --------------------------------------------------------------------
 
 class OptimizationManager:
     """
-    Manages optimizers, background thread, metrics history, and data streams.
+    Manages:
+      - PlacementProblem
+      - optimization threads
+      - streaming updates for plots and logs
+      - save/load state
+      - automatic optimized-config writing
     """
 
     def __init__(self):
         self.problem: Optional[PlacementProblem] = None
         self.config: Optional[Dict[str, Any]] = None
-        self.config_filename: Optional[str] = None  # to build optimized config name
+        self.config_name: str = "uploaded_config.json"
 
         self.current_algorithm: Optional[str] = None
         self.current_params: Dict[str, Any] = {}
@@ -523,9 +549,8 @@ class OptimizationManager:
 
         self._pending_steps: List[Dict[str, Any]] = []
         self._history_records: List[Dict[str, Any]] = []
-        self.history_vaex: Optional["vaex.dataframe.DataFrame"] = None
 
-        # Data sources (live)
+        # Bokeh data sources
         self.obj_source = ColumnDataSource(
             data=dict(
                 iteration=[],
@@ -551,35 +576,18 @@ class OptimizationManager:
             )
         )
         self.canvas_source = ColumnDataSource(
-            data=dict(
-                x=[],
-                y=[],
-                w=[],
-                h=[],
-                rect_id=[],
-                placement_id=[],
-            )
+            data=dict(x=[], y=[], w=[], h=[], rect_id=[], placement_id=[])
         )
-        self.bbox_source = ColumnDataSource(
-            data=dict(
-                x=[],
-                y=[],
-                w=[],
-                h=[],
-            )
-        )
+        self.bbox_source = ColumnDataSource(data=dict(x=[], y=[], w=[], h=[]))
         self.placement_label_source = ColumnDataSource(
             data=dict(x=[0.0], y=[0.0], text=["Placement: -"])
         )
 
-        # Status text (will explicitly contain "running" or "optimization over")
+        # Status and logs
         self.status_text = pn.pane.Markdown(
-            "idle", height=PARAM_ROW_HEIGHT, sizing_mode="stretch_width"
+            "Status: idle",
+            sizing_mode="stretch_width",
         )
-
-        # Logs table (single scrolling list, no pagination)
-        import pandas as pd
-
         self.log_table = pn.widgets.Tabulator(
             pd.DataFrame(
                 columns=[
@@ -592,20 +600,20 @@ class OptimizationManager:
                     "bbox_area",
                 ]
             ),
-            height=LOGS_TAB_HEIGHT - 60,
             pagination=None,
-            theme="fast",
+            height=400,
         )
 
-    # -------- LOAD / SAVE CONFIG & STATE ---------------------------------
+    # -------------- CONFIG / STATE LOAD-SAVE --------------------------
 
-    def load_config_from_json_str(self, json_str: str, filename: Optional[str]):
+    def load_config_from_json_str(self, json_str: str, name_hint: str = "uploaded_config.json"):
         cfg = json.loads(json_str)
         self.config = cfg
-        self.config_filename = filename
+        self.config_name = name_hint
         self.problem = PlacementProblem(cfg)
         self._reset_state()
-        self.status_text.object = "idle"
+        self._update_status("running")  # will be updated as needed
+        self._update_status("idle (config loaded)")
 
     def _reset_state(self):
         with self._lock:
@@ -615,7 +623,6 @@ class OptimizationManager:
             self.best_metrics = None
             self._pending_steps.clear()
             self._history_records.clear()
-            self.history_vaex = None
 
             self.obj_source.data = {k: [] for k in self.obj_source.data.keys()}
             self.constraint_source.data = {
@@ -626,9 +633,6 @@ class OptimizationManager:
             self.placement_label_source.data = dict(
                 x=[0.0], y=[0.0], text=["Placement: -"]
             )
-
-            import pandas as pd
-
             self.log_table.value = pd.DataFrame(
                 columns=[
                     "iteration",
@@ -643,12 +647,12 @@ class OptimizationManager:
 
     def save_state_to_file(self, path: str):
         if self.problem is None or self.config is None:
+            self._update_status("idle (no problem to save)")
             return
-
         with self._lock:
             state = {
                 "config": self.config,
-                "config_filename": self.config_filename,
+                "config_name": self.config_name,
                 "current_algorithm": self.current_algorithm,
                 "current_params": self.current_params,
                 "iteration": self.iteration,
@@ -657,22 +661,20 @@ class OptimizationManager:
                 "best_metrics": self.best_metrics,
                 "history_records": self._history_records,
             }
-
         with open(path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+        self._update_status(f"idle (state saved to {path})")
 
     def load_state_from_file(self, path: str):
         if not os.path.exists(path):
+            self._update_status(f"idle (state file not found: {path})")
             return
-
         with open(path, "r", encoding="utf-8") as f:
             state = json.load(f)
-
         cfg = state["config"]
         self.config = cfg
-        self.config_filename = state.get("config_filename")
+        self.config_name = state.get("config_name", "uploaded_config.json")
         self.problem = PlacementProblem(cfg)
-
         with self._lock:
             self.current_algorithm = state.get("current_algorithm")
             self.current_params = state.get("current_params", {})
@@ -683,23 +685,14 @@ class OptimizationManager:
             self.best_metrics = state.get("best_metrics")
             self._history_records = state.get("history_records", [])
 
-            if self._history_records and vaex is not None:
-                self.history_vaex = vaex.from_dict(self._history_records[0])
-                for rec in self._history_records[1:]:
-                    self.history_vaex = self.history_vaex.concat(vaex.from_dict(rec))
-            else:
-                self.history_vaex = None
+            self._refresh_from_history_locked()
+        self._update_status("idle (state loaded)")
 
-            self._refresh_datasources_from_history_locked()
-        self.status_text.object = "idle"
-
-    def _refresh_datasources_from_history_locked(self):
+    def _refresh_from_history_locked(self):
         if not self._history_records:
             return
-
         obj_data = {k: [] for k in self.obj_source.data.keys()}
         con_data = {k: [] for k in self.constraint_source.data.keys()}
-
         for rec in self._history_records:
             obj_data["iteration"].append(rec["iteration"])
             obj_data["placement_id"].append(rec["placement_id"])
@@ -722,37 +715,69 @@ class OptimizationManager:
         self.obj_source.data = obj_data
         self.constraint_source.data = con_data
 
-        # Canvas from last record
-        last_rec = self._history_records[-1]
-        x_vec = np.array(last_rec["x_vector"])
-        rect_shapes, bbox_shape = self.problem.make_rectangle_shapes(x_vec)
-
+        # Use last record for canvas
+        last = self._history_records[-1]
+        x_vec = np.array(last["x_vector"])
+        rects, bbox = self.problem.make_rectangle_shapes(x_vec)
         self.canvas_source.data = dict(
-            x=[r["x"] for r in rect_shapes],
-            y=[r["y"] for r in rect_shapes],
-            w=[r["w"] for r in rect_shapes],
-            h=[r["h"] for r in rect_shapes],
-            rect_id=[r["rect_id"] for r in rect_shapes],
-            placement_id=[last_rec["placement_id"]] * len(rect_shapes),
+            x=[r["x"] for r in rects],
+            y=[r["y"] for r in rects],
+            w=[r["w"] for r in rects],
+            h=[r["h"] for r in rects],
+            rect_id=[r["rect_id"] for r in rects],
+            placement_id=[last["placement_id"]] * len(rects),
         )
         self.bbox_source.data = dict(
-            x=[bbox_shape["x"]],
-            y=[bbox_shape["y"]],
-            w=[bbox_shape["w"]],
-            h=[bbox_shape["h"]],
+            x=[bbox["x"]], y=[bbox["y"]], w=[bbox["w"]], h=[bbox["h"]]
         )
         self.placement_label_source.data = dict(
-            x=[bbox_shape["x"]],
-            y=[bbox_shape["y"] + bbox_shape["h"] * 0.6],
-            text=[f"Placement: {last_rec['placement_id']}"],
+            x=[bbox["x"]],
+            y=[bbox["y"] + bbox["h"] * 0.6],
+            text=[f"Placement: {last['placement_id']}"],
         )
 
-    # -------- STEP REGISTRATION / HISTORY ------------------------------
+        # Logs
+        df = pd.DataFrame(
+            [
+                {
+                    "iteration": r["iteration"],
+                    "placement_id": r["placement_id"],
+                    "algo": r["algo"],
+                    "objective_augmented": r["objective_augmented"],
+                    "hpwl": r["hpwl"],
+                    "bbox_aspect": r["bbox_aspect"],
+                    "bbox_area": r["bbox_area"],
+                }
+                for r in self._history_records
+            ]
+        )
+        self.log_table.value = df
+
+    # -------------- STATUS + CONTROL FLAGS ----------------------------
+
+    def _update_status(self, msg: str):
+        self.status_text.object = f"Status: {msg}"
+
+    def pause(self):
+        if self.running:
+            self._pause_event.set()
+            self._update_status("paused")
+
+    def resume(self):
+        if self.running and self._pause_event.is_set():
+            self._pause_event.clear()
+            self._update_status("running")
+
+    def stop(self):
+        if self.running:
+            self._stop_event.set()
+            self._update_status("stopping")
+
+    # -------------- STEP RECORDING & STREAMING ------------------------
 
     def register_step(self, algo_name: str, x: np.ndarray, target_obj: float = 0.0):
         if self.problem is None:
             return
-
         with self._lock:
             self.iteration += 1
             self.placement_counter += 1
@@ -785,20 +810,11 @@ class OptimizationManager:
                 "x_vector": x.tolist(),
             }
             self._history_records.append(rec)
-
-            if vaex is not None:
-                try:
-                    if self.history_vaex is None:
-                        self.history_vaex = vaex.from_dict(rec)
-                    else:
-                        self.history_vaex = self.history_vaex.concat(vaex.from_dict(rec))
-                except Exception:
-                    pass
-
             self._pending_steps.append(rec)
 
-            # Global stopping condition
+            # global stop based on target objective
             if target_obj > 0.0 and metrics["objective_augmented"] <= target_obj:
+                self._update_status("optimization over (target objective reached)")
                 self._stop_event.set()
 
     def pop_pending_steps(self) -> List[Dict[str, Any]]:
@@ -807,43 +823,18 @@ class OptimizationManager:
             self._pending_steps.clear()
         return steps
 
-    # -------- CONTROL FLAGS --------------------------------------------
-
-    def pause(self):
-        if self.running:
-            self._pause_event.set()
-
-    def resume(self):
-        if self.running and self._pause_event.is_set():
-            self._pause_event.clear()
-
-    def stop(self):
-        if self.running:
-            self._stop_event.set()
-
-    def _check_pause_and_stop(self) -> bool:
-        while self._pause_event.is_set():
-            time.sleep(0.05)
-        if self._stop_event.is_set():
-            return True
-        return False
-
-    # -------- DASHBOARD PERIODIC UPDATE --------------------------------
-
-    def periodic_update(self, target_obj: float):
+    def periodic_update(self, target_obj: float, canvas_fig, objective_fig):
+        """
+        Called from main thread periodically to push new data into
+        ColumnDataSources and update titles / logs.
+        """
         steps = self.pop_pending_steps()
         if not steps:
-            # Also ensure status text updated if running
-            if self.running:
-                self.status_text.object = "running"
             return
 
-        import pandas as pd
-
-        # Bokeh streaming
+        # Append to objective & constraint sources
         obj_stream = {k: [] for k in self.obj_source.data.keys()}
         con_stream = {k: [] for k in self.constraint_source.data.keys()}
-
         for rec in steps:
             obj_stream["iteration"].append(rec["iteration"])
             obj_stream["placement_id"].append(rec["placement_id"])
@@ -866,34 +857,33 @@ class OptimizationManager:
         self.obj_source.stream(obj_stream, rollover=2000)
         self.constraint_source.stream(con_stream, rollover=2000)
 
-        # Canvas view & title with iteration number
+        # Canvas from last step
         last = steps[-1]
         if self.problem is not None:
             x_vec = np.array(last["x_vector"])
-            rect_shapes, bbox_shape = self.problem.make_rectangle_shapes(x_vec)
-
+            rects, bbox = self.problem.make_rectangle_shapes(x_vec)
             self.canvas_source.data = dict(
-                x=[r["x"] for r in rect_shapes],
-                y=[r["y"] for r in rect_shapes],
-                w=[r["w"] for r in rect_shapes],
-                h=[r["h"] for r in rect_shapes],
-                rect_id=[r["rect_id"] for r in rect_shapes],
-                placement_id=[last["placement_id"]] * len(rect_shapes),
+                x=[r["x"] for r in rects],
+                y=[r["y"] for r in rects],
+                w=[r["w"] for r in rects],
+                h=[r["h"] for r in rects],
+                rect_id=[r["rect_id"] for r in rects],
+                placement_id=[last["placement_id"]] * len(rects),
             )
             self.bbox_source.data = dict(
-                x=[bbox_shape["x"]],
-                y=[bbox_shape["y"]],
-                w=[bbox_shape["w"]],
-                h=[bbox_shape["h"]],
+                x=[bbox["x"]], y=[bbox["y"]], w=[bbox["w"]], h=[bbox["h"]]
             )
             self.placement_label_source.data = dict(
-                x=[bbox_shape["x"]],
-                y=[bbox_shape["y"] + bbox_shape["h"] * 0.6],
+                x=[bbox["x"]],
+                y=[bbox["y"] + bbox["h"] * 0.6],
                 text=[f"Placement: {last['placement_id']}"],
             )
 
-        # Logs DataFrame (latest first so most recent on top)
-        df_small = pd.DataFrame(
+        # Update canvas title with current iteration
+        canvas_fig.title.text = f"Canvas View (Iteration {last['iteration']})"
+
+        # Update logs (full history, but small columns)
+        df = pd.DataFrame(
             [
                 {
                     "iteration": rec["iteration"],
@@ -907,42 +897,38 @@ class OptimizationManager:
                 for rec in self._history_records
             ]
         )
-        df_small = df_small.sort_values("iteration", ascending=False)
-        self.log_table.value = df_small
+        self.log_table.value = df
+        if len(df) > 0:
+            # Try to select last row so it appears as "most recent"
+            self.log_table.selection = [len(df) - 1]
 
-        # Status must say "running" while active
-        if self.running:
-            self.status_text.object = "running"
-
-    # -------- OBJECTIVE WRAPPER ----------------------------------------
-
-    def _objective_augmented(self, x: np.ndarray) -> float:
-        metrics = self.problem.compute_metrics(x)
-        return metrics["objective_augmented"]
-
-    # -------- START / RUN OPTIMIZER THREAD ------------------------------
+    # -------------- RUN OPTIMIZATION (THREAD) -------------------------
 
     def start_run(self, algorithm: str, params: Dict[str, Any], resume_from_best: bool, target_obj: float):
         if self.problem is None:
-            self.status_text.object = "idle"
+            self._update_status("idle (load config first)")
             return
         if self.running:
+            self._update_status("running")
             return
 
         self.current_algorithm = algorithm
         self.current_params = params
-
         if not resume_from_best:
             self._reset_state()
             x0 = self.problem.initial_vector()
         else:
             with self._lock:
-                x0 = self.best_x.copy() if self.best_x is not None else self.problem.initial_vector()
+                x0 = (
+                    self.best_x.copy()
+                    if self.best_x is not None
+                    else self.problem.initial_vector()
+                )
 
         self._pause_event.clear()
         self._stop_event.clear()
         self.running = True
-        self.status_text.object = "running"
+        self._update_status("running")
 
         worker = threading.Thread(
             target=self._run_optimizer_worker,
@@ -952,45 +938,247 @@ class OptimizationManager:
         self.thread = worker
         worker.start()
 
-    def _run_optimizer_worker(self, algorithm: str, params: Dict[str, Any], x0: np.ndarray, target_obj: float):
-        try:
-            if algorithm == "Differential Evolution":
-                self._run_differential_evolution(params, target_obj)
-            elif algorithm == "Dual Annealing (Simulated Annealing)":
-                self._run_dual_annealing(params, x0, target_obj)
-            elif algorithm == "Basin Hopping (Simulated Annealing)":
-                self._run_basinhopping(params, x0, target_obj)
-            elif algorithm in {
-                "Nelder-Mead",
-                "Powell",
-                "CG",
-                "L-BFGS-B",
-                "SLSQP",
-                "Trust-Constr (Quadratic Programming-like)",
-            }:
-                self._run_scipy_minimize(algorithm, params, x0, target_obj)
-            elif algorithm == "Adam (PyTorch)":
-                self._run_adam_torch(params, x0, target_obj)
-            elif algorithm == "Adam (NumPy)":
-                self._run_adam_numpy(params, x0, target_obj)
-            elif algorithm == "Genetic Algorithm (pygad)":
-                self._run_genetic_pygad(params, target_obj)
-        except Exception:
-            # Any error will still lead to final status change
-            pass
-        finally:
-            self.running = False
-            # After run finishes, auto-write optimized config copy
-            self.write_optimized_config_copy()
-            # Status must say "optimization over"
-            self.status_text.object = "optimization over"
+    def _check_pause_and_stop(self) -> bool:
+        while self._pause_event.is_set():
+            time.sleep(0.05)
+        if self._stop_event.is_set():
+            return True
+        return False
 
-    # -------- OPTIMIZER IMPLEMENTATIONS --------------------------------
+    def _objective_augmented_np(self, x: np.ndarray) -> float:
+        return self.problem.compute_metrics(x)["objective_augmented"]
 
-    def _run_differential_evolution(self, params: Dict[str, Any], target_obj: float):
+    # ---------- Adam (PyTorch if available, else pure Python) ---------
+
+    def _run_adam(self, params: Dict[str, Any], x0: np.ndarray, target_obj: float):
+        """
+        Adam optimizer:
+        - If PyTorch is available, use torch.optim.Adam with a differentiable
+          implementation of the objective.
+        - Otherwise, use a pure Python Adam optimizer with finite-difference
+          gradients.
+        """
+        if torch is not None:
+            self._run_adam_torch(params, x0, target_obj)
+        else:
+            self._run_adam_pure(params, x0, target_obj)
+
+    def _build_torch_constants(self, device):
+        widths = torch.tensor([r.width for r in self.problem.rectangles], device=device)
+        heights = torch.tensor([r.height for r in self.problem.rectangles], device=device)
+        return widths, heights
+
+    def _objective_augmented_torch(self, x_t: "torch.Tensor", widths, heights) -> "torch.Tensor":
+        """
+        Torch version of augmented objective, used only when torch is available.
+        """
+        n = self.problem.n_rects
+        cx = x_t[0:2*n:2]
+        cy = x_t[1:2*n:2]
+
+        # HPWL
+        hpwl_x = torch.max(cx) - torch.min(cx)
+        hpwl_y = torch.max(cy) - torch.min(cy)
+        hpwl = hpwl_x + hpwl_y
+
+        half_w = widths / 2.0
+        half_h = heights / 2.0
+        left = cx - half_w
+        right = cx + half_w
+        bottom = cy - half_h
+        top = cy + half_h
+
+        min_x = torch.min(left)
+        max_x = torch.max(right)
+        min_y = torch.min(bottom)
+        max_y = torch.max(top)
+        width = max_x - min_x
+        height = max_y - min_y
+
+        bbox_aspect = torch.where(height > 0, width / torch.clamp(height, min=1e-6), torch.tensor(1.0, device=x_t.device))
+        bbox_area = torch.clamp(width, min=0.0) * torch.clamp(height, min=0.0)
+
+        pure_obj = (
+            self.problem.weight_hpwl * hpwl
+            + self.problem.weight_bbox_aspect * bbox_aspect
+            + self.problem.weight_bbox_area * bbox_area
+        )
+
+        # Constraints
+        cons_cfg = self.problem.constraints_cfg
+        no_ov = cons_cfg.get("no_overlap", {}).get("enabled", True)
+        min_sp = cons_cfg.get("min_spacing", {}).get("enabled", True)
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+        bbox_ar_enabled = bbox_ar_cfg.get("enabled", False)
+        boundary_enabled = boundary_cfg.get("enabled", True)
+
+        min_dx = float(cons_cfg.get("min_spacing", {}).get("min_dx", 0.0))
+        min_dy = float(cons_cfg.get("min_spacing", {}).get("min_dy", 0.0))
+
+        overlap_max_ratio = torch.tensor(0.0, device=x_t.device)
+        spacing_x_violation = torch.tensor(0.0, device=x_t.device)
+        spacing_y_violation = torch.tensor(0.0, device=x_t.device)
+
+        n_rects = n
+        areas = widths * heights
+
+        for i in range(n_rects):
+            for j in range(i + 1, n_rects):
+                overlap_x = torch.clamp(
+                    torch.min(right[i], right[j]) - torch.max(left[i], left[j]),
+                    min=0.0,
+                )
+                overlap_y = torch.clamp(
+                    torch.min(top[i], top[j]) - torch.max(bottom[i], bottom[j]),
+                    min=0.0,
+                )
+                overlap_area = overlap_x * overlap_y
+                if no_ov:
+                    smaller_area = torch.min(areas[i], areas[j])
+                    ratio = torch.where(
+                        smaller_area > 0,
+                        overlap_area / torch.clamp(smaller_area, min=1e-6),
+                        torch.tensor(1.0, device=x_t.device),
+                    )
+                    overlap_max_ratio = torch.maximum(overlap_max_ratio, ratio)
+
+                # spacing
+                # horizontal gap
+                cond1 = right[i] <= left[j]
+                cond2 = right[j] <= left[i]
+                horiz_gap = torch.where(
+                    cond1,
+                    left[j] - right[i],
+                    torch.where(cond2, left[i] - right[j], torch.tensor(0.0, device=x_t.device)),
+                )
+                # vertical gap
+                cond3 = top[i] <= bottom[j]
+                cond4 = top[j] <= bottom[i]
+                vert_gap = torch.where(
+                    cond3,
+                    bottom[j] - top[i],
+                    torch.where(cond4, bottom[i] - top[j], torch.tensor(0.0, device=x_t.device)),
+                )
+
+                if min_sp:
+                    spacing_x_violation = torch.maximum(
+                        spacing_x_violation,
+                        torch.clamp(torch.tensor(min_dx, device=x_t.device) - horiz_gap, min=0.0),
+                    )
+                    spacing_y_violation = torch.maximum(
+                        spacing_y_violation,
+                        torch.clamp(torch.tensor(min_dy, device=x_t.device) - vert_gap, min=0.0),
+                    )
+
+        bbox_ar_violation = torch.tensor(0.0, device=x_t.device)
+        if bbox_ar_enabled:
+            ar_type = bbox_ar_cfg.get("type", "less_than")
+            thr = float(bbox_ar_cfg.get("threshold", 1.0))
+            ar = torch.where(height > 0, width / torch.clamp(height, min=1e-6), torch.tensor(1.0, device=x_t.device))
+            if ar_type == "less_than":
+                bbox_ar_violation = torch.clamp(ar - thr, min=0.0)
+            else:
+                bbox_ar_violation = torch.clamp(thr - ar, min=0.0)
+
+        boundary_violation = torch.tensor(0.0, device=x_t.device)
+        if boundary_enabled:
+            cvw = self.problem.canvas_width
+            cvh = self.problem.canvas_height
+            boundary_violation += torch.sum(torch.clamp(-left, min=0.0))
+            boundary_violation += torch.sum(torch.clamp(right - cvw, min=0.0))
+            boundary_violation += torch.sum(torch.clamp(-bottom, min=0.0))
+            boundary_violation += torch.sum(torch.clamp(top - cvh, min=0.0))
+
+        no_ov_cfg = cons_cfg.get("no_overlap", {})
+        min_sp_cfg = cons_cfg.get("min_spacing", {})
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+
+        w_overlap = float(no_ov_cfg.get("penalty_weight", 1000.0))
+        w_spacing = float(min_sp_cfg.get("penalty_weight", 500.0))
+        w_bbox_ar_con = float(bbox_ar_cfg.get("penalty_weight", 50.0))
+        w_boundary = float(boundary_cfg.get("penalty_weight", 500.0))
+
+        penalty = 0.0
+        penalty += w_overlap * (overlap_max_ratio ** 2)
+        penalty += w_spacing * ((spacing_x_violation ** 2) + (spacing_y_violation ** 2))
+        penalty += w_bbox_ar_con * (bbox_ar_violation ** 2)
+        penalty += w_boundary * (boundary_violation ** 2)
+
+        return pure_obj + penalty
+
+    def _run_adam_torch(self, params: Dict[str, Any], x0: np.ndarray, target_obj: float):
+        algo_name = "Adam (PyTorch)"
+        lr = float(params.get("lr", 0.01))
+        maxiter = int(params.get("maxiter", 200))
+
+        device = torch.device("cpu")
+        x_t = torch.tensor(x0, dtype=torch.float32, requires_grad=True, device=device)
+        optimizer = torch.optim.Adam([x_t], lr=lr)
+        widths, heights = self._build_torch_constants(device)
+        bounds = self.problem.bounds()
+
+        for _ in range(maxiter):
+            if self._check_pause_and_stop():
+                break
+            optimizer.zero_grad()
+            loss = self._objective_augmented_torch(x_t, widths, heights)
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                for idx, (lo, hi) in enumerate(bounds):
+                    x_t[idx].clamp_(float(lo), float(hi))
+
+            self.register_step(algo_name, x_t.detach().cpu().numpy(), target_obj)
+
+    def _run_adam_pure(self, params: Dict[str, Any], x0: np.ndarray, target_obj: float):
+        """
+        Pure Python Adam with finite-difference gradients.
+        """
+        algo_name = "Adam (Pure Python)"
+        lr = float(params.get("lr", 0.01))
+        maxiter = int(params.get("maxiter", 200))
+        beta1 = 0.9
+        beta2 = 0.999
+        eps = 1e-8
+        x = x0.copy()
+        m = np.zeros_like(x)
+        v = np.zeros_like(x)
+        bounds = self.problem.bounds()
+
+        def grad_f(x_vec):
+            g = np.zeros_like(x_vec)
+            fx = self._objective_augmented_np(x_vec)
+            h = 1e-3
+            for i in range(len(x_vec)):
+                x_up = x_vec.copy()
+                x_up[i] += h
+                g[i] = (self._objective_augmented_np(x_up) - fx) / h
+            return g
+
+        for t in range(1, maxiter + 1):
+            if self._check_pause_and_stop():
+                break
+            g = grad_f(x)
+            m = beta1 * m + (1 - beta1) * g
+            v = beta2 * v + (1 - beta2) * (g ** 2)
+            m_hat = m / (1 - beta1 ** t)
+            v_hat = v / (1 - beta2 ** t)
+            x = x - lr * m_hat / (np.sqrt(v_hat) + eps)
+
+            # project bounds
+            for i, (lo, hi) in enumerate(bounds):
+                x[i] = np.clip(x[i], lo, hi)
+
+            self.register_step(algo_name, x, target_obj)
+
+    # ------------------ OTHER OPTIMIZERS ------------------------------
+
+    def _run_differential_evolution(self, params, target_obj):
         bounds = self.problem.bounds()
         algo_name = "Differential Evolution"
-
         maxiter = int(params.get("maxiter", 80))
         popsize = int(params.get("popsize", 15))
         seed = int(params.get("seed", 42))
@@ -1001,7 +1189,7 @@ class OptimizationManager:
             return self._check_pause_and_stop()
 
         differential_evolution(
-            lambda x: self._objective_augmented(x),
+            lambda x: self._objective_augmented_np(x),
             bounds=bounds,
             maxiter=maxiter,
             popsize=popsize,
@@ -1011,10 +1199,9 @@ class OptimizationManager:
             callback=callback,
         )
 
-    def _run_dual_annealing(self, params: Dict[str, Any], x0: np.ndarray, target_obj: float):
+    def _run_dual_annealing(self, params, x0, target_obj):
         bounds = self.problem.bounds()
         algo_name = "Dual Annealing (Simulated Annealing)"
-
         maxiter = int(params.get("maxiter", 200))
         initial_temp = float(params.get("initial_temp", 5230.0))
         seed = int(params.get("seed", 42))
@@ -1024,7 +1211,7 @@ class OptimizationManager:
             return self._check_pause_and_stop()
 
         dual_annealing(
-            lambda x: self._objective_augmented(x),
+            lambda x: self._objective_augmented_np(x),
             bounds=bounds,
             maxiter=maxiter,
             initial_temp=initial_temp,
@@ -1032,18 +1219,14 @@ class OptimizationManager:
             callback=callback,
         )
 
-    def _run_basinhopping(self, params: Dict[str, Any], x0: np.ndarray, target_obj: float):
+    def _run_basinhopping(self, params, x0, target_obj):
         algo_name = "Basin Hopping (Simulated Annealing)"
         niter = int(params.get("niter", 50))
         stepsize = float(params.get("stepsize", 10.0))
-
-        minimizer_kwargs = {
-            "method": "L-BFGS-B",
-            "bounds": self.problem.bounds(),
-        }
+        minimizer_kwargs = {"method": "L-BFGS-B", "bounds": self.problem.bounds()}
 
         def local_fun(x):
-            return self._objective_augmented(x)
+            return self._objective_augmented_np(x)
 
         def callback(x, f, accept):
             self.register_step(algo_name, np.array(x, dtype=float), target_obj)
@@ -1058,9 +1241,7 @@ class OptimizationManager:
             callback=callback,
         )
 
-    def _run_scipy_minimize(
-        self, algorithm: str, params: Dict[str, Any], x0: np.ndarray, target_obj: float
-    ):
+    def _run_scipy_minimize(self, algorithm, params, x0, target_obj):
         bounds = self.problem.bounds()
         method_map = {
             "Nelder-Mead": "Nelder-Mead",
@@ -1072,7 +1253,6 @@ class OptimizationManager:
         }
         method = method_map[algorithm]
         algo_name = algorithm
-
         maxiter = int(params.get("maxiter", 200))
         options = {"maxiter": maxiter}
 
@@ -1081,7 +1261,7 @@ class OptimizationManager:
             return self._check_pause_and_stop()
 
         minimize(
-            lambda x: self._objective_augmented(x),
+            lambda x: self._objective_augmented_np(x),
             x0,
             method=method,
             bounds=bounds if method != "trust-constr" else None,
@@ -1089,84 +1269,14 @@ class OptimizationManager:
             options=options,
         )
 
-    def _run_adam_torch(self, params: Dict[str, Any], x0: np.ndarray, target_obj: float):
-        if torch is None:
+    def _run_genetic_pygad(self, params, x0, target_obj):
+        try:
+            import pygad
+        except Exception:
+            self._update_status("idle (pygad not installed for GA)")
             return
-
-        algo_name = "Adam (PyTorch)"
-        lr = float(params.get("lr", 0.01))
-        maxiter = int(params.get("maxiter", 200))
-
-        x_t = torch.tensor(x0, dtype=torch.float32, requires_grad=True)
-        optimizer = torch.optim.Adam([x_t], lr=lr)
-        bounds = self.problem.bounds()
-
-        for _ in range(1, maxiter + 1):
-            if self._check_pause_and_stop():
-                break
-            optimizer.zero_grad()
-            x_np = x_t.detach().cpu().numpy()
-            metrics = self.problem.compute_metrics(x_np)
-            loss_value = metrics["objective_augmented"]
-            loss = torch.tensor(loss_value, dtype=torch.float32)
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                for idx, (lo, hi) in enumerate(bounds):
-                    x_t[idx].clamp_(float(lo), float(hi))
-            self.register_step(algo_name, x_t.detach().cpu().numpy(), target_obj)
-
-    def _run_adam_numpy(self, params: Dict[str, Any], x0: np.ndarray, target_obj: float):
-        """
-        Adam optimizer implemented purely in NumPy (fallback if PyTorch is absent).
-        Uses finite-difference gradients.
-        """
-        algo_name = "Adam (NumPy)"
-        lr = float(params.get("lr", 0.01))
-        maxiter = int(params.get("maxiter", 200))
-        beta1 = 0.9
-        beta2 = 0.999
-        eps = 1e-8
-        fd_eps = 1e-3
-
-        x = x0.copy()
-        m = np.zeros_like(x)
-        v = np.zeros_like(x)
-        bounds = self.problem.bounds()
-
-        f_base = self._objective_augmented(x)
-
-        for t in range(1, maxiter + 1):
-            if self._check_pause_and_stop():
-                break
-
-            # Finite-difference gradient
-            grad = np.zeros_like(x)
-            for i in range(len(x)):
-                x_pert = x.copy()
-                x_pert[i] += fd_eps
-                grad[i] = (self._objective_augmented(x_pert) - f_base) / fd_eps
-
-            # Adam update
-            m = beta1 * m + (1 - beta1) * grad
-            v = beta2 * v + (1 - beta2) * (grad ** 2)
-            m_hat = m / (1 - beta1 ** t)
-            v_hat = v / (1 - beta2 ** t)
-
-            x = x - lr * m_hat / (np.sqrt(v_hat) + eps)
-
-            # Project to bounds
-            for i, (lo, hi) in enumerate(bounds):
-                x[i] = min(max(x[i], lo), hi)
-
-            f_base = self._objective_augmented(x)
-            self.register_step(algo_name, x, target_obj)
-
-    def _run_genetic_pygad(self, params: Dict[str, Any], target_obj: float):
-        if pygad is None:
-            return
-
         algo_name = "Genetic Algorithm (pygad)"
+
         num_genes = self.problem.num_variables()
         bnds = self.problem.bounds()
         gene_space = [{"low": lo, "high": hi} for (lo, hi) in bnds]
@@ -1177,9 +1287,9 @@ class OptimizationManager:
         mutation_percent_genes = int(params.get("mutation_percent_genes", 10))
         parent_selection_type = params.get("parent_selection_type", "sss")
 
-        def fitness_func(ga_instance, solution, solution_idx):
+        def fitness_func(ga_instance, solution, sol_idx):
             x = np.array(solution, dtype=float)
-            return -self._objective_augmented(x)
+            return -self._objective_augmented_np(x)
 
         def on_generation(ga_instance):
             best_solution, best_fitness, _ = ga_instance.best_solution()
@@ -1200,57 +1310,227 @@ class OptimizationManager:
         )
         ga.run()
 
-    # -------- OPTIMIZED CONFIG COPY -----------------------------------
+    def _run_optimizer_worker(self, algorithm, params, x0, target_obj):
+        try:
+            if algorithm == "Differential Evolution":
+                self._run_differential_evolution(params, target_obj)
+            elif algorithm == "Dual Annealing (Simulated Annealing)":
+                self._run_dual_annealing(params, x0, target_obj)
+            elif algorithm == "Basin Hopping (Simulated Annealing)":
+                self._run_basinhopping(params, x0, target_obj)
+            elif algorithm in {
+                "Nelder-Mead",
+                "Powell",
+                "CG",
+                "L-BFGS-B",
+                "SLSQP",
+                "Trust-Constr (Quadratic Programming-like)",
+            }:
+                self._run_scipy_minimize(algorithm, params, x0, target_obj)
+            elif algorithm == "Adam (PyTorch)":
+                self._run_adam(params, x0, target_obj)
+            elif algorithm == "Genetic Algorithm (pygad)":
+                self._run_genetic_pygad(params, x0, target_obj)
+            else:
+                self._update_status(f"idle (unknown algorithm: {algorithm})")
+        except Exception as e:
+            self._update_status(f"idle (error in optimizer: {e})")
+        finally:
+            self.running = False
+            if self._stop_event.is_set():
+                self._update_status("optimization over (stopped)")
+            elif self._pause_event.is_set():
+                self._update_status("paused")
+            else:
+                # normal finish -> auto write optimized config
+                self._auto_save_optimized_config()
 
-    def write_optimized_config_copy(self):
+    def _auto_save_optimized_config(self):
+        """
+        After optimization finishes, copy loaded config and update
+        rectangle centres to best_x, saving as <basename>_optimized.json
+        in the current working directory.
+        """
         if self.config is None or self.problem is None or self.best_x is None:
+            self._update_status("optimization over")
             return
-
-        base_name = self.config_filename or "config.json"
-        name, ext = os.path.splitext(base_name)
-        if not ext:
-            ext = ".json"
-        new_name = f"{name}_optimized{ext}"
-        path = os.path.join(os.getcwd(), new_name)
-
-        new_cfg = json.loads(json.dumps(self.config))
+        cfg_out = json.loads(json.dumps(self.config))
         centres = self.problem.decode_centres(self.best_x)
-        for cfg_rect, (cx, cy) in zip(new_cfg.get("rectangles", []), centres):
-            cfg_rect["initial_center"] = [float(cx), float(cy)]
+        rects = cfg_out.get("rectangles", [])
+        for rcfg, (cx, cy) in zip(rects, centres):
+            rcfg["initial_center"] = [float(cx), float(cy)]
+        base = os.path.splitext(self.config_name)[0]
+        out_name = base + "_optimized.json"
+        out_path = os.path.join(os.getcwd(), out_name)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(cfg_out, f, indent=2)
+        self._update_status(f"optimization over (optimized config: {out_name})")
 
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(new_cfg, f, indent=2)
+# --------------------------------------------------------------------
+# INPUT PLACEMENT MANAGER (FOR CONFIG CREATION TAB)
+# --------------------------------------------------------------------
 
+class InputPlacementManager:
+    """
+    Handles interactive creation of rectangles & canvas for a config file.
+    """
 
-# =====================================================================
-# GLOBAL MANAGER INSTANCE
-# =====================================================================
+    def __init__(self):
+        self.canvas_width = 1000.0
+        self.canvas_height = 800.0
+        self.rectangles_source = ColumnDataSource(
+            data=dict(x=[], y=[], w=[], h=[], rect_id=[])
+        )
+
+        # Text panes for objective & constraints
+        self.obj_terms_text = pn.pane.Markdown("HPWL: -, AR: -, Area: -")
+        self.obj_combined_text = pn.pane.Markdown("Objective: -")
+        self.constraints_text = pn.pane.Markdown(
+            "Overlap: -, dx_viol: -, dy_viol: -, AR_viol: -, Boundary: -"
+        )
+
+        # Link to load constraints/objective from main config when available
+        self.base_config: Optional[Dict[str, Any]] = None
+
+    def update_base_config(self, cfg: Optional[Dict[str, Any]]):
+        self.base_config = cfg
+
+    def _random_rect(self, idx: int) -> Dict[str, Any]:
+        w = np.random.uniform(30.0, 80.0)
+        h = np.random.uniform(30.0, 80.0)
+        cx = np.random.uniform(w / 2.0, self.canvas_width - w / 2.0)
+        cy = np.random.uniform(h / 2.0, self.canvas_height - h / 2.0)
+        return {"x": cx, "y": cy, "w": w, "h": h, "rect_id": f"R{idx}"}
+
+    def regenerate_rectangles(self, n_rect: int):
+        rects = [self._random_rect(i) for i in range(n_rect)]
+        self.rectangles_source.data = dict(
+            x=[r["x"] for r in rects],
+            y=[r["y"] for r in rects],
+            w=[r["w"] for r in rects],
+            h=[r["h"] for r in rects],
+            rect_id=[r["rect_id"] for r in rects],
+        )
+        self.update_metrics()
+
+    def add_rectangle(self):
+        data = self.rectangles_source.data
+        idx = len(data["x"])
+        new_rect = self._random_rect(idx)
+        for k in data.keys():
+            data[k].append(new_rect[k])
+        self.rectangles_source.data = data
+        self.update_metrics()
+
+    def randomize_all(self):
+        n = len(self.rectangles_source.data["x"])
+        self.regenerate_rectangles(n)
+
+    def _build_temp_problem(self) -> Optional[PlacementProblem]:
+        xs = self.rectangles_source.data["x"]
+        ys = self.rectangles_source.data["y"]
+        ws = self.rectangles_source.data["w"]
+        hs = self.rectangles_source.data["h"]
+        rects_cfg = []
+        for i in range(len(xs)):
+            rects_cfg.append(
+                {
+                    "id": f"R{i}",
+                    "width": float(ws[i]),
+                    "height": float(hs[i]),
+                    "initial_center": [float(xs[i]), float(ys[i])],
+                }
+            )
+        if self.base_config is not None:
+            cfg = json.loads(json.dumps(self.base_config))
+        else:
+            cfg = {
+                "constraints": {
+                    "bbox_aspect_ratio": {
+                        "enabled": True,
+                        "type": "less_than",
+                        "threshold": 1.5,
+                        "penalty_weight": 50.0,
+                    },
+                    "no_overlap": {"enabled": True, "penalty_weight": 1000.0},
+                    "min_spacing": {
+                        "enabled": True,
+                        "min_dx": 10.0,
+                        "min_dy": 10.0,
+                        "penalty_weight": 500.0,
+                    },
+                    "canvas_boundary": {"enabled": True, "penalty_weight": 500.0},
+                },
+                "objective": {
+                    "weights": {"hpwl": 1.0, "bbox_aspect": 0.5, "bbox_area": 0.01}
+                },
+            }
+        cfg["canvas"] = {"width": self.canvas_width, "height": self.canvas_height}
+        cfg["rectangles"] = rects_cfg
+        return PlacementProblem(cfg)
+
+    def update_metrics(self):
+        problem = self._build_temp_problem()
+        if problem is None or problem.n_rects == 0:
+            self.obj_terms_text.object = "HPWL: -, AR: -, Area: -"
+            self.obj_combined_text.object = "Objective: -"
+            self.constraints_text.object = (
+                "Overlap: -, dx_viol: -, dy_viol: -, AR_viol: -, Boundary: -"
+            )
+            return
+        x0 = problem.initial_vector()
+        metrics = problem.compute_metrics(x0)
+        self.obj_terms_text.object = (
+            f"HPWL: {metrics['hpwl']:.2f}, "
+            f"AR: {metrics['bbox_aspect']:.3f}, "
+            f"Area: {metrics['bbox_area']:.1f}"
+        )
+        self.obj_combined_text.object = (
+            f"Objective (aug): {metrics['objective_augmented']:.3f}"
+        )
+        self.constraints_text.object = (
+            f"Overlap: {metrics['overlap_max_ratio']:.3f}, "
+            f"dx_viol: {metrics['spacing_x_violation']:.3f}, "
+            f"dy_viol: {metrics['spacing_y_violation']:.3f}, "
+            f"AR_viol: {metrics['bbox_ar_violation']:.3f}, "
+            f"Boundary: {metrics['boundary_violation']:.3f}"
+        )
+
+    def write_config_to_file(self, filename: str):
+        if not filename:
+            filename = "input_rectangles_config.json"
+        problem = self._build_temp_problem()
+        if problem is None:
+            return
+        cfg_out = json.loads(json.dumps(problem.config))
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(cfg_out, f, indent=2)
+
+# --------------------------------------------------------------------
+# MANAGERS
+# --------------------------------------------------------------------
 
 manager = OptimizationManager()
+input_manager = InputPlacementManager()
 
-# =====================================================================
-# BOKEH FIGURES FOR MAIN TAB
-# =====================================================================
+# --------------------------------------------------------------------
+# BOKEH FIGURES (LIVE VIEW)
+# --------------------------------------------------------------------
 
 def make_canvas_fig():
     fig = figure(
-        height=LIVE_CANVAS_HEIGHT,
-        width=LIVE_WIDTH,
-        title="Canvas View (iteration -)",
-        x_axis_label="x",
-        y_axis_label="y",
-        match_aspect=True,  # 1:1 scale
+        height=int(DEFAULT_VIEWPORT_HEIGHT * CANVAS_VIEW_HEIGHT_FRACTION),
+        width=int(DEFAULT_VIEWPORT_WIDTH * LIVE_SECTION_WIDTH_FRACTION),
+        title="Canvas View (Iteration 0)",
+        match_aspect=True,
         tools="pan,wheel_zoom,reset",
-        background_fill_color=COLOR_PANEL_BG,
-        border_fill_color=COLOR_PANEL_BG,
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
         toolbar_location="right",
-        min_border=PLOT_MIN_BORDER,
     )
-    fig.grid.grid_line_color = COLOR_GRID
-    fig.axis.axis_label_text_color = COLOR_TEXT
-    fig.axis.major_label_text_color = COLOR_TEXT
-    fig.title.text_color = COLOR_PRIMARY
-    fig.title.text_font_size = "11pt"
+    fig.grid.grid_line_color = COLORS["grid"]
+    fig.title.text_color = COLORS["primary"]
+    fig.min_border = 5
 
     fig.rect(
         x="x",
@@ -1260,8 +1540,8 @@ def make_canvas_fig():
         source=manager.canvas_source,
         fill_alpha=0.25,
         line_alpha=0.9,
-        fill_color=COLOR_RECT_FILL,
-        line_color=COLOR_RECT_LINE,
+        fill_color=COLORS["rect_fill"],
+        line_color=COLORS["rect_line"],
     )
     fig.rect(
         x="x",
@@ -1273,15 +1553,15 @@ def make_canvas_fig():
         line_alpha=0.7,
         line_dash="dashed",
         line_width=2,
-        line_color=COLOR_BBOX_LINE,
+        line_color=COLORS["bbox_line"],
     )
     fig.text(
         x="x",
         y="y",
         text="text",
         source=manager.placement_label_source,
-        text_color=COLOR_ACCENT,
-        text_font_size="9pt",
+        text_color=COLORS["accent"],
+        text_font_size="10pt",
     )
     fig.add_tools(
         HoverTool(
@@ -1295,46 +1575,39 @@ def make_canvas_fig():
             ]
         )
     )
-    # Default ranges (updated when config is loaded)
     fig.x_range.start = 0
     fig.x_range.end = 1000
     fig.y_range.start = 0
     fig.y_range.end = 800
     return fig
 
-
 def make_objective_fig():
     fig = figure(
-        height=OBJECTIVE_HEIGHT,
-        width=OBJECTIVE_WIDTH,
+        height=int(DEFAULT_VIEWPORT_HEIGHT * OBJ_GRAPH_HEIGHT_FRACTION),
+        width=int(DEFAULT_VIEWPORT_WIDTH * LIVE_SECTION_WIDTH_FRACTION * 0.5),
         title="Objective Terms vs Iteration",
         x_axis_label="Iteration",
         y_axis_label="Value",
-        background_fill_color=COLOR_PANEL_BG,
-        border_fill_color=COLOR_PANEL_BG,
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
         toolbar_location="right",
-        min_border=PLOT_MIN_BORDER,
     )
-    fig.grid.grid_line_color = COLOR_GRID
-    fig.axis.axis_label_text_color = COLOR_TEXT
-    fig.axis.major_label_text_color = COLOR_TEXT
-    fig.title.text_color = COLOR_PRIMARY
-    fig.title.text_font_size = "10pt"
+    fig.grid.grid_line_color = COLORS["grid"]
+    fig.axis.axis_label_text_color = UI_TEXT_COLOR
+    fig.axis.major_label_text_color = UI_TEXT_COLOR
+    fig.title.text_color = COLORS["primary"]
+    fig.min_border = 5
 
-    fig.line("iteration", "hpwl", source=manager.obj_source,
-             legend_label="HPWL", line_width=2, alpha=0.8)
-    fig.line("iteration", "bbox_aspect", source=manager.obj_source,
-             legend_label="BBox Aspect", line_width=2, line_dash="dashed", alpha=0.8)
-    fig.line("iteration", "bbox_area", source=manager.obj_source,
-             legend_label="BBox Area", line_width=2, line_dash="dotdash", alpha=0.8)
-    fig.line("iteration", "objective_augmented", source=manager.obj_source,
-             legend_label="Augmented Objective", line_width=3, alpha=0.9)
+    fig.line("iteration", "hpwl", source=manager.obj_source, legend_label="HPWL", line_width=2, alpha=0.8)
+    fig.line("iteration", "bbox_aspect", source=manager.obj_source, legend_label="BBox Aspect", line_width=2, line_dash="dashed", alpha=0.8)
+    fig.line("iteration", "bbox_area", source=manager.obj_source, legend_label="BBox Area", line_width=2, line_dash="dotdash", alpha=0.8)
+    fig.line("iteration", "objective_augmented", source=manager.obj_source, legend_label="Aug Objective", line_width=3, alpha=0.9)
 
     legend = fig.legend[0]
+    legend.label_text_font_size = LEGEND_FONT_SIZE
+    legend.background_fill_alpha = LEGEND_BACKGROUND_ALPHA
     legend.location = "top_left"
     legend.click_policy = "hide"
-    legend.background_fill_alpha = LEGEND_BG_ALPHA
-    legend.label_text_font_size = LEGEND_FONT_SIZE
 
     fig.add_tools(
         HoverTool(
@@ -1351,41 +1624,34 @@ def make_objective_fig():
     )
     return fig
 
-
 def make_constraint_fig():
     fig = figure(
-        height=CONSTRAINT_HEIGHT,
-        width=CONSTRAINT_WIDTH,
+        height=int(DEFAULT_VIEWPORT_HEIGHT * CON_GRAPH_HEIGHT_FRACTION),
+        width=int(DEFAULT_VIEWPORT_WIDTH * LIVE_SECTION_WIDTH_FRACTION * 0.5),
         title="Constraint Terms vs Iteration",
         x_axis_label="Iteration",
         y_axis_label="Violation",
-        background_fill_color=COLOR_PANEL_BG,
-        border_fill_color=COLOR_PANEL_BG,
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
         toolbar_location="right",
-        min_border=PLOT_MIN_BORDER,
     )
-    fig.grid.grid_line_color = COLOR_GRID
-    fig.axis.axis_label_text_color = COLOR_TEXT
-    fig.axis.major_label_text_color = COLOR_TEXT
-    fig.title.text_color = COLOR_SECONDARY
-    fig.title.text_font_size = "10pt"
+    fig.grid.grid_line_color = COLORS["grid"]
+    fig.axis.axis_label_text_color = UI_TEXT_COLOR
+    fig.axis.major_label_text_color = UI_TEXT_COLOR
+    fig.title.text_color = COLORS["secondary"]
+    fig.min_border = 5
 
-    fig.line("iteration", "overlap_max_ratio", source=manager.constraint_source,
-             legend_label="Max Overlap Ratio", line_width=2, alpha=0.8)
-    fig.line("iteration", "spacing_x_violation", source=manager.constraint_source,
-             legend_label="Spacing X Violation", line_width=2, line_dash="dashed", alpha=0.8)
-    fig.line("iteration", "spacing_y_violation", source=manager.constraint_source,
-             legend_label="Spacing Y Violation", line_width=2, line_dash="dotdash", alpha=0.8)
-    fig.line("iteration", "bbox_ar_violation", source=manager.constraint_source,
-             legend_label="BBox AR Violation", line_width=2, line_dash="dotted", alpha=0.8)
-    fig.line("iteration", "boundary_violation", source=manager.constraint_source,
-             legend_label="Boundary Violation", line_width=2, line_dash="dashdot", alpha=0.8)
+    fig.line("iteration", "overlap_max_ratio", source=manager.constraint_source, legend_label="Overlap Ratio", line_width=2, alpha=0.8)
+    fig.line("iteration", "spacing_x_violation", source=manager.constraint_source, legend_label="dx Violation", line_width=2, line_dash="dashed", alpha=0.8)
+    fig.line("iteration", "spacing_y_violation", source=manager.constraint_source, legend_label="dy Violation", line_width=2, line_dash="dotdash", alpha=0.8)
+    fig.line("iteration", "bbox_ar_violation", source=manager.constraint_source, legend_label="AR Violation", line_width=2, line_dash="dotted", alpha=0.8)
+    fig.line("iteration", "boundary_violation", source=manager.constraint_source, legend_label="Boundary Violation", line_width=2, line_dash="dashdot", alpha=0.8)
 
     legend = fig.legend[0]
+    legend.label_text_font_size = LEGEND_FONT_SIZE
+    legend.background_fill_alpha = LEGEND_BACKGROUND_ALPHA
     legend.location = "top_left"
     legend.click_policy = "hide"
-    legend.background_fill_alpha = LEGEND_BG_ALPHA
-    legend.label_text_font_size = LEGEND_FONT_SIZE
 
     fig.add_tools(
         HoverTool(
@@ -1394,8 +1660,8 @@ def make_constraint_fig():
                 ("Placement", "@placement_id"),
                 ("Algo", "@algo"),
                 ("Overlap", "@overlap_max_ratio{0.000}"),
-                ("dx_violation", "@spacing_x_violation{0.000}"),
-                ("dy_violation", "@spacing_y_violation{0.000}"),
+                ("dx_viol", "@spacing_x_violation{0.000}"),
+                ("dy_viol", "@spacing_y_violation{0.000}"),
                 ("AR_viol", "@bbox_ar_violation{0.000}"),
                 ("Boundary", "@boundary_violation{0.000}"),
             ]
@@ -1403,40 +1669,75 @@ def make_constraint_fig():
     )
     return fig
 
-
 canvas_fig = make_canvas_fig()
 objective_fig = make_objective_fig()
 constraint_fig = make_constraint_fig()
 
+# --------------------------------------------------------------------
+# INPUT PLACEMENT CANVAS FIGURE
+# --------------------------------------------------------------------
 
-def update_canvas_ranges_from_problem():
-    if manager.problem is not None:
-        canvas_fig.x_range.start = 0
-        canvas_fig.x_range.end = manager.problem.canvas_width
-        canvas_fig.y_range.start = 0
-        canvas_fig.y_range.end = manager.problem.canvas_height
+def make_input_canvas_fig():
+    fig = figure(
+        height=int(DEFAULT_VIEWPORT_HEIGHT * 0.9),
+        width=int(DEFAULT_VIEWPORT_WIDTH * INPUT_CANVAS_SECTION_WIDTH_FRACTION),
+        title="Input Placement Canvas",
+        match_aspect=True,
+        tools="pan,wheel_zoom,reset",
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
+        toolbar_location="right",
+    )
+    fig.grid.grid_line_color = COLORS["grid"]
+    fig.title.text_color = COLORS["primary"]
+    fig.min_border = 5
 
+    r = fig.rect(
+        x="x",
+        y="y",
+        width="w",
+        height="h",
+        source=input_manager.rectangles_source,
+        fill_alpha=0.25,
+        line_alpha=0.9,
+        fill_color=COLORS["rect_fill"],
+        line_color=COLORS["rect_line"],
+    )
+    edit_tool = BoxEditTool(renderers=[r])
+    fig.add_tools(edit_tool)
+    fig.toolbar.active_drag = edit_tool
 
-# =====================================================================
-# MAIN TAB WIDGETS (PARAMETERS SECTION)
-# =====================================================================
+    fig.x_range.start = 0
+    fig.x_range.end = input_manager.canvas_width
+    fig.y_range.start = 0
+    fig.y_range.end = input_manager.canvas_height
 
-# Row 1: File input + load button
+    def _src_change(attr, old, new):
+        input_manager.update_metrics()
+
+    input_manager.rectangles_source.on_change("data", _src_change)
+    return fig
+
+input_canvas_fig = make_input_canvas_fig()
+
+# --------------------------------------------------------------------
+# WIDGETS - FIRST TAB (PARAMETERS & LIVE UPDATES)
+# --------------------------------------------------------------------
+
+# 1st row: Choose file + load button
 config_file_input = pn.widgets.FileInput(
     name="",
     accept=".json",
     multiple=False,
-    width=int(PARAM_WIDTH * 0.6),
-    height=BUTTON_HEIGHT,
+    width=150,
 )
 load_config_button = pn.widgets.Button(
     name="Load",
     button_type="primary",
-    width=int(PARAM_WIDTH * 0.3),
-    height=BUTTON_HEIGHT,
+    width=60,
 )
 
-# Row 2: Optimizer select
+# 2nd row: optimizer dropdown
 optimizer_options = [
     "Differential Evolution",
     "Dual Annealing (Simulated Annealing)",
@@ -1448,311 +1749,202 @@ optimizer_options = [
     "SLSQP",
     "Trust-Constr (Quadratic Programming-like)",
     "Adam (PyTorch)",
-    "Adam (NumPy)",
     "Genetic Algorithm (pygad)",
 ]
 optimizer_select = pn.widgets.Select(
     name="Optimizer",
     options=optimizer_options,
-    width=PARAM_WIDGET_WIDTH_LARGE,
-    height=WIDGET_HEIGHT,
+    width=220,
 )
 
-# Row 3: Stop strategy ("max iter only" / "allow objective target")
-stop_strategy_select = pn.widgets.RadioButtonGroup(
+# 3rd row: stop strategy
+stop_strategy_radio = pn.widgets.RadioButtonGroup(
     name="Stop Strategy",
     options=["max iter only", "allow objective target"],
     value="allow objective target",
-    button_type="success",
-    width=PARAM_WIDGET_WIDTH_LARGE,
-    height=WIDGET_HEIGHT,
+    button_type="primary",
 )
 target_objective_input = pn.widgets.FloatInput(
-    name="Target Obj",
+    name="Target Obj (<=0 off)",
     value=0.0,
     step=0.1,
-    width=PARAM_WIDGET_WIDTH_SMALL,
-    height=WIDGET_HEIGHT,
+    width=150,
 )
 resume_checkbox = pn.widgets.Checkbox(
     name="Resume from best",
     value=False,
-    width=PARAM_WIDGET_WIDTH_SMALL,
-    height=WIDGET_HEIGHT,
 )
 
-# Rows 4 & 5: per-optimizer parameter widgets (two rows containers)
-optimizer_param_row1_container = pn.Row(height=PARAM_ROW_HEIGHT)
-optimizer_param_row2_container = pn.Row(height=PARAM_ROW_HEIGHT)
-
-# Parameter widget definitions per algorithm
-optimizer_param_widgets: Dict[str, Dict[str, pn.widgets.Widget]] = {}
-optimizer_param_rows: Dict[str, Tuple[pn.Row, pn.Row]] = {}
+# 4th & 5th rows: optimizer parameter widgets (dynamic placement)
+optimizer_param_widgets: Dict[str, List[pn.widgets.Widget]] = {}
 
 # Differential Evolution
-de_maxiter = pn.widgets.IntInput(
-    name="maxiter", value=80, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-de_popsize = pn.widgets.IntInput(
-    name="popsize", value=15, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-de_seed = pn.widgets.IntInput(
-    name="seed", value=42, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
+de_maxiter = pn.widgets.IntInput(name="maxiter", value=80, step=1, width=70)
+de_popsize = pn.widgets.IntInput(name="popsize", value=15, step=1, width=70)
+de_seed = pn.widgets.IntInput(name="seed", value=42, step=1, width=70)
 de_workers = pn.widgets.IntInput(
-    name="workers", value=os.cpu_count() or 1, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
+    name="workers", value=os.cpu_count() or 1, step=1, width=70
 )
-optimizer_param_widgets["Differential Evolution"] = {
-    "maxiter": de_maxiter,
-    "popsize": de_popsize,
-    "seed": de_seed,
-    "workers": de_workers,
-}
-optimizer_param_rows["Differential Evolution"] = (
-    pn.Row(de_maxiter, de_popsize, height=PARAM_ROW_HEIGHT),
-    pn.Row(de_seed, de_workers, height=PARAM_ROW_HEIGHT),
-)
+optimizer_param_widgets["Differential Evolution"] = [
+    de_maxiter,
+    de_popsize,
+    de_seed,
+    de_workers,
+]
 
 # Dual Annealing
-da_maxiter = pn.widgets.IntInput(
-    name="maxiter", value=200, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
+da_maxiter = pn.widgets.IntInput(name="maxiter", value=200, step=1, width=70)
 da_initial_temp = pn.widgets.FloatInput(
-    name="initial_temp", value=5230.0, step=10.0,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
+    name="initial_temp", value=5230.0, step=10.0, width=90
 )
-da_seed = pn.widgets.IntInput(
-    name="seed", value=42, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-optimizer_param_widgets["Dual Annealing (Simulated Annealing)"] = {
-    "maxiter": da_maxiter,
-    "initial_temp": da_initial_temp,
-    "seed": da_seed,
-}
-optimizer_param_rows["Dual Annealing (Simulated Annealing)"] = (
-    pn.Row(da_maxiter, da_initial_temp, height=PARAM_ROW_HEIGHT),
-    pn.Row(da_seed, pn.Spacer(width=PARAM_WIDGET_WIDTH_SMALL), height=PARAM_ROW_HEIGHT),
-)
+da_seed = pn.widgets.IntInput(name="seed", value=42, step=1, width=70)
+optimizer_param_widgets["Dual Annealing (Simulated Annealing)"] = [
+    da_maxiter,
+    da_initial_temp,
+    da_seed,
+]
 
 # Basin Hopping
-bh_niter = pn.widgets.IntInput(
-    name="niter", value=50, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-bh_stepsize = pn.widgets.FloatInput(
-    name="stepsize", value=10.0, step=0.5,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-optimizer_param_widgets["Basin Hopping (Simulated Annealing)"] = {
-    "niter": bh_niter,
-    "stepsize": bh_stepsize,
-}
-optimizer_param_rows["Basin Hopping (Simulated Annealing)"] = (
-    pn.Row(bh_niter, bh_stepsize, height=PARAM_ROW_HEIGHT),
-    pn.Row(pn.Spacer(width=PARAM_WIDGET_WIDTH_SMALL), pn.Spacer(), height=PARAM_ROW_HEIGHT),
-)
+bh_niter = pn.widgets.IntInput(name="niter", value=50, step=1, width=70)
+bh_stepsize = pn.widgets.FloatInput(name="stepsize", value=10.0, step=0.5, width=90)
+optimizer_param_widgets["Basin Hopping (Simulated Annealing)"] = [
+    bh_niter,
+    bh_stepsize,
+]
 
-# SciPy minimize shared maxiter
-sp_maxiter = pn.widgets.IntInput(
-    name="maxiter", value=200, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-for name in ["Nelder-Mead", "Powell", "CG", "L-BFGS-B", "SLSQP", "Trust-Constr (Quadratic Programming-like)"]:
-    optimizer_param_widgets[name] = {"maxiter": sp_maxiter}
-    optimizer_param_rows[name] = (
-        pn.Row(sp_maxiter, pn.Spacer(width=PARAM_WIDGET_WIDTH_SMALL), height=PARAM_ROW_HEIGHT),
-        pn.Row(pn.Spacer(width=PARAM_WIDGET_WIDTH_SMALL), pn.Spacer(), height=PARAM_ROW_HEIGHT),
-    )
+# Shared SciPy minimize
+sp_maxiter = pn.widgets.IntInput(name="maxiter", value=200, step=1, width=70)
+for name in [
+    "Nelder-Mead",
+    "Powell",
+    "CG",
+    "L-BFGS-B",
+    "SLSQP",
+    "Trust-Constr (Quadratic Programming-like)",
+]:
+    optimizer_param_widgets[name] = [sp_maxiter]
 
-# Adam (PyTorch)
-ad_lr = pn.widgets.FloatInput(
-    name="lr", value=0.01, step=0.001,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-ad_maxiter = pn.widgets.IntInput(
-    name="maxiter", value=200, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-optimizer_param_widgets["Adam (PyTorch)"] = {"lr": ad_lr, "maxiter": ad_maxiter}
-optimizer_param_rows["Adam (PyTorch)"] = (
-    pn.Row(ad_lr, ad_maxiter, height=PARAM_ROW_HEIGHT),
-    pn.Row(pn.Spacer(width=PARAM_WIDGET_WIDTH_SMALL), pn.Spacer(), height=PARAM_ROW_HEIGHT),
-)
-
-# Adam (NumPy)
-adn_lr = pn.widgets.FloatInput(
-    name="lr", value=0.01, step=0.001,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-adn_maxiter = pn.widgets.IntInput(
-    name="maxiter", value=200, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
-optimizer_param_widgets["Adam (NumPy)"] = {"lr": adn_lr, "maxiter": adn_maxiter}
-optimizer_param_rows["Adam (NumPy)"] = (
-    pn.Row(adn_lr, adn_maxiter, height=PARAM_ROW_HEIGHT),
-    pn.Row(pn.Spacer(width=PARAM_WIDGET_WIDTH_SMALL), pn.Spacer(), height=PARAM_ROW_HEIGHT),
-)
+# Adam (PyTorch or pure)
+ad_lr = pn.widgets.FloatInput(name="lr", value=0.01, step=0.001, width=90)
+ad_maxiter = pn.widgets.IntInput(name="maxiter", value=200, step=1, width=70)
+optimizer_param_widgets["Adam (PyTorch)"] = [ad_lr, ad_maxiter]
 
 # Genetic Algorithm
 ga_num_generations = pn.widgets.IntInput(
-    name="num_generations", value=80, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
+    name="num_generations", value=80, step=1, width=90
 )
-ga_sol_per_pop = pn.widgets.IntInput(
-    name="sol_per_pop", value=20, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
-)
+ga_sol_per_pop = pn.widgets.IntInput(name="sol_per_pop", value=20, step=1, width=90)
 ga_num_parents_mating = pn.widgets.IntInput(
-    name="num_parents_mating", value=10, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
+    name="num_parents_mating", value=10, step=1, width=90
 )
 ga_mutation_percent = pn.widgets.IntInput(
-    name="mutation_percent_genes", value=10, step=1,
-    width=PARAM_WIDGET_WIDTH_SMALL, height=WIDGET_HEIGHT
+    name="mutation_percent_genes", value=10, step=1, width=90
 )
 ga_parent_selection_type = pn.widgets.Select(
     name="parent_selection_type",
     options=["sss", "rws", "rank", "random"],
     value="sss",
-    width=PARAM_WIDGET_WIDTH_SMALL,
-    height=WIDGET_HEIGHT,
+    width=100,
 )
-optimizer_param_widgets["Genetic Algorithm (pygad)"] = {
-    "num_generations": ga_num_generations,
-    "sol_per_pop": ga_sol_per_pop,
-    "num_parents_mating": ga_num_parents_mating,
-    "mutation_percent_genes": ga_mutation_percent,
-    "parent_selection_type": ga_parent_selection_type,
-}
-optimizer_param_rows["Genetic Algorithm (pygad)"] = (
-    pn.Row(ga_num_generations, ga_sol_per_pop, height=PARAM_ROW_HEIGHT),
-    pn.Row(ga_num_parents_mating, ga_mutation_percent, ga_parent_selection_type, height=PARAM_ROW_HEIGHT),
-)
+optimizer_param_widgets["Genetic Algorithm (pygad)"] = [
+    ga_num_generations,
+    ga_sol_per_pop,
+    ga_num_parents_mating,
+    ga_mutation_percent,
+    ga_parent_selection_type,
+]
 
+# Parameter rows 4 & 5 containers
+param_row4 = pn.Row(name="Params Row 4", css_classes=["param-row"])
+param_row5 = pn.Row(name="Params Row 5", css_classes=["param-row"])
 
-def _update_optimizer_param_rows(event=None):
+def _update_param_rows(event=None):
     algo = optimizer_select.value
-    row1, row2 = optimizer_param_rows.get(algo, (pn.Row(), pn.Row()))
-    optimizer_param_row1_container.objects = [row1]
-    optimizer_param_row2_container.objects = [row2]
+    widgets = optimizer_param_widgets.get(algo, [])
+    half = (len(widgets) + 1) // 2
+    param_row4.objects = widgets[:half]
+    param_row5.objects = widgets[half:]
 
+optimizer_select.param.watch(_update_param_rows, "value")
+_update_param_rows()
 
-optimizer_select.param.watch(_update_optimizer_param_rows, "value")
-_update_optimizer_param_rows()
+# 6th row: run/pause/resume/stop&save
+run_button = pn.widgets.Button(name="Run", button_type="success", width=60)
+pause_button = pn.widgets.Button(name="Pause", button_type="warning", width=60)
+resume_button = pn.widgets.Button(name="Resume", button_type="primary", width=60)
+stop_button = pn.widgets.Button(name="Stop & Save", button_type="danger", width=90)
 
-# Row 6: run/pause/resume/stop+save
-run_button = pn.widgets.Button(
-    name="Run",
-    button_type="primary",
-    width=int(PARAM_WIDTH * 0.23),
-    height=BUTTON_HEIGHT,
-)
-pause_button = pn.widgets.Button(
-    name="Pause",
-    button_type="warning",
-    width=int(PARAM_WIDTH * 0.23),
-    height=BUTTON_HEIGHT,
-)
-continue_button = pn.widgets.Button(
-    name="Resume",
-    button_type="success",
-    width=int(PARAM_WIDTH * 0.23),
-    height=BUTTON_HEIGHT,
-)
-stop_button = pn.widgets.Button(
-    name="Stop+Save",
-    button_type="danger",
-    width=int(PARAM_WIDTH * 0.23),
-    height=BUTTON_HEIGHT,
-)
-
-# Row 7: state file name + save/load state
+# 7th row: state path + save/load
 state_filename_input = pn.widgets.TextInput(
-    name="State file",
-    value="optimizer_state.json",
-    width=int(PARAM_WIDTH * 0.5),
-    height=WIDGET_HEIGHT,
+    name="State file", value="optimizer_state.json", width=140
 )
-save_state_button = pn.widgets.Button(
-    name="Save state",
-    button_type="primary",
-    width=int(PARAM_WIDTH * 0.23),
-    height=BUTTON_HEIGHT,
-)
-load_state_button = pn.widgets.Button(
-    name="Load state",
-    button_type="default",
-    width=int(PARAM_WIDTH * 0.23),
-    height=BUTTON_HEIGHT,
-)
+save_state_button = pn.widgets.Button(name="Save", button_type="primary", width=60)
+load_state_button = pn.widgets.Button(name="Load", button_type="default", width=60)
 
-# Row 8: save dashboard HTML
+# 8th row: HTML export
 html_filename_input = pn.widgets.TextInput(
-    name="HTML file",
-    value="placement_dashboard.html",
-    width=int(PARAM_WIDTH * 0.5),
-    height=WIDGET_HEIGHT,
+    name="HTML file", value="placement_dashboard.html", width=140
 )
 save_html_button = pn.widgets.Button(
-    name="Save HTML",
-    button_type="primary",
-    width=int(PARAM_WIDTH * 0.4),
-    height=BUTTON_HEIGHT,
+    name="Save HTML", button_type="primary", width=80
 )
 
-# Row 9: Status (already defined in manager.status_text)
+# 9th row: Status (manager.status_text already created)
 
-# =====================================================================
-# MAIN TAB CALLBACKS
-# =====================================================================
+# Dashboard refresh interval (for periodic callback)
+refresh_interval_slider = pn.widgets.IntSlider(
+    name="Refresh [ms]",
+    start=10,
+    end=100,
+    step=5,
+    value=20,
+    width=150,
+)
+
+# --------------------------------------------------------------------
+# CALLBACKS (FIRST TAB)
+# --------------------------------------------------------------------
 
 def on_load_config_click(event):
     if not config_file_input.value:
-        manager.status_text.object = "idle"
+        manager._update_status("idle (no file selected)")
         return
+    raw = config_file_input.value
     try:
-        raw = config_file_input.value
         json_str = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-        manager.load_config_from_json_str(json_str, filename=config_file_input.filename)
-        update_canvas_ranges_from_problem()
-        manager.status_text.object = "idle"
-    except Exception:
-        manager.status_text.object = "idle"
+        manager.load_config_from_json_str(json_str, name_hint="uploaded_config.json")
+        input_manager.update_base_config(manager.config)
+        # adjust canvas ranges
+        if manager.problem is not None:
+            canvas_fig.x_range.start = 0
+            canvas_fig.x_range.end = manager.problem.canvas_width
+            canvas_fig.y_range.start = 0
+            canvas_fig.y_range.end = manager.problem.canvas_height
+    except Exception as e:
+        manager._update_status(f"idle (failed to load config: {e})")
 
-
-def _collect_optimizer_params(selected_algo: str) -> Dict[str, Any]:
-    widgets = optimizer_param_widgets.get(selected_algo, {})
+def _collect_optimizer_params(algo: str) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
-    for k, w in widgets.items():
-        params[k] = w.value
+    for w in optimizer_param_widgets.get(algo, []):
+        params[w.name] = w.value
     return params
-
 
 def on_run_click(event):
     algo = optimizer_select.value
     params = _collect_optimizer_params(algo)
     resume = bool(resume_checkbox.value)
     target = float(target_objective_input.value or 0.0)
+    if stop_strategy_radio.value == "max iter only":
+        target = 0.0
     manager.start_run(algo, params, resume_from_best=resume, target_obj=target)
-
 
 def on_pause_click(event):
     manager.pause()
-    # Save state on pause
     if state_filename_input.value:
         manager.save_state_to_file(state_filename_input.value)
 
-
-def on_continue_click(event):
+def on_resume_click(event):
     manager.resume()
-
 
 def on_stop_click(event):
     manager.stop()
@@ -1760,413 +1952,226 @@ def on_stop_click(event):
     if state_filename_input.value:
         manager.save_state_to_file(state_filename_input.value)
 
-
 def on_save_state_click(event):
     if state_filename_input.value:
         manager.save_state_to_file(state_filename_input.value)
 
-
 def on_load_state_click(event):
     if state_filename_input.value:
         manager.load_state_from_file(state_filename_input.value)
-        update_canvas_ranges_from_problem()
-
+        if manager.problem is not None:
+            canvas_fig.x_range.start = 0
+            canvas_fig.x_range.end = manager.problem.canvas_width
+            canvas_fig.y_range.start = 0
+            canvas_fig.y_range.end = manager.problem.canvas_height
 
 def on_save_html_click(event):
     filename = html_filename_input.value or "placement_dashboard.html"
     try:
         pn.io.save(dashboard, filename)
-    except Exception:
-        pass
-
+        manager._update_status(f"idle (HTML saved: {filename})")
+    except Exception as e:
+        manager._update_status(f"idle (failed to save HTML: {e})")
 
 load_config_button.on_click(on_load_config_click)
 run_button.on_click(on_run_click)
 pause_button.on_click(on_pause_click)
-continue_button.on_click(on_continue_click)
+resume_button.on_click(on_resume_click)
 stop_button.on_click(on_stop_click)
 save_state_button.on_click(on_save_state_click)
 load_state_button.on_click(on_load_state_click)
 save_html_button.on_click(on_save_html_click)
 
-# =====================================================================
-# FIRST TAB LAYOUT (PARAMETERS / LIVE UPDATES)
-# =====================================================================
+# --------------------------------------------------------------------
+# INPUT PLACEMENT TAB WIDGETS
+# --------------------------------------------------------------------
 
-parameters_panel = pn.Column(
-    pn.Row(config_file_input, load_config_button, height=PARAM_ROW_HEIGHT),
-    pn.Row(optimizer_select, height=PARAM_ROW_HEIGHT),
-    pn.Row(stop_strategy_select, target_objective_input, resume_checkbox, height=PARAM_ROW_HEIGHT),
-    optimizer_param_row1_container,
-    optimizer_param_row2_container,
-    pn.Row(run_button, pause_button, continue_button, stop_button, height=PARAM_ROW_HEIGHT),
-    pn.Row(state_filename_input, save_state_button, load_state_button, height=PARAM_ROW_HEIGHT),
-    pn.Row(html_filename_input, save_html_button, height=PARAM_ROW_HEIGHT),
-    pn.Row(manager.status_text, height=PARAM_ROW_HEIGHT),
-    width=PARAM_WIDTH,
-    height=PARAM_HEIGHT,
-    css_classes=["parameters-panel"],
+input_num_rectangles = pn.widgets.IntInput(
+    name="Num Rectangles", value=5, step=1, width=100
+)
+input_canvas_width = pn.widgets.FloatInput(
+    name="Canvas W", value=1000.0, step=10.0, width=100
+)
+input_canvas_height = pn.widgets.FloatInput(
+    name="Canvas H", value=800.0, step=10.0, width=100
 )
 
-live_updates_panel = pn.Column(
+def _on_canvas_params_change(event=None):
+    input_manager.canvas_width = float(input_canvas_width.value or 1000.0)
+    input_manager.canvas_height = float(input_canvas_height.value or 800.0)
+    input_canvas_fig.x_range.start = 0
+    input_canvas_fig.x_range.end = input_manager.canvas_width
+    input_canvas_fig.y_range.start = 0
+    input_canvas_fig.y_range.end = input_manager.canvas_height
+    input_manager.regenerate_rectangles(int(input_num_rectangles.value or 0))
+
+input_num_rectangles.param.watch(_on_canvas_params_change, "value")
+input_canvas_width.param.watch(_on_canvas_params_change, "value")
+input_canvas_height.param.watch(_on_canvas_params_change, "value")
+
+# Row 2: add rectangle
+input_add_rect_button = pn.widgets.Button(
+    name="Add Rect.", button_type="success", width=100
+)
+
+def on_input_add_rect(event):
+    input_manager.add_rectangle()
+
+input_add_rect_button.on_click(on_input_add_rect)
+
+# Row 3: randomize sizes & positions
+input_randomize_button = pn.widgets.Button(
+    name="Randomize All", button_type="warning", width=120
+)
+
+def on_input_randomize(event):
+    input_manager.randomize_all()
+
+input_randomize_button.on_click(on_input_randomize)
+
+# Row 4: config filename + write button
+input_config_name_input = pn.widgets.TextInput(
+    name="New Config Name", value="input_rectangles_config.json", width=180
+)
+input_write_config_button = pn.widgets.Button(
+    name="Write Config", button_type="primary", width=100
+)
+
+def on_input_write_config(event):
+    fname = input_config_name_input.value or "input_rectangles_config.json"
+    input_manager.write_config_to_file(fname)
+
+input_write_config_button.on_click(on_input_write_config)
+
+# Initial rectangles
+_on_canvas_params_change()
+
+# --------------------------------------------------------------------
+# LAYOUTS
+# --------------------------------------------------------------------
+
+# First tab left: Parameters (9 rows)
+parameters_left = pn.Column(
+    pn.pane.Markdown("**Parameters**"),
+    pn.Row(config_file_input, load_config_button, css_classes=["param-row"]),
+    pn.Row(optimizer_select, css_classes=["param-row"]),
+    pn.Row(stop_strategy_radio, target_objective_input, resume_checkbox, css_classes=["param-row"]),
+    param_row4,
+    param_row5,
+    pn.Row(run_button, pause_button, resume_button, stop_button, css_classes=["param-row"]),
+    pn.Row(state_filename_input, save_state_button, load_state_button, css_classes=["param-row"]),
+    pn.Row(html_filename_input, save_html_button, css_classes=["param-row"]),
+    pn.Row(manager.status_text, css_classes=["param-row"]),
+    css_classes=["parameters-section"],
+)
+
+# First tab right: Live Updates
+live_updates_right = pn.Column(
+    pn.pane.Markdown("**Live Updates**"),
     canvas_fig,
     pn.Row(objective_fig, constraint_fig),
-    width=LIVE_WIDTH,
-    height=LIVE_HEIGHT,
-    css_classes=["live-panel"],
+    css_classes=["live-section"],
 )
 
-first_tab = pn.Row(parameters_panel, live_updates_panel, width=SCREEN_WIDTH, height=SCREEN_HEIGHT)
+first_tab = pn.Row(parameters_left, live_updates_right)
 
-# =====================================================================
-# LOGS TAB
-# =====================================================================
-
-logs_tab = pn.Column(
-    pn.pane.Markdown("### Logs (most recent at top)"),
-    manager.log_table,
-    width=LOGS_TAB_WIDTH,
-    height=LOGS_TAB_HEIGHT,
-)
-
-# =====================================================================
-# INPUT PLACEMENT TAB (CONFIG BUILDER)
-# =====================================================================
-
-# ColumnDataSource for rectangles in input canvas
-input_canvas_source = ColumnDataSource(
-    data=dict(
-        x=[],
-        y=[],
-        w=[],
-        h=[],
-        rect_id=[],
-    )
-)
-
-# Input canvas figure
-def make_input_canvas_fig():
-    fig = figure(
-        height=INPUT_CANVAS_HEIGHT,
-        width=INPUT_CANVAS_WIDTH,
-        title="Input Canvas (drag/resize rectangles)",
-        x_axis_label="x",
-        y_axis_label="y",
-        match_aspect=True,
-        tools="pan,wheel_zoom,reset",
-        background_fill_color=COLOR_PANEL_BG,
-        border_fill_color=COLOR_PANEL_BG,
-        toolbar_location="right",
-        min_border=PLOT_MIN_BORDER,
-    )
-    fig.grid.grid_line_color = COLOR_GRID
-    fig.axis.axis_label_text_color = COLOR_TEXT
-    fig.axis.major_label_text_color = COLOR_TEXT
-    fig.title.text_color = COLOR_PRIMARY
-    fig.title.text_font_size = "10pt"
-
-    rect_r = fig.rect(
-        x="x", y="y", width="w", height="h",
-        source=input_canvas_source,
-        fill_alpha=0.25,
-        line_alpha=0.9,
-        fill_color=COLOR_RECT_FILL,
-        line_color=COLOR_RECT_LINE,
-    )
-
-    box_edit = BoxEditTool(renderers=[rect_r])
-    tap_tool = TapTool()
-    fig.add_tools(box_edit, tap_tool)
-    fig.toolbar.active_drag = box_edit
-
-    return fig, rect_r
-
-
-input_canvas_fig, input_rect_renderer = make_input_canvas_fig()
-
-# Inputs in parameter panel of Input Placement tab
-num_rectangles_input = pn.widgets.IntInput(
-    name="Num rects",
-    value=0,
-    step=1,
-    width=int(INPUT_PARAM_WIDTH * 0.3),
-    height=WIDGET_HEIGHT,
-)
-input_canvas_width_input = pn.widgets.FloatInput(
-    name="Canvas W",
-    value=1000.0,
-    step=10.0,
-    width=int(INPUT_PARAM_WIDTH * 0.3),
-    height=WIDGET_HEIGHT,
-)
-input_canvas_height_input = pn.widgets.FloatInput(
-    name="Canvas H",
-    value=800.0,
-    step=10.0,
-    width=int(INPUT_PARAM_WIDTH * 0.3),
-    height=WIDGET_HEIGHT,
-)
-
-add_one_rect_button = pn.widgets.Button(
-    name="Add Rect",
-    button_type="primary",
-    width=int(INPUT_PARAM_WIDTH * 0.45),
-    height=BUTTON_HEIGHT,
-)
-randomize_button = pn.widgets.Button(
-    name="Randomize All",
-    button_type="warning",
-    width=int(INPUT_PARAM_WIDTH * 0.45),
-    height=BUTTON_HEIGHT,
-)
-
-input_config_filename_input = pn.widgets.TextInput(
-    name="New config name",
-    value="generated_placement.json",
-    width=int(INPUT_PARAM_WIDTH * 0.6),
-    height=WIDGET_HEIGHT,
-)
-write_config_button = pn.widgets.Button(
-    name="Write Config",
-    button_type="primary",
-    width=int(INPUT_PARAM_WIDTH * 0.35),
-    height=BUTTON_HEIGHT,
-)
-
-# Objective/constraints display for input canvas
-input_obj_terms_text = pn.pane.Markdown("Objective terms: -", height=PARAM_ROW_HEIGHT)
-input_obj_total_text = pn.pane.Markdown("Total objective: -", height=PARAM_ROW_HEIGHT)
-input_constraints_text = pn.pane.Markdown("Constraint terms: -", height=PARAM_ROW_HEIGHT)
-
-def _build_input_problem() -> Optional[PlacementProblem]:
-    """
-    Build a PlacementProblem for the input canvas using constraints/objective
-    from the currently loaded main config (if any).
-    """
-    if manager.config is None:
-        base_cfg = {
-            "constraints": {},
-            "objective": {"weights": {"hpwl": 1.0, "bbox_aspect": 0.5, "bbox_area": 0.01}},
-        }
-    else:
-        base_cfg = {
-            "constraints": manager.config.get("constraints", {}),
-            "objective": manager.config.get("objective", {}),
-        }
-
-    data = input_canvas_source.data
-    rects = []
-    for i in range(len(data["x"])):
-        rects.append(
-            {
-                "id": data["rect_id"][i],
-                "width": data["w"][i],
-                "height": data["h"][i],
-                "initial_center": [data["x"][i], data["y"][i]],
-            }
-        )
-
-    cfg = dict(base_cfg)
-    cfg["canvas"] = {
-        "width": float(input_canvas_width_input.value),
-        "height": float(input_canvas_height_input.value),
-    }
-    cfg["rectangles"] = rects
-    if not rects:
-        return None
-    return PlacementProblem(cfg)
-
-
-def _update_input_canvas_ranges():
-    input_canvas_fig.x_range.start = 0
-    input_canvas_fig.x_range.end = input_canvas_width_input.value
-    input_canvas_fig.y_range.start = 0
-    input_canvas_fig.y_range.end = input_canvas_height_input.value
-
-
-def _update_input_metrics():
-    problem = _build_input_problem()
-    if problem is None:
-        input_obj_terms_text.object = "Objective terms: -"
-        input_obj_total_text.object = "Total objective: -"
-        input_constraints_text.object = "Constraint terms: -"
-        return
-
-    x_vec = problem.initial_vector()
-    metrics = problem.compute_metrics(x_vec)
-    input_obj_terms_text.object = (
-        f"Objective terms: HPWL={metrics['hpwl']:.2f}, "
-        f"AR={metrics['bbox_aspect']:.3f}, "
-        f"Area={metrics['bbox_area']:.1f}"
-    )
-    input_obj_total_text.object = f"Total objective: {metrics['objective_augmented']:.3f}"
-    input_constraints_text.object = (
-        "Constraint terms: "
-        f"Overlap={metrics['overlap_max_ratio']:.3f}, "
-        f"dx_viol={metrics['spacing_x_violation']:.3f}, "
-        f"dy_viol={metrics['spacing_y_violation']:.3f}, "
-        f"AR_viol={metrics['bbox_ar_violation']:.3f}, "
-        f"Boundary={metrics['boundary_violation']:.3f}"
-    )
-
-
-def _on_input_canvas_change(attr, old, new):
-    _update_input_canvas_ranges()
-    _update_input_metrics()
-
-
-input_canvas_source.on_change("data", _on_input_canvas_change)
-
-def _add_random_rectangle():
-    n = num_rectangles_input.value + 1
-    num_rectangles_input.value = n
-
-    W = float(input_canvas_width_input.value)
-    H = float(input_canvas_height_input.value)
-    # Reasonable random sizes
-    w = W * np.random.uniform(0.05, 0.15)
-    h = H * np.random.uniform(0.05, 0.15)
-    x = np.random.uniform(w / 2, W - w / 2)
-    y = np.random.uniform(h / 2, H - h / 2)
-    rect_id = f"R{n - 1}"
-
-    data = input_canvas_source.data
-    data["x"].append(x)
-    data["y"].append(y)
-    data["w"].append(w)
-    data["h"].append(h)
-    data["rect_id"].append(rect_id)
-    input_canvas_source.data = data
-
-
-def on_add_one_rect_click(event):
-    _add_random_rectangle()
-
-
-def on_randomize_click(event):
-    n = num_rectangles_input.value
-    W = float(input_canvas_width_input.value)
-    H = float(input_canvas_height_input.value)
-
-    xs = []
-    ys = []
-    ws = []
-    hs = []
-    rect_ids = []
-    for i in range(n):
-        w = W * np.random.uniform(0.05, 0.15)
-        h = H * np.random.uniform(0.05, 0.15)
-        x = np.random.uniform(w / 2, W - w / 2)
-        y = np.random.uniform(h / 2, H - h / 2)
-        xs.append(x)
-        ys.append(y)
-        ws.append(w)
-        hs.append(h)
-        rect_ids.append(f"R{i}")
-    input_canvas_source.data = dict(x=xs, y=ys, w=ws, h=hs, rect_id=rect_ids)
-
-
-def on_write_config_click(event):
-    # Build config
-    if manager.config is None:
-        base_cfg = {
-            "constraints": {},
-            "objective": {"weights": {"hpwl": 1.0, "bbox_aspect": 0.5, "bbox_area": 0.01}},
-        }
-    else:
-        base_cfg = {
-            "constraints": manager.config.get("constraints", {}),
-            "objective": manager.config.get("objective", {}),
-        }
-
-    data = input_canvas_source.data
-    rects = []
-    for i in range(len(data["x"])):
-        rects.append(
-            {
-                "id": data["rect_id"][i],
-                "width": float(data["w"][i]),
-                "height": float(data["h"][i]),
-                "initial_center": [float(data["x"][i]), float(data["y"][i])],
-            }
-        )
-
-    cfg = dict(base_cfg)
-    cfg["canvas"] = {
-        "width": float(input_canvas_width_input.value),
-        "height": float(input_canvas_height_input.value),
-    }
-    cfg["rectangles"] = rects
-
-    filename = input_config_filename_input.value or "generated_placement.json"
-    path = os.path.join(os.getcwd(), filename)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-
-add_one_rect_button.on_click(on_add_one_rect_click)
-randomize_button.on_click(on_randomize_click)
-write_config_button.on_click(on_write_config_click)
-
-# Input Placement layout (7 rows as required)
+# Second tab: Input Placement
 input_param_panel = pn.Column(
-    pn.Row(num_rectangles_input, input_canvas_width_input, input_canvas_height_input, height=PARAM_ROW_HEIGHT),
-    pn.Row(add_one_rect_button, height=PARAM_ROW_HEIGHT),
-    pn.Row(randomize_button, height=PARAM_ROW_HEIGHT),
-    pn.Row(input_config_filename_input, write_config_button, height=PARAM_ROW_HEIGHT),
-    pn.Row(input_obj_terms_text, height=PARAM_ROW_HEIGHT),
-    pn.Row(input_obj_total_text, height=PARAM_ROW_HEIGHT),
-    pn.Row(input_constraints_text, height=PARAM_ROW_HEIGHT),
-    width=INPUT_PARAM_WIDTH,
-    height=INPUT_PARAM_HEIGHT,
-    css_classes=["parameters-panel"],
+    pn.pane.Markdown("**Input Placement - Parameter Panel**"),
+    pn.Row(input_num_rectangles, input_canvas_width, input_canvas_height, css_classes=["param-row"]),
+    pn.Row(input_add_rect_button, css_classes=["param-row"]),
+    pn.Row(input_randomize_button, css_classes=["param-row"]),
+    pn.Row(input_config_name_input, input_write_config_button, css_classes=["param-row"]),
+    pn.Row(input_manager.obj_terms_text, css_classes=["param-row"]),
+    pn.Row(input_manager.obj_combined_text, css_classes=["param-row"]),
+    pn.Row(input_manager.constraints_text, css_classes=["param-row"]),
+    css_classes=["input-param-section"],
 )
 
-input_tab = pn.Row(
-    input_param_panel,
+input_canvas_panel = pn.Column(
     input_canvas_fig,
-    width=SCREEN_WIDTH,
-    height=SCREEN_HEIGHT,
+    css_classes=["input-canvas-section"],
 )
 
-# =====================================================================
-# TABS ASSEMBLY
-# =====================================================================
+input_tab = pn.Row(input_param_panel, input_canvas_panel)
+
+# Third tab: Logs
+logs_tab = pn.Column(
+    pn.pane.Markdown("**Logs**"),
+    pn.Column(manager.log_table, css_classes=["logs-table-container"]),
+    css_classes=["logs-tab"],
+)
 
 dashboard = pn.Tabs(
-    ("1. Optimization", first_tab),
-    ("2. Logs", logs_tab),
-    ("3. Input Placement", input_tab),
-    width=SCREEN_WIDTH,
-    height=SCREEN_HEIGHT,
+    ("1. Controls & Live Updates", first_tab),
+    ("2. Input Placement", input_tab),
+    ("3. Logs", logs_tab),
 )
 
-# =====================================================================
-# PERIODIC CALLBACK
-# =====================================================================
+# --------------------------------------------------------------------
+# RESPONSIVE SIZING & PERIODIC CALLBACK (NO EVENT-LOOP ERROR)
+# --------------------------------------------------------------------
 
-def _periodic_callback():
-    target = float(target_objective_input.value or 0.0)
-    manager.periodic_update(target_obj=target)
-    # Update canvas title with latest iteration
-    if manager.iteration > 0:
-        canvas_fig.title.text = f"Canvas View (iteration {manager.iteration})"
-    else:
-        canvas_fig.title.text = "Canvas View (iteration -)"
+periodic_cb = None  # will be set on load
 
+def _update_sizes_from_viewport(event=None):
+    w = pn.state.viewport_width or DEFAULT_VIEWPORT_WIDTH
+    h = pn.state.viewport_height or DEFAULT_VIEWPORT_HEIGHT
 
-# 20 ms default refresh (can be tuned by changing here if needed)
-pn.state.add_periodic_callback(_periodic_callback, period=20, start=True)
+    canvas_fig.width = int(w * LIVE_SECTION_WIDTH_FRACTION * 0.98)
+    canvas_fig.height = int(h * CANVAS_VIEW_HEIGHT_FRACTION * 0.48)
 
-# =====================================================================
-# MAIN ENTRY POINT
-# =====================================================================
+    objective_fig.width = int(w * LIVE_SECTION_WIDTH_FRACTION * 0.49)
+    objective_fig.height = int(h * OBJ_GRAPH_HEIGHT_FRACTION * 0.48)
+
+    constraint_fig.width = int(w * LIVE_SECTION_WIDTH_FRACTION * 0.49)
+    constraint_fig.height = int(h * CON_GRAPH_HEIGHT_FRACTION * 0.48)
+
+    input_canvas_fig.width = int(w * INPUT_CANVAS_SECTION_WIDTH_FRACTION * 0.98)
+    input_canvas_fig.height = int(h * 0.9)
+
+    manager.log_table.height = int(h * 0.85)
+
+def _start_periodic():
+    global periodic_cb
+    _update_sizes_from_viewport()
+    def _tick():
+        target = float(target_objective_input.value or 0.0)
+        if stop_strategy_radio.value == "max iter only":
+            target_local = 0.0
+        else:
+            target_local = target
+        manager.periodic_update(target_local, canvas_fig, objective_fig)
+
+    periodic_cb = pn.state.add_periodic_callback(
+        _tick, period=refresh_interval_slider.value, start=True
+    )
+
+def _on_refresh_interval_change(event):
+    global periodic_cb
+    if periodic_cb is not None:
+        periodic_cb.period = refresh_interval_slider.value
+
+refresh_interval_slider.param.watch(_on_refresh_interval_change, "value")
+
+def _on_viewport_change(event):
+    _update_sizes_from_viewport()
+
+pn.state.param.watch(_on_viewport_change, "viewport_width")
+pn.state.param.watch(_on_viewport_change, "viewport_height")
+
+pn.state.onload(_start_periodic)
+
+# --------------------------------------------------------------------
+# ENTRYPOINT - RUN WITH "python placement_dashboard.py"
+# --------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # panel.serve returns immediately, but starts Bokeh server; show=True opens browser
     pn.serve(
         dashboard,
         title="Rectangle Placement Dashboard",
         show=True,
         address="localhost",
-        port=5007,
+        port=0,  # random free port
     )
