@@ -1,0 +1,857 @@
+"""
+input_placement_manager.py
+==========================
+
+Backend logic for the "Input Placement" tab.
+
+This module defines the `InputPlacementManager` class, whose job is to:
+
+1. Maintain a **mutable in-memory canvas + rectangles definition**
+   completely independent of the optimisation runs.
+
+2. Provide a **clean API** for the dashboard to:
+
+   - Change the canvas size (width/height).
+   - Set the number of rectangles (increase / decrease) **without**
+     randomising existing rectangles.
+   - Add a single rectangle ("Add Rect." button).
+   - Randomise positions of all rectangles (but **not** their sizes).
+   - Delete a specific rectangle (usually the selected one in the UI).
+   - Update a rectangle's size (width/height) from numeric inputs.
+   - Update rectangles from interactive dragging (Bokeh BoxEditTool).
+
+3. Compute **objective and constraint metrics** for the current
+   canvas/rectangles using the same logic as the main placement problem:
+
+   - It builds a temporary `PlacementProblem` using:
+       * Current canvas width/height
+       * Current rectangles (width, height, centre)
+       * The constraints and objective weights taken from a base config
+         that comes from the main JSON file loaded in the dashboard.
+
+4. Generate a **new JSON-like config** dictionary that can be directly
+   written to disk as a new config file:
+
+   - The new config contains:
+       * "canvas" with current width/height
+       * "rectangles" with current rectangle data
+       * All other keys (constraints, objective, etc.) copied from a
+         base config provided at construction.
+
+5. Be completely UI-agnostic:
+
+   - No Panel imports.
+   - No Bokeh figure creation here.
+   - Only simple data structures (lists, dicts, floats).
+   - The dashboard handles all widgets/figures and only passes data
+     to/from this manager.
+
+The dashboard code (Code 4) will typically:
+
+- Construct this manager as:
+
+    ipm = InputPlacementManager(base_config_dict)
+
+  where `base_config_dict` is the config loaded from a JSON file that
+  will be used later for optimisation (constraints, objective weights,
+  etc.).
+
+- Use:
+
+    - `ipm.set_canvas_size(...)`
+    - `ipm.set_num_rectangles(...)`
+    - `ipm.add_rectangle()`
+    - `ipm.randomize_positions()`
+    - `ipm.update_rectangle_size(rect_id, w, h)`
+    - `ipm.delete_rectangle_by_id(rect_id)`
+    - `ipm.update_from_bokeh_data(source.data)`
+    - `rect_data = ipm.get_rectangles_data()`  (for ColumnDataSource)
+    - `metrics = ipm.compute_metrics()`       (for live objective/constraints)
+    - `new_config = ipm.generate_config_dict()` (for saving to JSON)
+
+Everything is heavily commented to make the logic easy to follow and
+modify.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import copy
+import numpy as np
+
+from placement_problem import PlacementProblem, RectangleDef
+
+
+# ---------------------------------------------------------------------------
+# RECTANGLE DATA CLASS FOR INPUT PLACEMENT
+# ---------------------------------------------------------------------------
+
+@dataclass
+class InputRect:
+    """
+    Small data container representing a rectangle in the Input Placement tab.
+
+    We deliberately separate this from `RectangleDef` even though they are
+    very similar, because:
+
+    - Here we treat `cx, cy` as the *current* centre (fully mutable).
+    - We want to keep track of creation order explicitly (via id naming),
+      so decreasing the number of rectangles removes the most recently
+      created rectangles.
+
+    Attributes
+    ----------
+    rect_id : str
+        Unique identifier of the rectangle, e.g. "R0", "R1", ...
+
+    width : float
+        Width of the rectangle.
+
+    height : float
+        Height of the rectangle.
+
+    cx : float
+        Current x-coordinate of the rectangle centre.
+
+    cy : float
+        Current y-coordinate of the rectangle centre.
+    """
+    rect_id: str
+    width: float
+    height: float
+    cx: float
+    cy: float
+
+
+# ---------------------------------------------------------------------------
+# INPUT PLACEMENT MANAGER
+# ---------------------------------------------------------------------------
+
+class InputPlacementManager:
+    """
+    Backend manager for the "Input Placement" tab.
+
+    Responsibilities
+    ----------------
+
+    1. Hold a **mutable** representation of:
+       - Canvas width, height
+       - A list of rectangles (InputRect objects)
+
+    2. Provide operations requested in your specs:
+       - Set canvas size.
+       - Set number of rectangles (`set_num_rectangles`):
+           * Increasing: create new rectangles with arbitrary but not-too-small
+             size and position.
+           * Decreasing: delete rectangles in creation order (highest index
+             removed first), **not** randomising position or shape of remaining
+             rectangles.
+       - Add a single rectangle (`add_rectangle`).
+       - Randomise positions of **all** rectangles (`randomize_positions`)
+         without changing their sizes.
+       - Delete a specific rectangle (`delete_rectangle_by_id`).
+       - Update sizes (`update_rectangle_size`) and positions
+         (`update_rectangle_position`).
+       - Synchronise from a Bokeh ColumnDataSource data dict
+         (`update_from_bokeh_data`).
+
+    3. Provide data for plotting:
+       - `get_rectangles_data()` returns a dictionary with:
+           * "x", "y", "width", "height", "rect_id"
+         suitable for feeding directly into a Bokeh `ColumnDataSource`.
+
+    4. Compute metrics:
+       - `compute_metrics()` builds a temporary `PlacementProblem` using
+         current rectangles and canvas, along with the constraints and
+         objective weights from the `base_config`, and returns the full
+         metrics dictionary:
+           * hpwl, bbox_aspect, bbox_area, objective_pure, objective_augmented,
+             overlap_max_ratio, spacing_x_violation, spacing_y_violation,
+             bbox_ar_violation, boundary_violation
+
+    5. Generate new config dict:
+       - `generate_config_dict()` merges:
+           * base_config (constraints, objective, other keys)
+           * current canvas size
+           * current rectangles (under "rectangles")
+         into a complete config dictionary that can be written out to JSON.
+
+
+    Construction
+    -----------
+
+    ipm = InputPlacementManager(base_config)
+
+    where `base_config` is the original JSON config dict loaded by the
+    dashboard that you want to use as template for constraints/objective
+    etc.
+
+    If `base_config` already contains "canvas" and "rectangles", they will
+    be used as an **initial** canvas and rectangle list; otherwise sensible
+    defaults are used (empty list of rectangles and some default canvas size).
+    """
+
+    # -------------------------------------------------------------------
+    # INITIALISATION
+    # -------------------------------------------------------------------
+
+    def __init__(self, base_config: Dict[str, Any]):
+        """
+        Parameters
+        ----------
+        base_config : Dict[str, Any]
+            Dictionary representing the base configuration loaded from
+            the JSON file that the main dashboard uses for optimisation.
+
+            It is expected to contain:
+              - "canvas": { "width": float, "height": float } (optional)
+              - "rectangles": [ { "id": ..., "width": ..., "height": ...,
+                                  "initial_center": [cx, cy] }, ... ]
+                              (optional)
+              - "constraints": {...}  (optional)
+              - "objective": {"weights": {...}} (optional)
+              - Possibly other application-specific keys that we *do not*
+                touch here.
+
+        Notes
+        -----
+        - We deep-copy `base_config` into `self.base_config` so that
+          modifications here do not affect the original dict in the
+          dashboard. This is important so that `generate_config_dict()`
+          always starts from a clean template.
+        """
+        # Deep copy to make sure we never mutate the original base_config
+        self.base_config: Dict[str, Any] = copy.deepcopy(base_config)
+
+        # Canvas size: use base_config if available, else default
+        canvas_cfg = self.base_config.get("canvas", {})
+        self.canvas_width: float = float(canvas_cfg.get("width", 1000.0))
+        self.canvas_height: float = float(canvas_cfg.get("height", 800.0))
+
+        # Internal list of InputRect
+        self.rectangles: List[InputRect] = []
+
+        # If base_config has rectangles, initialise from them
+        rects_cfg = self.base_config.get("rectangles", [])
+        for i, r in enumerate(rects_cfg):
+            rect_id = r.get("id", f"R{i}")
+            w = float(r["width"])
+            h = float(r["height"])
+            cx, cy = r.get("initial_center", [self.canvas_width / 2.0, self.canvas_height / 2.0])
+            self.rectangles.append(
+                InputRect(
+                    rect_id=rect_id,
+                    width=w,
+                    height=h,
+                    cx=float(cx),
+                    cy=float(cy),
+                )
+            )
+
+        # Keep a running counter for generating new rectangle IDs.
+        # We assume that existing rect_ids, if any, are of the form "R<number>".
+        # We'll parse the numeric suffix to find the largest index and then
+        # increment from there. If parsing fails, we fall back to len(rectangles).
+        self._next_rect_index: int = self._compute_initial_next_index()
+
+        # Internal mapping from rect_id -> index in self.rectangles list.
+        # This is rebuilt whenever we change the rectangle list.
+        self._rect_index_by_id: Dict[str, int] = {}
+        self._rebuild_rect_index()
+
+    # -------------------------------------------------------------------
+    # INTERNAL HELPERS
+    # -------------------------------------------------------------------
+
+    def _compute_initial_next_index(self) -> int:
+        """
+        Compute the next rectangle index based on existing rect_ids.
+
+        We try to interpret each rect_id as something like "R<number>".
+        If successful, we keep track of the largest number seen. The next
+        index becomes (largest + 1). If we cannot parse anything, we
+        fall back to len(self.rectangles).
+
+        Returns
+        -------
+        int
+            The next index to use when generating a new rect_id.
+        """
+        max_idx = -1
+        for rect in self.rectangles:
+            rid = rect.rect_id
+            if isinstance(rid, str) and rid.startswith("R"):
+                try:
+                    num = int(rid[1:])
+                    if num > max_idx:
+                        max_idx = num
+                except ValueError:
+                    # Non-numeric suffix -> ignore
+                    pass
+        if max_idx >= 0:
+            return max_idx + 1
+        return len(self.rectangles)
+
+    def _rebuild_rect_index(self) -> None:
+        """
+        Rebuild the mapping from rect_id to index.
+
+        This should be called **any time** we change the `self.rectangles`
+        list (e.g. after adding, deleting, or reordering rectangles).
+        """
+        self._rect_index_by_id = {r.rect_id: i for i, r in enumerate(self.rectangles)}
+
+    def _generate_new_rect_id(self) -> str:
+        """
+        Generate a new unique rect_id of the form "R<n>".
+
+        Returns
+        -------
+        str
+            A rect_id that does not collide with any existing one.
+        """
+        rid = f"R{self._next_rect_index}"
+        self._next_rect_index += 1
+        return rid
+
+    def _ensure_canvas_nonzero(self) -> None:
+        """
+        Ensure the canvas width and height are not zero (to avoid degenerate
+        cases when we place rectangles).
+
+        If width or height is <= 0, we set them to a small default.
+        """
+        if self.canvas_width <= 0.0:
+            self.canvas_width = 100.0
+        if self.canvas_height <= 0.0:
+            self.canvas_height = 100.0
+
+    def _get_default_rect_size(self) -> Tuple[float, float]:
+        """
+        Compute a default rectangle size that is "not too small" relative
+        to the current canvas.
+
+        Returns
+        -------
+        (w, h) : Tuple[float, float]
+            Default width and height for a newly created rectangle.
+
+        Notes
+        -----
+        We use a fraction (e.g. 1/10) of the smaller canvas dimension.
+        """
+        self._ensure_canvas_nonzero()
+        base = min(self.canvas_width, self.canvas_height)
+        # Ensure a minimum size in case the canvas is very small
+        side = max(base / 10.0, 10.0)
+        return side, side
+
+    def _get_default_rect_position(self) -> Tuple[float, float]:
+        """
+        Compute a default random position for a new rectangle inside the
+        canvas, keeping it fully within bounds.
+
+        Returns
+        -------
+        (cx, cy) : Tuple[float, float]
+            A random centre coordinate for a new rectangle.
+
+        Notes
+        -----
+        We use uniform sampling within a safe margin derived from the
+        default rectangle size.
+        """
+        self._ensure_canvas_nonzero()
+        w, h = self._get_default_rect_size()
+        half_w = w / 2.0
+        half_h = h / 2.0
+
+        cx = np.random.uniform(half_w, self.canvas_width - half_w)
+        cy = np.random.uniform(half_h, self.canvas_height - half_h)
+        return cx, cy
+
+    # -------------------------------------------------------------------
+    # PUBLIC: CANVAS SIZE
+    # -------------------------------------------------------------------
+
+    def set_canvas_size(self, width: float, height: float) -> None:
+        """
+        Set the canvas width and height.
+
+        Parameters
+        ----------
+        width : float
+            New canvas width.
+
+        height : float
+            New canvas height.
+
+        Notes
+        -----
+        - This does *not* automatically reposition rectangles; they remain
+          at their current centres, even if they go out of bounds.
+        - The dashboard is responsible for updating the Bokeh figure's
+          x_range/y_range accordingly (0..width, 0..height).
+        """
+        self.canvas_width = float(width)
+        self.canvas_height = float(height)
+        self._ensure_canvas_nonzero()
+
+    def get_canvas_size(self) -> Tuple[float, float]:
+        """
+        Return the current canvas size.
+
+        Returns
+        -------
+        (width, height) : Tuple[float, float]
+        """
+        return self.canvas_width, self.canvas_height
+
+    # -------------------------------------------------------------------
+    # PUBLIC: RECTANGLE COLLECTION MANAGEMENT
+    # -------------------------------------------------------------------
+
+    def set_num_rectangles(self, n: int) -> None:
+        """
+        Set the total number of rectangles.
+
+        Behaviour (per your strict specification):
+        ------------------------------------------
+
+        - When **increasing** the number of rectangles:
+            * Do **NOT** randomise the position or shape of existing rectangles.
+            * Only append *new* rectangles with arbitrary size and position.
+
+        - When **decreasing** the number of rectangles:
+            * Delete rectangles sequentially as they were originally created.
+              i.e. based on their IDs / order in `self.rectangles`.
+            * Do **NOT** randomise the position or shapes of the remaining
+              rectangles.
+
+        Parameters
+        ----------
+        n : int
+            Desired number of rectangles (n >= 0).
+        """
+        n = max(0, int(n))
+        current = len(self.rectangles)
+
+        if n == current:
+            # No change
+            return
+
+        if n > current:
+            # Need to add (n - current) rectangles
+            num_new = n - current
+            for _ in range(num_new):
+                self.add_rectangle()
+        else:
+            # Need to remove (current - n) rectangles
+            num_remove = current - n
+            # Remove from the end (latest created rectangles)
+            for _ in range(num_remove):
+                if self.rectangles:
+                    self.rectangles.pop()
+            self._rebuild_rect_index()
+
+    def add_rectangle(self) -> InputRect:
+        """
+        Add a single new rectangle with arbitrary (but not too small) size
+        and random position within the current canvas.
+
+        Existing rectangles are **not** randomised or changed.
+
+        Returns
+        -------
+        InputRect
+            The newly created rectangle object.
+        """
+        w, h = self._get_default_rect_size()
+        cx, cy = self._get_default_rect_position()
+        rid = self._generate_new_rect_id()
+
+        rect = InputRect(
+            rect_id=rid,
+            width=w,
+            height=h,
+            cx=cx,
+            cy=cy,
+        )
+        self.rectangles.append(rect)
+        self._rebuild_rect_index()
+        return rect
+
+    def delete_rectangle_by_id(self, rect_id: str) -> None:
+        """
+        Delete a rectangle by its ID.
+
+        Parameters
+        ----------
+        rect_id : str
+            ID of the rectangle to delete.
+
+        Notes
+        -----
+        - If rect_id does not exist, this method silently does nothing.
+        - The remaining rectangles retain their sizes and positions; no
+          randomisation is performed.
+        """
+        idx = self._rect_index_by_id.get(rect_id)
+        if idx is None:
+            return
+        # Remove the rectangle
+        self.rectangles.pop(idx)
+        self._rebuild_rect_index()
+
+    # -------------------------------------------------------------------
+    # PUBLIC: RANDOMISATION OF POSITIONS (NOT SIZES)
+    # -------------------------------------------------------------------
+
+    def randomize_positions(self) -> None:
+        """
+        Randomise the positions of **all** rectangles within the canvas,
+        without changing their sizes.
+
+        This is used for the "Randomize All" button in the Input Placement
+        tab, with the updated requirement:
+
+            - Randomise **only** the positions, not the sizes.
+        """
+        self._ensure_canvas_nonzero()
+        for rect in self.rectangles:
+            half_w = rect.width / 2.0
+            half_h = rect.height / 2.0
+            cx = np.random.uniform(half_w, self.canvas_width - half_w)
+            cy = np.random.uniform(half_h, self.canvas_height - half_h)
+            rect.cx = cx
+            rect.cy = cy
+
+    # -------------------------------------------------------------------
+    # PUBLIC: RECTANGLE ATTRIBUTES (SIZE / POSITION)
+    # -------------------------------------------------------------------
+
+    def update_rectangle_size(self, rect_id: str, width: float, height: float) -> None:
+        """
+        Update the width and height of a specific rectangle.
+
+        Parameters
+        ----------
+        rect_id : str
+            ID of the rectangle to update.
+
+        width : float
+            New width.
+
+        height : float
+            New height.
+
+        Notes
+        -----
+        - If rect_id does not exist, this method silently does nothing.
+        - We clamp the size to be positive and ensure it's not zero.
+        - We do **not** automatically move the rectangle; if after resizing
+          it goes out of bounds, that is allowed here. The constraints and
+          metrics will reflect any boundary violation.
+        """
+        idx = self._rect_index_by_id.get(rect_id)
+        if idx is None:
+            return
+
+        rect = self.rectangles[idx]
+        rect.width = max(float(width), 1e-6)
+        rect.height = max(float(height), 1e-6)
+
+    def update_rectangle_position(self, rect_id: str, cx: float, cy: float) -> None:
+        """
+        Update the centre position of a specific rectangle.
+
+        Parameters
+        ----------
+        rect_id : str
+            ID of the rectangle to move.
+
+        cx : float
+            New x-coordinate of the centre.
+
+        cy : float
+            New y-coordinate of the centre.
+
+        Notes
+        -----
+        - If rect_id does not exist, this method silently does nothing.
+        - We do not clamp to canvas bounds here; that is handled by
+          constraints/metrics. This makes the tool more flexible.
+        """
+        idx = self._rect_index_by_id.get(rect_id)
+        if idx is None:
+            return
+
+        rect = self.rectangles[idx]
+        rect.cx = float(cx)
+        rect.cy = float(cy)
+
+    # -------------------------------------------------------------------
+    # PUBLIC: SYNCHRONISATION WITH BOKEH ColumnDataSource
+    # -------------------------------------------------------------------
+
+    def get_rectangles_data(self) -> Dict[str, List[Any]]:
+        """
+        Return a dictionary of lists representing the current rectangles,
+        suitable for feeding into a Bokeh `ColumnDataSource`.
+
+        Returns
+        -------
+        Dict[str, List[Any]]
+            {
+              "x":       [cx_0, cx_1, ...],
+              "y":       [cy_0, cy_1, ...],
+              "width":   [w_0, w_1, ...],
+              "height":  [h_0, h_1, ...],
+              "rect_id": ["R0", "R1", ...]
+            }
+        """
+        xs: List[float] = []
+        ys: List[float] = []
+        ws: List[float] = []
+        hs: List[float] = []
+        ids: List[str] = []
+
+        for rect in self.rectangles:
+            xs.append(float(rect.cx))
+            ys.append(float(rect.cy))
+            ws.append(float(rect.width))
+            hs.append(float(rect.height))
+            ids.append(rect.rect_id)
+
+        return {
+            "x": xs,
+            "y": ys,
+            "width": ws,
+            "height": hs,
+            "rect_id": ids,
+        }
+
+    def update_from_bokeh_data(self, data: Dict[str, List[Any]]) -> None:
+        """
+        Update internal rectangles from a Bokeh ColumnDataSource-like `data`.
+
+        This is typically called when:
+
+        - The user drags rectangles interactively in the canvas.
+        - The BoxEditTool modifies x/y/width/height arrays.
+        - The dashboard wants to sync the internal model with what is
+          currently shown on the canvas.
+
+        Parameters
+        ----------
+        data : Dict[str, List[Any]]
+            A dictionary that must contain the keys:
+              - "x"
+              - "y"
+              - "width"
+              - "height"
+              - "rect_id"
+
+            Each key maps to a list of the same length N.
+
+        Behaviour
+        ---------
+        - For every entry in `data`, we look up the corresponding rectangle
+          by rect_id and update its cx, cy, width, height.
+        - Rectangles that exist internally but not in `data` are preserved
+          unchanged (though this situation should not normally happen if the
+          dashboard keeps everything in sync).
+        """
+        xs = data.get("x", [])
+        ys = data.get("y", [])
+        ws = data.get("width", [])
+        hs = data.get("height", [])
+        ids = data.get("rect_id", [])
+
+        n = min(len(xs), len(ys), len(ws), len(hs), len(ids))
+
+        # Update matching rectangles
+        for i in range(n):
+            rect_id = ids[i]
+            idx = self._rect_index_by_id.get(rect_id)
+            if idx is None:
+                # Unknown rectangle ID; ignore
+                continue
+            rect = self.rectangles[idx]
+            rect.cx = float(xs[i])
+            rect.cy = float(ys[i])
+            rect.width = max(float(ws[i]), 1e-6)
+            rect.height = max(float(hs[i]), 1e-6)
+
+        # We *do not* remove or add rectangles here; this method only
+        # updates existing ones that are present in `data`.
+
+    # -------------------------------------------------------------------
+    # PUBLIC: METRIC COMPUTATION (VIA PlacementProblem)
+    # -------------------------------------------------------------------
+
+    def _build_temp_placement_problem(self) -> PlacementProblem:
+        """
+        Internal helper: construct a temporary `PlacementProblem` instance
+        matching the *current* canvas and rectangles, but reusing all
+        other configuration (constraints, objective weights, etc.) from
+        `self.base_config`.
+
+        Returns
+        -------
+        PlacementProblem
+            A new PlacementProblem instance ready to compute metrics.
+
+        Notes
+        -----
+        - We construct a fresh config dict every time this is called,
+          so changes in `base_config` (due to dashboard-level updates of
+          constraints/weights) are naturally reflected.
+        - The "rectangles" in this temp config are a direct translation
+          of our `InputRect` objects using the fields expected by
+          `PlacementProblem`:
+              { "id": ..., "width": ..., "height": ...,
+                "initial_center": [cx, cy] }
+        """
+        cfg = copy.deepcopy(self.base_config)
+
+        # Override canvas with current size
+        cfg["canvas"] = {
+            "width": self.canvas_width,
+            "height": self.canvas_height,
+        }
+
+        # Override rectangles with current list
+        rects_cfg: List[Dict[str, Any]] = []
+        for rect in self.rectangles:
+            rects_cfg.append(
+                {
+                    "id": rect.rect_id,
+                    "width": float(rect.width),
+                    "height": float(rect.height),
+                    "initial_center": [float(rect.cx), float(rect.cy)],
+                }
+            )
+        cfg["rectangles"] = rects_cfg
+
+        return PlacementProblem(cfg)
+
+    def compute_metrics(self) -> Dict[str, float]:
+        """
+        Compute objective and constraint metrics for the *current* state
+        of the Input Placement canvas.
+
+        Returns
+        -------
+        Dict[str, float]
+            Metrics dictionary exactly as returned by
+            `PlacementProblem.compute_metrics(x)`, including:
+
+              - "hpwl"
+              - "bbox_aspect"
+              - "bbox_area"
+              - "objective_pure"
+              - "objective_augmented"
+              - "overlap_max_ratio"
+              - "spacing_x_violation"
+              - "spacing_y_violation"
+              - "bbox_ar_violation"
+              - "boundary_violation"
+
+        Behaviour
+        ---------
+        - If there are no rectangles (`self.rectangles` is empty),
+          this method returns a dictionary of zeros for all terms.
+        """
+        if not self.rectangles:
+            # No rectangles -> all metrics are zero (or neutral)
+            return {
+                "hpwl": 0.0,
+                "bbox_aspect": 1.0,
+                "bbox_area": 0.0,
+                "objective_pure": 0.0,
+                "objective_augmented": 0.0,
+                "overlap_max_ratio": 0.0,
+                "spacing_x_violation": 0.0,
+                "spacing_y_violation": 0.0,
+                "bbox_ar_violation": 0.0,
+                "boundary_violation": 0.0,
+            }
+
+        problem = self._build_temp_placement_problem()
+
+        # Construct vector x = [cx_0, cy_0, ..., cx_{N-1}, cy_{N-1}]
+        vals: List[float] = []
+        for rect in self.rectangles:
+            vals.append(rect.cx)
+            vals.append(rect.cy)
+        x = np.array(vals, dtype=float)
+
+        return problem.compute_metrics(x)
+
+    # -------------------------------------------------------------------
+    # PUBLIC: CONFIG GENERATION FOR SAVING
+    # -------------------------------------------------------------------
+
+    def generate_config_dict(self) -> Dict[str, Any]:
+        """
+        Generate a complete JSON-serialisable config dict representing
+        the current canvas and rectangles, combined with the other keys
+        from `self.base_config`.
+
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary with structure compatible with `PlacementProblem`,
+            typically containing:
+
+              {
+                "canvas": {
+                  "width": <current canvas_width>,
+                  "height": <current canvas_height>
+                },
+                "rectangles": [
+                  {
+                    "id": <rect_id>,
+                    "width": <width>,
+                    "height": <height>,
+                    "initial_center": [cx, cy]
+                  },
+                  ...
+                ],
+                "constraints": { ... }  # from base_config
+                "objective": { "weights": {...} }  # from base_config
+                ... (any other keys from base_config)
+              }
+
+        Notes
+        -----
+        - The dashboard is responsible for writing this dict out to a
+          file with a user-chosen name.
+        - The other keys present in the original base_config (e.g. custom
+          metadata) are preserved as-is.
+        """
+        cfg = copy.deepcopy(self.base_config)
+
+        # Override canvas
+        cfg["canvas"] = {
+            "width": self.canvas_width,
+            "height": self.canvas_height,
+        }
+
+        # Override rectangles
+        rects_cfg: List[Dict[str, Any]] = []
+        for rect in self.rectangles:
+            rects_cfg.append(
+                {
+                    "id": rect.rect_id,
+                    "width": float(rect.width),
+                    "height": float(rect.height),
+                    "initial_center": [float(rect.cx), float(rect.cy)],
+                }
+            )
+        cfg["rectangles"] = rects_cfg
+
+        return cfg
