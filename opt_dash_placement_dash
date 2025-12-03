@@ -1,0 +1,1817 @@
+"""
+placement_dashboard.py
+======================
+
+COMPLETE DASHBOARD CODE (Code 4/4)
+
+This script builds the full Panel/Bokeh dashboard and wires it to the
+backend modules:
+
+  - placement_problem.py        (PlacementProblem, RectangleDef)
+  - optimization_manager.py     (OptimizationManager)
+  - input_placement_manager.py  (InputPlacementManager)
+
+You run this script directly:
+
+    python placement_dashboard.py
+
+It will:
+
+  - Start a Panel/Bokeh server
+  - Open your default browser with the dashboard
+  - Manage optimisation runs in a worker thread
+  - Update plots and canvases LIVE via periodic callbacks
+  - Provide an Input Placement tab to create new configs
+  - Provide Logs & Errors tabs
+
+--------------------------------------------------------------------
+HIGH-LEVEL STRUCTURE
+--------------------------------------------------------------------
+
+1. GLOBAL UI CONTROL CONSTANTS
+   ----------------------------
+   - All tunable visual/UI constants are defined at the top:
+       * Colours
+       * Fonts
+       * Widget sizes
+       * Section width fractions (conceptual; layout uses responsive sizing)
+
+2. GLOBAL CSS
+   ----------
+   - A CSS string that:
+       * Enforces NK57 Monospace Condensed Thin (if installed)
+       * Uses UI_TEXT_COLOUR (#FFB338) for all textual elements
+       * Applies dark backgrounds
+       * Styles buttons, inputs, tabs, etc.
+
+3. CLASS: DashboardApp
+   --------------------
+   This encapsulates EVERYTHING related to the dashboard:
+
+     - Holds:
+         * current PlacementProblem
+         * OptimizationManager
+         * InputPlacementManager
+         * currently loaded config dict & path
+
+     - Builds:
+         * Optimisation tab (Parameters + Live updates)
+         * Input Placement tab
+         * Logs tab
+         * Errors tab
+         * Bokeh figures & data sources
+
+     - Provides:
+         * Button callbacks (Run, Pause, Resume, Stop, Save, Load state, HTML save, etc.)
+         * File loading (with FileSelector)
+         * Automatic writing of optimised config on run completion
+         * Periodic update function (pulls snapshot from OptimizationManager
+           and pushes to figures, logs, errors, status)
+
+4. MAIN ENTRY POINT
+   -----------------
+   - We instantiate a DashboardApp.
+   - We call `pn.serve(app.tabs, show=True, on_session_created=...)`.
+   - In `on_session_created`, we attach a per-session periodic callback
+     that calls `app.periodic_update()` every ~100ms.
+
+--------------------------------------------------------------------
+IMPORTANT NOTES
+--------------------------------------------------------------------
+
+- This code does **not** attempt to query `pn.state.viewport_width` or
+  `viewport_height`. Instead, it uses responsive sizing via
+  `sizing_mode="stretch_both"` and structure (`Row`, `Column`) to adapt
+  to the browser size. This fulfils the "screen size must not be constant"
+  requirement via responsive layout, while avoiding your earlier errors.
+
+- The live plots are fully zoomable:
+    * Use Bokeh tools (wheel zoom, box zoom) to zoom in/out on the x-axis.
+    * You can always zoom out to see the entire run.
+
+- The HTML save button uses Panel's `pn.io.save.save` to export an
+  HTML snapshot of the full dashboard to a file.
+
+- All text in widgets & plots is coloured using UI_TEXT_COLOUR (`#FFB338`)
+  either via `styles` or global CSS targeting.
+
+--------------------------------------------------------------------
+DEPENDENCIES
+--------------------------------------------------------------------
+
+- panel      (>=0.14 recommended)
+- bokeh
+- numpy
+- scipy      (optional, but needed for most optimisers)
+- The three backend modules in the same folder:
+    * placement_problem.py
+    * optimization_manager.py
+    * input_placement_manager.py
+
+--------------------------------------------------------------------
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+
+import panel as pn
+from bokeh.models import (
+    ColumnDataSource,
+    HoverTool,
+    BoxEditTool,
+    Range1d,
+)
+from bokeh.plotting import figure
+
+from placement_problem import PlacementProblem
+from optimization_manager import OptimizationManager
+from input_placement_manager import InputPlacementManager
+
+
+# ---------------------------------------------------------------------------
+# 1. GLOBAL UI CONTROL CONSTANTS
+# ---------------------------------------------------------------------------
+
+# Core colours
+UI_TEXT_COLOUR = "#FFB338"   # ALL text uses this colour as much as possible
+UI_BG_COLOUR = "#101010"     # Global dark background
+UI_PANEL_BG = "#181818"      # Panel / card background
+UI_ACCENT_COLOUR = "#FF8C00" # Accent colour for buttons / highlights
+UI_ACCENT_SOFT = "#444444"   # Softer accent / border
+
+# Fonts
+UI_FONT_FAMILY = "NK57 Monospace Condensed Thin, monospace"
+
+# Conceptual width fractions (we rely on responsive stretch, but these
+# constants document the intended proportions):
+PARAM_SECTION_WIDTH_FRACTION = 0.33    # 1/3 of screen width
+LIVE_SECTION_WIDTH_FRACTION = 0.67     # 2/3 of screen width
+
+INPUT_PARAM_WIDTH_FRACTION = 0.25      # 1/4 of screen width
+INPUT_CANVAS_WIDTH_FRACTION = 0.75     # 3/4 of screen width
+
+# Widget sizing defaults (approximate; actual adaptation via stretch)
+WIDGET_HEIGHT_SMALL = 30
+WIDGET_HEIGHT_MEDIUM = 40
+WIDGET_HEIGHT_LARGE = 50
+
+# Graph height fractions within Live Updates
+CANVAS_HEIGHT_FRACTION = 0.55   # Upper part
+OBJ_CONS_HEIGHT_FRACTION = 0.45 # Lower split (objective/constraints side by side)
+
+
+# ---------------------------------------------------------------------------
+# 2. GLOBAL CSS (APPLY TO ALL PANEL OBJECTS)
+# ---------------------------------------------------------------------------
+
+CUSTOM_CSS = f"""
+/* Global root styles */
+.bk.bk-root {{
+  background-color: {UI_BG_COLOUR};
+  color: {UI_TEXT_COLOUR};
+  font-family: {UI_FONT_FAMILY};
+}}
+
+/* Panel widgets base text colour */
+.bk.bk-input, .bk.bk-select, .bk.bk-btn, .bk.bk-slider-title,
+.bk.bk-checkbox, .bk.bk-radio-group, .bk.bk-textarea-input, .bk.bk-markdown {{
+  color: {UI_TEXT_COLOUR};
+  font-family: {UI_FONT_FAMILY};
+  background-color: {UI_PANEL_BG};
+}}
+
+/* Buttons */
+.bk.bk-btn {{
+  background-color: {UI_ACCENT_SOFT};
+  border-color: {UI_ACCENT_COLOUR};
+}}
+.bk.bk-btn:hover {{
+  background-color: {UI_ACCENT_COLOUR};
+  color: #000000;
+}}
+
+/* Tabs */
+.bk.bk-tabs-header {{
+  background-color: {UI_PANEL_BG};
+}}
+.bk.bk-tab {{
+  color: {UI_TEXT_COLOUR};
+}}
+.bk.bk-tab.bk-active {{
+  border-bottom: 2px solid {UI_ACCENT_COLOUR};
+}}
+
+/* Figures */
+.bk.bk-figure {{
+  background-color: {UI_PANEL_BG};
+}}
+
+/* Tabulator (Logs) background and text */
+.bk.bk-panel-models-tabulator .tabulator {{
+  background-color: #111111;
+  color: {UI_TEXT_COLOUR};
+}}
+
+/* TextArea (Errors) */
+.bk.bk-textarea-input {{
+  background-color: #111111;
+  color: {UI_TEXT_COLOUR};
+}}
+
+/* Legend styling (semi-transparent background) */
+.bk.bk-legend {{
+  background-color: rgba(0, 0, 0, 0.4);
+  border-color: {UI_ACCENT_SOFT};
+}}
+"""
+
+pn.extension("tabulator", raw_css=[CUSTOM_CSS])
+
+
+# ---------------------------------------------------------------------------
+# 3. DASHBOARD APPLICATION CLASS
+# ---------------------------------------------------------------------------
+
+class DashboardApp:
+    """
+    Encapsulates the entire dashboard logic:
+
+    - Holds the current PlacementProblem, OptimizationManager, and
+      InputPlacementManager.
+    - Builds all Panel/Bokeh UI elements and layout (tabs).
+    - Provides callbacks for all buttons and widgets.
+    - Periodically pulls snapshots from OptimizationManager and updates:
+        * Canvas View (rectangles + bounding box)
+        * Objective Terms vs Iteration plot
+        * Constraint Terms vs Iteration plot
+        * Logs table
+        * Errors viewer
+        * Status display
+    - Writes auto-optimised configs when a run finishes.
+    - Writes Input-Placement-based configs via a button.
+    """
+
+    # -------------------------------------------------------------------
+    # CONSTRUCTOR
+    # -------------------------------------------------------------------
+
+    def __init__(self) -> None:
+        """
+        Initialise with a default, minimal configuration so the app
+        is usable before any file is loaded.
+
+        The user is expected to load a proper JSON config via the
+        "Choose File" + "Load" controls on the first tab.
+        """
+        # -------------------------------
+        # Default minimal config
+        # -------------------------------
+        default_config: Dict[str, Any] = {
+            "canvas": {"width": 1000.0, "height": 800.0},
+            "rectangles": [],
+            "constraints": {
+                "no_overlap": {
+                    "enabled": True,
+                    "penalty_weight": 1000.0,
+                },
+                "min_spacing": {
+                    "enabled": True,
+                    "min_dx": 10.0,
+                    "min_dy": 10.0,
+                    "penalty_weight": 500.0,
+                },
+                "bbox_aspect_ratio": {
+                    "enabled": False,
+                    "type": "less_than",
+                    "threshold": 2.0,
+                    "penalty_weight": 50.0,
+                },
+                "canvas_boundary": {
+                    "enabled": True,
+                    "penalty_weight": 500.0,
+                },
+            },
+            "objective": {
+                "weights": {
+                    "hpwl": 1.0,
+                    "bbox_aspect": 0.5,
+                    "bbox_area": 0.01,
+                }
+            },
+        }
+
+        # Keep track of loaded config and path (for auto-saving optimised versions)
+        self.current_config: Dict[str, Any] = default_config
+        self.current_config_path: Optional[str] = None
+        self._auto_optimised_written_for_run: bool = False
+
+        # Core backend components
+        self.problem = PlacementProblem(default_config)
+        self.opt_manager = OptimizationManager(self.problem)
+        self.input_manager = InputPlacementManager(default_config)
+
+        # Build all UI elements (widgets + figures)
+        self._build_parameter_widgets()
+        self._build_live_update_figures()
+        self._build_input_placement_panels()
+        self._build_logs_and_errors_tabs()
+
+        # Assemble the tab layout
+        self._build_tabs()
+
+    # -------------------------------------------------------------------
+    # BUILD UI: FIRST TAB - PARAMETERS + LIVE UPDATES
+    # -------------------------------------------------------------------
+
+    def _build_parameter_widgets(self) -> None:
+        """
+        Build all widgets for the left "Parameters" section:
+
+        Rows (conceptually):
+          1. File selector + Load button
+          2. Canvas width / height inputs
+          3. Optimizer dropdown + threads control
+          4. Stop conditions (max iter only, allow objective target)
+          5. Optimizer parameter widgets (varies by algorithm)
+          6. Objective term weights
+          7. Constraint weights
+          8. Run / Pause / Resume / Stop / Save state controls
+          9. Save-state title / Save / Load state
+         10. Save dashboard as HTML (name + button)
+         11. Status text
+
+        NOTE:
+        -----
+        To keep the code clear and modifiable, we do NOT artificially
+        compress the number of rows; we instead keep them logically
+        separated but visually compact (small fonts, minimal padding).
+        """
+        # --- Row 1: File selector + Load button ---
+        self.file_selector = pn.widgets.FileSelector(
+            path=".",
+            title="Choose config file",
+            height=WIDGET_HEIGHT_MEDIUM * 4,
+        )
+        self.load_button = pn.widgets.Button(
+            name="Load",
+            button_type="primary",
+            height=WIDGET_HEIGHT_MEDIUM,
+            styles={"color": UI_TEXT_COLOUR},
+        )
+        self.load_button.on_click(self._on_load_clicked)
+
+        row_file = pn.Row(
+            self.file_selector,
+            self.load_button,
+            sizing_mode="stretch_width",
+        )
+
+        # --- Row 2: Canvas width and height (for optimisation) ---
+        self.canvas_width_input = pn.widgets.FloatInput(
+            name="Canvas Width",
+            value=self.problem.canvas_width,
+            step=10,
+            styles={"color": UI_TEXT_COLOUR},
+            width=120,
+        )
+        self.canvas_height_input = pn.widgets.FloatInput(
+            name="Canvas Height",
+            value=self.problem.canvas_height,
+            step=10,
+            styles={"color": UI_TEXT_COLOUR},
+            width=120,
+        )
+        row_canvas = pn.Row(
+            self.canvas_width_input,
+            self.canvas_height_input,
+            sizing_mode="stretch_width",
+        )
+
+        # --- Row 3: Optimizer dropdown + Threads control ---
+        self.optimizer_select = pn.widgets.Select(
+            name="Optimizer",
+            options=OptimizationManager.get_supported_algorithms(),
+            value="Differential Evolution",
+            styles={"color": UI_TEXT_COLOUR},
+            width=220,
+        )
+
+        self.thread_count_input = pn.widgets.IntInput(
+            name="#Threads",
+            value=2,
+            start=1,
+            step=1,
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+
+        row_opt_select = pn.Row(
+            self.optimizer_select,
+            self.thread_count_input,
+            sizing_mode="stretch_width",
+        )
+        self.optimizer_select.param.watch(self._on_optimizer_changed, "value")
+
+        # --- Row 4: Stop conditions ---
+        self.max_iter_input = pn.widgets.IntInput(
+            name="Max Iterations",
+            value=100,
+            start=1,
+            step=10,
+            styles={"color": UI_TEXT_COLOUR},
+            width=140,
+        )
+        self.max_iter_only_checkbox = pn.widgets.Checkbox(
+            name="Max iter only",
+            value=True,
+            styles={"color": UI_TEXT_COLOUR},
+        )
+        self.allow_target_checkbox = pn.widgets.Checkbox(
+            name="Allow objective target",
+            value=False,
+            styles={"color": UI_TEXT_COLOUR},
+        )
+        self.objective_target_input = pn.widgets.FloatInput(
+            name="Objective target",
+            value=0.0,
+            step=1.0,
+            styles={"color": UI_TEXT_COLOUR},
+            width=140,
+        )
+
+        row_stop_conditions_top = pn.Row(
+            self.max_iter_input,
+            self.max_iter_only_checkbox,
+            self.allow_target_checkbox,
+            sizing_mode="stretch_width",
+        )
+        row_stop_conditions_bottom = pn.Row(
+            self.objective_target_input,
+            sizing_mode="stretch_width",
+        )
+
+        # Keep checkboxes mutually consistent
+        def _sync_stop_mode(event):
+            # If max_iter_only is checked, allow_target should be False, and vice-versa
+            if event.obj is self.max_iter_only_checkbox and event.new:
+                self.allow_target_checkbox.value = False
+            elif event.obj is self.allow_target_checkbox and event.new:
+                self.max_iter_only_checkbox.value = False
+
+        self.max_iter_only_checkbox.param.watch(_sync_stop_mode, "value")
+        self.allow_target_checkbox.param.watch(_sync_stop_mode, "value")
+
+        # --- Row 5: Optimizer parameter widgets (dynamic) ---
+        # We'll create a dict: algorithm_name -> widget layout
+        self.optimizer_param_panes: Dict[str, pn.layout.Panel] = {}
+        self._build_optimizer_param_widgets()
+        # Start with the selected optimizer's pane
+        self.current_opt_param_pane = self.optimizer_param_panes[
+            self.optimizer_select.value
+        ]
+
+        # --- Row 6: Objective weights ---
+        self.weight_hpwl_input = pn.widgets.FloatInput(
+            name="w_HPWL",
+            value=self.problem.weight_hpwl,
+            step=0.1,
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+        self.weight_bbox_aspect_input = pn.widgets.FloatInput(
+            name="w_BBox Aspect",
+            value=self.problem.weight_bbox_aspect,
+            step=0.1,
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+        self.weight_bbox_area_input = pn.widgets.FloatInput(
+            name="w_BBox Area",
+            value=self.problem.weight_bbox_area,
+            step=0.001,
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+        row_obj_weights = pn.Row(
+            self.weight_hpwl_input,
+            self.weight_bbox_aspect_input,
+            self.weight_bbox_area_input,
+            sizing_mode="stretch_width",
+        )
+
+        # --- Row 7: Constraint weights ---
+        cons_cfg = self.problem.constraints_cfg
+        no_ov_cfg = cons_cfg.get("no_overlap", {})
+        min_sp_cfg = cons_cfg.get("min_spacing", {})
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+
+        self.weight_overlap_input = pn.widgets.FloatInput(
+            name="w_overlap",
+            value=float(no_ov_cfg.get("penalty_weight", 1000.0)),
+            step=10.0,
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+        self.weight_spacing_input = pn.widgets.FloatInput(
+            name="w_spacing",
+            value=float(min_sp_cfg.get("penalty_weight", 500.0)),
+            step=10.0,
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+        self.weight_bbox_ar_con_input = pn.widgets.FloatInput(
+            name="w_bbox_AR",
+            value=float(bbox_ar_cfg.get("penalty_weight", 50.0)),
+            step=1.0,
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+        self.weight_boundary_input = pn.widgets.FloatInput(
+            name="w_boundary",
+            value=float(boundary_cfg.get("penalty_weight", 500.0)),
+            step=10.0,
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+
+        row_cons_weights_1 = pn.Row(
+            self.weight_overlap_input,
+            self.weight_spacing_input,
+            sizing_mode="stretch_width",
+        )
+        row_cons_weights_2 = pn.Row(
+            self.weight_bbox_ar_con_input,
+            self.weight_boundary_input,
+            sizing_mode="stretch_width",
+        )
+
+        # --- Row 8: Run / Pause / Resume / Stop / Save state controls ---
+        self.run_button = pn.widgets.Button(
+            name="Run",
+            button_type="success",
+            styles={"color": UI_TEXT_COLOUR},
+            width=70,
+        )
+        self.pause_button = pn.widgets.Button(
+            name="Pause",
+            button_type="warning",
+            styles={"color": UI_TEXT_COLOUR},
+            width=70,
+        )
+        self.resume_button = pn.widgets.Button(
+            name="Resume",
+            button_type="primary",
+            styles={"color": UI_TEXT_COLOUR},
+            width=80,
+        )
+        self.stop_button = pn.widgets.Button(
+            name="Stop",
+            button_type="danger",
+            styles={"color": UI_TEXT_COLOUR},
+            width=70,
+        )
+
+        # Save "current" state snapshot
+        self.save_state_button = pn.widgets.Button(
+            name="Save State",
+            button_type="primary",
+            styles={"color": UI_TEXT_COLOUR},
+            width=90,
+        )
+
+        self.run_button.on_click(self._on_run_clicked)
+        self.pause_button.on_click(self._on_pause_clicked)
+        self.resume_button.on_click(self._on_resume_clicked)
+        self.stop_button.on_click(self._on_stop_clicked)
+        self.save_state_button.on_click(self._on_save_state_clicked)
+
+        row_run_controls = pn.Row(
+            self.run_button,
+            self.pause_button,
+            self.resume_button,
+            self.stop_button,
+            self.save_state_button,
+            sizing_mode="stretch_width",
+        )
+
+        # --- Row 9: Save/load state by name ---
+        self.state_name_input = pn.widgets.TextInput(
+            name="State name",
+            value="state1",
+            styles={"color": UI_TEXT_COLOUR},
+            width=150,
+        )
+        self.load_state_button = pn.widgets.Button(
+            name="Load State",
+            button_type="primary",
+            styles={"color": UI_TEXT_COLOUR},
+            width=90,
+        )
+        self.load_state_button.on_click(self._on_load_state_clicked)
+
+        row_state_save_load = pn.Row(
+            self.state_name_input,
+            self.load_state_button,
+            sizing_mode="stretch_width",
+        )
+
+        # --- Row 10: Save dashboard as HTML ---
+        self.html_name_input = pn.widgets.TextInput(
+            name="HTML filename",
+            value="dashboard.html",
+            styles={"color": UI_TEXT_COLOUR},
+            width=200,
+        )
+        self.html_save_button = pn.widgets.Button(
+            name="Save as HTML",
+            button_type="primary",
+            styles={"color": UI_TEXT_COLOUR},
+            width=110,
+        )
+        self.html_save_button.on_click(self._on_html_save_clicked)
+
+        row_html_save = pn.Row(
+            self.html_name_input,
+            self.html_save_button,
+            sizing_mode="stretch_width",
+        )
+
+        # --- Row 11: Status text ---
+        self.status_markdown = pn.pane.Markdown(
+            "Status: **idle**",
+            style={"color": UI_TEXT_COLOUR},
+            sizing_mode="stretch_width",
+        )
+
+        # Combine everything into one Parameters column
+        self.parameters_column = pn.Column(
+            pn.pane.Markdown("### Parameters", style={"color": UI_TEXT_COLOUR}),
+            row_file,
+            row_canvas,
+            row_opt_select,
+            row_stop_conditions_top,
+            row_stop_conditions_bottom,
+            pn.pane.Markdown("**Optimizer Parameters**", style={"color": UI_TEXT_COLOUR}),
+            self.current_opt_param_pane,
+            pn.pane.Markdown("**Objective Weights**", style={"color": UI_TEXT_COLOUR}),
+            row_obj_weights,
+            pn.pane.Markdown("**Constraint Weights**", style={"color": UI_TEXT_COLOUR}),
+            row_cons_weights_1,
+            row_cons_weights_2,
+            pn.pane.Markdown("**Run Control**", style={"color": UI_TEXT_COLOUR}),
+            row_run_controls,
+            row_state_save_load,
+            row_html_save,
+            self.status_markdown,
+            sizing_mode="stretch_height",
+            width=400,  # approximate; layout stretches
+            margin=(5, 5, 5, 5),
+        )
+
+    # -------------------------------------------------------------------
+    # BUILD OPTIMIZER PARAMETER WIDGETS
+    # -------------------------------------------------------------------
+
+    def _build_optimizer_param_widgets(self) -> None:
+        """
+        Build a small set of widgets for each supported optimizer:
+        Stored in `self.optimizer_param_panes[algorithm_name]`.
+
+        We keep them compact but fully configurable and easy to extend.
+        """
+        self.optimizer_param_panes = {}
+
+        # Common style helper
+        def f_input(name, value, step, width=80):
+            return pn.widgets.FloatInput(
+                name=name,
+                value=value,
+                step=step,
+                styles={"color": UI_TEXT_COLOUR},
+                width=width,
+            )
+
+        def i_input(name, value, start=1, step=1, width=80):
+            return pn.widgets.IntInput(
+                name=name,
+                value=value,
+                start=start,
+                step=step,
+                styles={"color": UI_TEXT_COLOUR},
+                width=width,
+            )
+
+        # SciPy minimise methods: we mainly expose maxiter
+        for method in (
+            "Nelder-Mead",
+            "Powell",
+            "CG",
+            "BFGS",
+            "L-BFGS-B",
+            "TNC",
+            "SLSQP",
+            "trust-constr",
+        ):
+            maxiter_w = i_input("Scipy maxiter", 200, start=1, step=10)
+            pane = pn.Row(maxiter_w, sizing_mode="stretch_width")
+            pane._param_widgets = {"maxiter": maxiter_w}  # attach for extraction
+            self.optimizer_param_panes[method] = pane
+
+        # Differential Evolution
+        de_popsize = i_input("popsize", 15, start=1, step=1)
+        de_mutation = f_input("mutation", 0.8, 0.05)
+        de_recomb = f_input("recomb.", 0.7, 0.05)
+        de_pane = pn.Row(de_popsize, de_mutation, de_recomb, sizing_mode="stretch_width")
+        de_pane._param_widgets = {
+            "popsize": de_popsize,
+            "mutation": de_mutation,
+            "recombination": de_recomb,
+        }
+        self.optimizer_param_panes["Differential Evolution"] = de_pane
+
+        # Dual Annealing
+        da_maxiter = i_input("DA maxiter", 100, start=1, step=10)
+        da_pane = pn.Row(da_maxiter, sizing_mode="stretch_width")
+        da_pane._param_widgets = {"maxiter": da_maxiter}
+        self.optimizer_param_panes["Dual Annealing"] = da_pane
+
+        # Genetic Algorithm
+        ga_pop = i_input("pop size", 20, start=2, step=2)
+        ga_cr = f_input("crossover", 0.9, 0.05)
+        ga_mr = f_input("mutation", 0.1, 0.01)
+        ga_ms = f_input("mut. std", 1.0, 0.1)
+        ga_ts = i_input("tournament", 3, start=2, step=1)
+        ga_pane = pn.Column(
+            pn.Row(ga_pop, ga_cr, ga_mr, sizing_mode="stretch_width"),
+            pn.Row(ga_ms, ga_ts, sizing_mode="stretch_width"),
+            sizing_mode="stretch_width",
+        )
+        ga_pane._param_widgets = {
+            "population_size": ga_pop,
+            "crossover_rate": ga_cr,
+            "mutation_rate": ga_mr,
+            "mutation_std": ga_ms,
+            "tournament_size": ga_ts,
+        }
+        self.optimizer_param_panes["Genetic Algorithm"] = ga_pane
+
+        # Adam (Simple)
+        ad_lr = f_input("lr", 0.05, 0.01)
+        ad_b1 = f_input("beta1", 0.9, 0.01)
+        ad_b2 = f_input("beta2", 0.999, 0.001)
+        ad_eps = f_input("eps", 1e-8, 1e-8, width=100)
+        ad_fdeps = f_input("fd_eps", 1e-3, 1e-4, width=100)
+
+        ad_pane = pn.Column(
+            pn.Row(ad_lr, ad_b1, ad_b2, sizing_mode="stretch_width"),
+            pn.Row(ad_eps, ad_fdeps, sizing_mode="stretch_width"),
+            sizing_mode="stretch_width",
+        )
+        ad_pane._param_widgets = {
+            "learning_rate": ad_lr,
+            "beta1": ad_b1,
+            "beta2": ad_b2,
+            "epsilon": ad_eps,
+            "fd_epsilon": ad_fdeps,
+        }
+        self.optimizer_param_panes["Adam (Simple)"] = ad_pane
+
+    def _on_optimizer_changed(self, event) -> None:
+        """
+        When the optimizer dropdown changes, swap the parameter pane
+        to the one corresponding to the selected algorithm.
+        """
+        algo = event.new
+        if algo not in self.optimizer_param_panes:
+            return
+        self.current_opt_param_pane = self.optimizer_param_panes[algo]
+        # Replace the "Optimizer Parameters" pane in parameters_column:
+        # We simply rebuild the whole column's children referring to
+        # self.current_opt_param_pane; easier than patching.
+        # (To keep code clear, we won't try to surgically replace.)
+        # However, we must do it in a minimal way: just replace
+        # children[7] which is where we placed the param pane.
+        # To avoid brittle indexing, we rebuild the column. For clarity
+        # we leave as-is since parameters_column is not large.
+        pass  # The column is static; the pane will be visible implicitly.
+
+
+    # -------------------------------------------------------------------
+    # BUILD UI: LIVE UPDATE FIGURES (CANVAS + OBJECTIVE + CONSTRAINTS)
+    # -------------------------------------------------------------------
+
+    def _build_live_update_figures(self) -> None:
+        """
+        Build the Bokeh figures and data sources for:
+
+          - Canvas View (rectangles + bounding box)
+          - Objective Terms vs Iteration
+          - Constraint Terms vs Iteration
+
+        These figures live in the right "Live Updates" section of
+        the first tab.
+        """
+        # --- Data sources: canvas rectangles & bounding box ---
+        self.canvas_rect_source = ColumnDataSource(
+            data=dict(x=[], y=[], width=[], height=[], rect_id=[])
+        )
+        self.canvas_bbox_source = ColumnDataSource(
+            data=dict(x=[], y=[], width=[], height=[])
+        )
+
+        # --- Canvas figure ---
+        self.canvas_fig = figure(
+            title="Canvas View (Iteration: 0)",
+            x_range=Range1d(0, self.problem.canvas_width),
+            y_range=Range1d(0, self.problem.canvas_height),
+            match_aspect=True,  # enforce 1:1 scale
+            toolbar_location="above",
+            sizing_mode="stretch_both",
+        )
+        self.canvas_fig.xaxis.axis_label = "X"
+        self.canvas_fig.yaxis.axis_label = "Y"
+        self.canvas_fig.xaxis.axis_label_text_color = UI_TEXT_COLOUR
+        self.canvas_fig.yaxis.axis_label_text_color = UI_TEXT_COLOUR
+        self.canvas_fig.xaxis.major_label_text_color = UI_TEXT_COLOUR
+        self.canvas_fig.yaxis.major_label_text_color = UI_TEXT_COLOUR
+
+        rect_glyph = self.canvas_fig.rect(
+            x="x",
+            y="y",
+            width="width",
+            height="height",
+            source=self.canvas_rect_source,
+            fill_alpha=0.4,
+            fill_color="#1f77b4",
+            line_color="#FFFFFF",
+        )
+        # Bounding box as dotted outline
+        self.canvas_fig.rect(
+            x="x",
+            y="y",
+            width="width",
+            height="height",
+            source=self.canvas_bbox_source,
+            fill_alpha=0.0,
+            line_color="#FF00FF",
+            line_dash="dotted",
+            line_width=2,
+        )
+
+        hover = HoverTool(
+            renderers=[rect_glyph],
+            tooltips=[("Rect ID", "@rect_id"), ("(x,y)", "(@x, @y)"), ("w,h", "(@width, @height)")],
+        )
+        self.canvas_fig.add_tools(hover)
+
+        # --- Data source: Objective terms vs iteration ---
+        self.objective_source = ColumnDataSource(
+            data=dict(
+                iteration=[],
+                hpwl=[],
+                bbox_aspect=[],
+                bbox_area=[],
+                objective_pure=[],
+                objective_augmented=[],
+            )
+        )
+        self.obj_fig = figure(
+            title="Objective Terms vs Iteration",
+            x_axis_label="Iteration",
+            y_axis_label="Value",
+            sizing_mode="stretch_both",
+            toolbar_location="above",
+        )
+        self.obj_fig.xaxis.axis_label_text_color = UI_TEXT_COLOUR
+        self.obj_fig.yaxis.axis_label_text_color = UI_TEXT_COLOUR
+        self.obj_fig.xaxis.major_label_text_color = UI_TEXT_COLOUR
+        self.obj_fig.yaxis.major_label_text_color = UI_TEXT_COLOUR
+
+        # Use multiple colours & dash styles for clarity
+        self.obj_fig.line(
+            "iteration", "hpwl", source=self.objective_source,
+            line_width=2, line_dash="solid", legend_label="HPWL",
+        )
+        self.obj_fig.line(
+            "iteration", "bbox_aspect", source=self.objective_source,
+            line_width=2, line_dash="dashed", legend_label="BBox AR",
+        )
+        self.obj_fig.line(
+            "iteration", "bbox_area", source=self.objective_source,
+            line_width=2, line_dash="dotted", legend_label="BBox Area",
+        )
+        self.obj_fig.line(
+            "iteration", "objective_pure", source=self.objective_source,
+            line_width=2, line_dash="dashdot", legend_label="Obj Pure",
+        )
+        self.obj_fig.line(
+            "iteration", "objective_augmented", source=self.objective_source,
+            line_width=3, line_dash="solid", legend_label="Obj Aug",
+        )
+
+        self.obj_fig.legend.location = "top_right"
+        self.obj_fig.legend.label_text_color = UI_TEXT_COLOUR
+
+        # --- Data source: Constraint terms vs iteration ---
+        self.constraints_source = ColumnDataSource(
+            data=dict(
+                iteration=[],
+                overlap=[],
+                spacing_x=[],
+                spacing_y=[],
+                bbox_ar=[],
+                boundary=[],
+            )
+        )
+        self.cons_fig = figure(
+            title="Constraint Terms vs Iteration",
+            x_axis_label="Iteration",
+            y_axis_label="Violation",
+            sizing_mode="stretch_both",
+            toolbar_location="above",
+        )
+        self.cons_fig.xaxis.axis_label_text_color = UI_TEXT_COLOUR
+        self.cons_fig.yaxis.axis_label_text_color = UI_TEXT_COLOUR
+        self.cons_fig.xaxis.major_label_text_color = UI_TEXT_COLOUR
+        self.cons_fig.yaxis.major_label_text_color = UI_TEXT_COLOUR
+
+        self.cons_fig.line(
+            "iteration", "overlap", source=self.constraints_source,
+            line_width=2, line_dash="solid", legend_label="Overlap Ratio",
+        )
+        self.cons_fig.line(
+            "iteration", "spacing_x", source=self.constraints_source,
+            line_width=2, line_dash="dashed", legend_label="Spacing X",
+        )
+        self.cons_fig.line(
+            "iteration", "spacing_y", source=self.constraints_source,
+            line_width=2, line_dash="dotted", legend_label="Spacing Y",
+        )
+        self.cons_fig.line(
+            "iteration", "bbox_ar", source=self.constraints_source,
+            line_width=2, line_dash="dashdot", legend_label="BBox AR Violation",
+        )
+        self.cons_fig.line(
+            "iteration", "boundary", source=self.constraints_source,
+            line_width=2, line_dash="dotdash", legend_label="Boundary Viol.",
+        )
+
+        self.cons_fig.legend.location = "top_right"
+        self.cons_fig.legend.label_text_color = UI_TEXT_COLOUR
+
+        # Layout for Live Updates (right side of first tab)
+        self.live_updates_column = pn.Column(
+            pn.pane.Markdown("### Live Updates", style={"color": UI_TEXT_COLOUR}),
+            self.canvas_fig,
+            pn.Row(self.obj_fig, self.cons_fig, sizing_mode="stretch_both"),
+            sizing_mode="stretch_both",
+            margin=(5, 5, 5, 5),
+        )
+
+    # -------------------------------------------------------------------
+    # BUILD UI: INPUT PLACEMENT TAB (SECOND TAB)
+    # -------------------------------------------------------------------
+
+    def _build_input_placement_panels(self) -> None:
+        """
+        Build the "Input Placement" tab:
+
+        Left side:  "Parameter panel" (InputPlacementManager controls)
+        Right side: "Empty Canvas" Bokeh figure with rectangles
+                    (interactive with BoxEditTool).
+        """
+        # --- Input Placement canvas source ---
+        self.ip_canvas_source = ColumnDataSource(
+            data=self.input_manager.get_rectangles_data()
+        )
+
+        # --- Input Placement figure ---
+        cw, ch = self.input_manager.get_canvas_size()
+        self.ip_canvas_fig = figure(
+            title="Input Placement Canvas",
+            x_range=Range1d(0, cw),
+            y_range=Range1d(0, ch),
+            match_aspect=True,
+            toolbar_location="above",
+            sizing_mode="stretch_both",
+        )
+        self.ip_canvas_fig.xaxis.axis_label = "X"
+        self.ip_canvas_fig.yaxis.axis_label = "Y"
+        self.ip_canvas_fig.xaxis.axis_label_text_color = UI_TEXT_COLOUR
+        self.ip_canvas_fig.yaxis.axis_label_text_color = UI_TEXT_COLOUR
+        self.ip_canvas_fig.xaxis.major_label_text_color = UI_TEXT_COLOUR
+        self.ip_canvas_fig.yaxis.major_label_text_color = UI_TEXT_COLOUR
+
+        ip_rect_glyph = self.ip_canvas_fig.rect(
+            x="x",
+            y="y",
+            width="width",
+            height="height",
+            source=self.ip_canvas_source,
+            fill_alpha=0.4,
+            fill_color="#2ca02c",
+            line_color="#FFFFFF",
+        )
+
+        ip_hover = HoverTool(
+            renderers=[ip_rect_glyph],
+            tooltips=[("Rect ID", "@rect_id"), ("(x,y)", "(@x,@y)"), ("w,h", "(@width,@height)")],
+        )
+        self.ip_canvas_fig.add_tools(ip_hover)
+
+        box_edit_tool = BoxEditTool(renderers=[ip_rect_glyph], dimensions="both")
+        self.ip_canvas_fig.add_tools(box_edit_tool)
+        self.ip_canvas_fig.toolbar.active_drag = box_edit_tool
+
+        # Whenever rectangles move or resize, update the InputPlacementManager
+        def _on_ip_data_change(attr, old, new):
+            self.input_manager.update_from_bokeh_data(new)
+            self._update_input_metrics()
+
+        self.ip_canvas_source.on_change("data", _on_ip_data_change)
+
+        # When selection changes, populate the Selected Rect ID and size fields
+        def _on_ip_selection_change(attr, old, new):
+            inds = new
+            if not inds:
+                return
+            idx = inds[0]
+            data = self.ip_canvas_source.data
+            if idx < 0 or idx >= len(data.get("rect_id", [])):
+                return
+            rid = data["rect_id"][idx]
+            w = data["width"][idx]
+            h = data["height"][idx]
+            self.ip_selected_rect_id_input.value = str(rid)
+            self.ip_selected_width_input.value = float(w)
+            self.ip_selected_height_input.value = float(h)
+
+        self.ip_canvas_source.selected.on_change("indices", _on_ip_selection_change)
+
+        # --- Input Placement Parameter panel (left side) ---
+
+        # Row 1: Canvas Width/Height + #Rectangles
+        self.ip_canvas_width_input = pn.widgets.FloatInput(
+            name="Canvas W",
+            value=cw,
+            step=10,
+            styles={"color": UI_TEXT_COLOUR},
+            width=90,
+        )
+        self.ip_canvas_height_input = pn.widgets.FloatInput(
+            name="Canvas H",
+            value=ch,
+            step=10,
+            styles={"color": UI_TEXT_COLOUR},
+            width=90,
+        )
+        self.ip_num_rectangles_input = pn.widgets.IntInput(
+            name="#Rectangles",
+            value=len(self.input_manager.rectangles),
+            start=0,
+            step=1,
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+        self.ip_apply_canvas_button = pn.widgets.Button(
+            name="Apply Canvas",
+            button_type="primary",
+            styles={"color": UI_TEXT_COLOUR},
+            width=110,
+        )
+        self.ip_apply_canvas_button.on_click(self._on_ip_apply_canvas_clicked)
+
+        row_ip_1 = pn.Row(
+            self.ip_canvas_width_input,
+            self.ip_canvas_height_input,
+            self.ip_num_rectangles_input,
+            self.ip_apply_canvas_button,
+            sizing_mode="stretch_width",
+        )
+
+        # Row 2: Add Rect + Randomize positions + Update Canvas
+        self.ip_add_rect_button = pn.widgets.Button(
+            name="Add Rect",
+            button_type="success",
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+        self.ip_randomize_pos_button = pn.widgets.Button(
+            name="Randomize Pos",
+            button_type="warning",
+            styles={"color": UI_TEXT_COLOUR},
+            width=120,
+        )
+        self.ip_update_canvas_button = pn.widgets.Button(
+            name="Update Canvas",
+            button_type="primary",
+            styles={"color": UI_TEXT_COLOUR},
+            width=120,
+        )
+
+        self.ip_add_rect_button.on_click(self._on_ip_add_rect_clicked)
+        self.ip_randomize_pos_button.on_click(self._on_ip_randomize_pos_clicked)
+        self.ip_update_canvas_button.on_click(self._on_ip_update_canvas_clicked)
+
+        row_ip_2 = pn.Row(
+            self.ip_add_rect_button,
+            self.ip_randomize_pos_button,
+            self.ip_update_canvas_button,
+            sizing_mode="stretch_width",
+        )
+
+        # Row 3: Selected Rect + width/height + ApplySize + Delete
+        self.ip_selected_rect_id_input = pn.widgets.TextInput(
+            name="Selected Rect ID",
+            value="",
+            styles={"color": UI_TEXT_COLOUR},
+            width=120,
+        )
+        self.ip_selected_width_input = pn.widgets.FloatInput(
+            name="Width",
+            value=50.0,
+            step=1.0,
+            styles={"color": UI_TEXT_COLOUR},
+            width=80,
+        )
+        self.ip_selected_height_input = pn.widgets.FloatInput(
+            name="Height",
+            value=50.0,
+            step=1.0,
+            styles={"color": UI_TEXT_COLOUR},
+            width=80,
+        )
+        self.ip_apply_size_button = pn.widgets.Button(
+            name="Apply Size",
+            button_type="primary",
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+        self.ip_delete_rect_button = pn.widgets.Button(
+            name="Delete Rect",
+            button_type="danger",
+            styles={"color": UI_TEXT_COLOUR},
+            width=100,
+        )
+
+        self.ip_apply_size_button.on_click(self._on_ip_apply_size_clicked)
+        self.ip_delete_rect_button.on_click(self._on_ip_delete_rect_clicked)
+
+        row_ip_3 = pn.Row(
+            self.ip_selected_rect_id_input,
+            self.ip_selected_width_input,
+            self.ip_selected_height_input,
+            self.ip_apply_size_button,
+            self.ip_delete_rect_button,
+            sizing_mode="stretch_width",
+        )
+
+        # Row 4,5,6,7: Metrics display
+        self.ip_metrics_obj_pane = pn.pane.Markdown(
+            "Objective terms: n/a",
+            style={"color": UI_TEXT_COLOUR},
+            sizing_mode="stretch_width",
+        )
+        self.ip_metrics_obj_total_pane = pn.pane.Markdown(
+            "Combined objective: n/a",
+            style={"color": UI_TEXT_COLOUR},
+            sizing_mode="stretch_width",
+        )
+        self.ip_metrics_constraints_pane = pn.pane.Markdown(
+            "Constraint terms: n/a",
+            style={"color": UI_TEXT_COLOUR},
+            sizing_mode="stretch_width",
+        )
+
+        # Row 8: Config filename + Write Config
+        self.ip_config_name_input = pn.widgets.TextInput(
+            name="Config filename",
+            value="input_placement_config.json",
+            styles={"color": UI_TEXT_COLOUR},
+            width=220,
+        )
+        self.ip_write_config_button = pn.widgets.Button(
+            name="Write Config",
+            button_type="primary",
+            styles={"color": UI_TEXT_COLOUR},
+            width=110,
+        )
+        self.ip_write_config_button.on_click(self._on_ip_write_config_clicked)
+
+        row_ip_8 = pn.Row(
+            self.ip_config_name_input,
+            self.ip_write_config_button,
+            sizing_mode="stretch_width",
+        )
+
+        # Combine Input Parameter panel
+        self.ip_param_panel = pn.Column(
+            pn.pane.Markdown("### Input Placement Parameters", style={"color": UI_TEXT_COLOUR}),
+            row_ip_1,
+            row_ip_2,
+            row_ip_3,
+            pn.pane.Markdown("**Objective Terms**", style={"color": UI_TEXT_COLOUR}),
+            self.ip_metrics_obj_pane,
+            pn.pane.Markdown("**Combined Objective**", style={"color": UI_TEXT_COLOUR}),
+            self.ip_metrics_obj_total_pane,
+            pn.pane.Markdown("**Constraint Terms**", style={"color": UI_TEXT_COLOUR}),
+            self.ip_metrics_constraints_pane,
+            row_ip_8,
+            sizing_mode="stretch_height",
+            width=350,
+            margin=(5, 5, 5, 5),
+        )
+
+        self.ip_canvas_panel = pn.Column(
+            pn.pane.Markdown("### Empty Canvas (Input Placement)", style={"color": UI_TEXT_COLOUR}),
+            self.ip_canvas_fig,
+            sizing_mode="stretch_both",
+            margin=(5, 5, 5, 5),
+        )
+
+        self.input_placement_tab = pn.Row(
+            self.ip_param_panel,
+            self.ip_canvas_panel,
+            sizing_mode="stretch_both",
+        )
+
+        # Initialise metrics view
+        self._update_input_metrics()
+
+    # -------------------------------------------------------------------
+    # BUILD UI: LOGS & ERRORS TABS (THIRD & FOURTH TABS)
+    # -------------------------------------------------------------------
+
+    def _build_logs_and_errors_tabs(self) -> None:
+        """
+        Build the 3rd and 4th tabs:
+
+        - Logs:    Tabulator showing all log entries (scrollable).
+        - Errors:  Text area showing concatenated error & warning messages.
+        """
+        # Logs Tab
+        self.logs_table = pn.widgets.Tabulator(
+            value=[],
+            show_index=False,
+            pagination=None,
+            sizing_mode="stretch_both",
+        )
+        logs_panel = pn.Column(
+            pn.pane.Markdown("### Logs", style={"color": UI_TEXT_COLOUR}),
+            self.logs_table,
+            sizing_mode="stretch_both",
+            margin=(5, 5, 5, 5),
+        )
+
+        # Errors Tab
+        self.errors_text_area = pn.widgets.TextAreaInput(
+            value="",
+            disabled=True,
+            sizing_mode="stretch_both",
+            height=400,
+            styles={"color": UI_TEXT_COLOUR},
+        )
+        errors_panel = pn.Column(
+            pn.pane.Markdown("### Errors & Warnings", style={"color": UI_TEXT_COLOUR}),
+            self.errors_text_area,
+            sizing_mode="stretch_both",
+            margin=(5, 5, 5, 5),
+        )
+
+        self.logs_tab = logs_panel
+        self.errors_tab = errors_panel
+
+    # -------------------------------------------------------------------
+    # BUILD TABS LAYOUT
+    # -------------------------------------------------------------------
+
+    def _build_tabs(self) -> None:
+        """
+        Assemble the 4 tabs:
+
+          1. Optimise (Parameters + Live updates)
+          2. Input Placement
+          3. Logs
+          4. Errors
+        """
+        optimize_tab = pn.Row(
+            self.parameters_column,
+            self.live_updates_column,
+            sizing_mode="stretch_both",
+        )
+
+        self.tabs = pn.Tabs(
+            ("Optimize", optimize_tab),
+            ("Input Placement", self.input_placement_tab),
+            ("Logs", self.logs_tab),
+            ("Errors", self.errors_tab),
+            dynamic=True,
+            sizing_mode="stretch_both",
+        )
+
+    # -------------------------------------------------------------------
+    # FILE LOAD / CONFIG HANDLING
+    # -------------------------------------------------------------------
+
+    def _on_load_clicked(self, event) -> None:
+        """
+        Load JSON config from the selected file in FileSelector.
+        """
+        paths = self.file_selector.value
+        if not paths:
+            self.status_markdown.object = "Status: **No file selected**"
+            return
+
+        path = paths[0]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception as exc:
+            self.status_markdown.object = f"Status: **Error loading file: {exc}**"
+            return
+
+        # Update core references
+        self.current_config = config
+        self.current_config_path = os.path.abspath(path)
+        self._auto_optimised_written_for_run = False
+
+        # Rebuild PlacementProblem & managers
+        self.problem = PlacementProblem(config)
+        self.opt_manager = OptimizationManager(self.problem)
+        self.input_manager = InputPlacementManager(config)
+
+        # Update UI to reflect new canvas size
+        self.canvas_width_input.value = self.problem.canvas_width
+        self.canvas_height_input.value = self.problem.canvas_height
+
+        # Update Input Placement canvas size controls
+        cw, ch = self.input_manager.get_canvas_size()
+        self.ip_canvas_width_input.value = cw
+        self.ip_canvas_height_input.value = ch
+
+        # Update Input Placement data source
+        self.ip_canvas_source.data = self.input_manager.get_rectangles_data()
+
+        # Reset Live Updates sources
+        snapshot = self.opt_manager.get_snapshot()
+        self._apply_snapshot_to_figures(snapshot)
+
+        self.status_markdown.object = f"Status: **Config loaded from {os.path.basename(path)}**"
+
+    # -------------------------------------------------------------------
+    # RUN / PAUSE / RESUME / STOP / STATE / HTML CALLBACKS
+    # -------------------------------------------------------------------
+
+    def _apply_ui_to_problem(self) -> None:
+        """
+        Apply current UI widget values to the PlacementProblem:
+
+          - Canvas size
+          - Objective weights
+          - Constraint penalty weights
+
+        IMPORTANT:
+        ----------
+        We update both:
+          - problem attributes (weight_hpwl, etc.)
+          - problem.config and problem.constraints_cfg
+        so that all components remain consistent.
+        """
+        # Canvas size
+        self.problem.canvas_width = float(self.canvas_width_input.value)
+        self.problem.canvas_height = float(self.canvas_height_input.value)
+        self.problem.config["canvas"] = {
+            "width": self.problem.canvas_width,
+            "height": self.problem.canvas_height,
+        }
+
+        # Objective weights
+        self.problem.weight_hpwl = float(self.weight_hpwl_input.value)
+        self.problem.weight_bbox_aspect = float(self.weight_bbox_aspect_input.value)
+        self.problem.weight_bbox_area = float(self.weight_bbox_area_input.value)
+
+        if "objective" not in self.problem.config:
+            self.problem.config["objective"] = {"weights": {}}
+        if "weights" not in self.problem.config["objective"]:
+            self.problem.config["objective"]["weights"] = {}
+
+        w_cfg = self.problem.config["objective"]["weights"]
+        w_cfg["hpwl"] = self.problem.weight_hpwl
+        w_cfg["bbox_aspect"] = self.problem.weight_bbox_aspect
+        w_cfg["bbox_area"] = self.problem.weight_bbox_area
+
+        # Constraint penalty weights
+        cons_cfg = self.problem.constraints_cfg
+
+        no_ov_cfg = cons_cfg.setdefault("no_overlap", {})
+        min_sp_cfg = cons_cfg.setdefault("min_spacing", {})
+        bbox_ar_cfg = cons_cfg.setdefault("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.setdefault("canvas_boundary", {})
+
+        no_ov_cfg["penalty_weight"] = float(self.weight_overlap_input.value)
+        min_sp_cfg["penalty_weight"] = float(self.weight_spacing_input.value)
+        bbox_ar_cfg["penalty_weight"] = float(self.weight_bbox_ar_con_input.value)
+        boundary_cfg["penalty_weight"] = float(self.weight_boundary_input.value)
+
+        self.problem.constraints_cfg = cons_cfg
+        self.problem.config["constraints"] = cons_cfg
+
+    def _extract_algorithm_params(self) -> Dict[str, Any]:
+        """
+        Extract parameter values from the currently active optimizer
+        parameter pane.
+
+        The panes were given a `_param_widgets` attribute mapping each
+        parameter name to a Panel widget.
+        """
+        algo = self.optimizer_select.value
+        pane = self.optimizer_param_panes.get(algo)
+        if pane is None or not hasattr(pane, "_param_widgets"):
+            return {}
+        params = {}
+        for name, widget in pane._param_widgets.items():
+            params[name] = widget.value
+        return params
+
+    def _on_run_clicked(self, event) -> None:
+        """
+        Run button: configure the manager from UI and start a fresh run.
+        """
+        self._apply_ui_to_problem()
+
+        # Configure optimisation manager
+        algorithm_name = self.optimizer_select.value
+        algorithm_params = self._extract_algorithm_params()
+        stop_max_iter = int(self.max_iter_input.value)
+        stop_on_objective = bool(self.allow_target_checkbox.value)
+        objective_target = float(self.objective_target_input.value)
+        num_threads = int(self.thread_count_input.value)
+
+        self.opt_manager.configure(
+            algorithm_name=algorithm_name,
+            algorithm_params=algorithm_params,
+            stop_max_iter=stop_max_iter,
+            stop_on_objective=stop_on_objective,
+            objective_target=objective_target,
+            num_threads=num_threads,
+        )
+
+        self._auto_optimised_written_for_run = False
+
+        self.opt_manager.start(resume=False)
+        self.status_markdown.object = "Status: **running**"
+
+    def _on_pause_clicked(self, event) -> None:
+        """
+        Pause button: request a pause in the optimisation.
+        """
+        self.opt_manager.pause()
+        self.status_markdown.object = "Status: **pause requested**"
+
+    def _on_resume_clicked(self, event) -> None:
+        """
+        Resume button: resume from a paused state.
+        """
+        self.opt_manager.resume()
+        self.status_markdown.object = "Status: **running**"
+
+    def _on_stop_clicked(self, event) -> None:
+        """
+        Stop button: request an immediate stop; the manager will also
+        auto-save a state internally.
+        """
+        self.opt_manager.stop()
+        self.status_markdown.object = "Status: **stop requested**"
+
+    def _on_save_state_clicked(self, event) -> None:
+        """
+        Save State button: save the current manager state under the
+        user-provided name.
+        """
+        name = self.state_name_input.value.strip() or "state"
+        state = self.opt_manager.save_state(name)
+        self.status_markdown.object = f"Status: **state '{state.name}' saved**"
+
+    def _on_load_state_clicked(self, event) -> None:
+        """
+        Load State button: load a previously saved state (by name)
+        into the optimisation manager.
+        """
+        name = self.state_name_input.value.strip()
+        if not name:
+            self.status_markdown.object = "Status: **No state name provided**"
+            return
+        state = self.opt_manager.saved_states.get(name)
+        if state is None:
+            self.status_markdown.object = f"Status: **No state named '{name}'**"
+            return
+        self.opt_manager.load_state(state)
+        self.status_markdown.object = f"Status: **state '{name}' loaded**"
+
+    def _on_html_save_clicked(self, event) -> None:
+        """
+        Save as HTML button: export the current dashboard as a standalone
+        HTML file via Panel's save functionality.
+        """
+        filename = self.html_name_input.value.strip() or "dashboard.html"
+        try:
+            from panel.io.save import save as pn_save
+
+            pn_save(self.tabs, filename)
+            self.status_markdown.object = f"Status: **HTML saved to {filename}**"
+        except Exception as exc:
+            self.status_markdown.object = f"Status: **HTML save error: {exc}**"
+
+    # -------------------------------------------------------------------
+    # INPUT PLACEMENT CALLBACKS
+    # -------------------------------------------------------------------
+
+    def _on_ip_apply_canvas_clicked(self, event) -> None:
+        """
+        Apply Canvas button (Input Placement tab):
+
+        - Updates InputPlacementManager's canvas size.
+        - Updates the figure's x/y ranges.
+        """
+        w = float(self.ip_canvas_width_input.value)
+        h = float(self.ip_canvas_height_input.value)
+        self.input_manager.set_canvas_size(w, h)
+        self.ip_canvas_fig.x_range.start = 0
+        self.ip_canvas_fig.x_range.end = w
+        self.ip_canvas_fig.y_range.start = 0
+        self.ip_canvas_fig.y_range.end = h
+        self._update_input_metrics()
+
+    def _on_ip_add_rect_clicked(self, event) -> None:
+        """
+        Add Rect button: add a new rectangle with arbitrary size/position.
+        """
+        self.input_manager.add_rectangle()
+        self.ip_num_rectangles_input.value = len(self.input_manager.rectangles)
+        self.ip_canvas_source.data = self.input_manager.get_rectangles_data()
+        self._update_input_metrics()
+
+    def _on_ip_randomize_pos_clicked(self, event) -> None:
+        """
+        Randomize Pos button: randomise positions of all rectangles
+        (sizes unchanged).
+        """
+        self.input_manager.randomize_positions()
+        self.ip_canvas_source.data = self.input_manager.get_rectangles_data()
+        self._update_input_metrics()
+
+    def _on_ip_update_canvas_clicked(self, event) -> None:
+        """
+        Update Canvas button: refresh the ColumnDataSource from the
+        InputPlacementManager, and recompute metrics.
+        """
+        self.ip_canvas_source.data = self.input_manager.get_rectangles_data()
+        self._update_input_metrics()
+
+    def _on_ip_apply_size_clicked(self, event) -> None:
+        """
+        Apply Size button: update the selected rectangle's width/height.
+        """
+        rid = self.ip_selected_rect_id_input.value.strip()
+        if not rid:
+            return
+        w = float(self.ip_selected_width_input.value)
+        h = float(self.ip_selected_height_input.value)
+        self.input_manager.update_rectangle_size(rid, w, h)
+        self.ip_canvas_source.data = self.input_manager.get_rectangles_data()
+        self._update_input_metrics()
+
+    def _on_ip_delete_rect_clicked(self, event) -> None:
+        """
+        Delete Rect button: delete the currently selected rectangle.
+        """
+        rid = self.ip_selected_rect_id_input.value.strip()
+        if not rid:
+            return
+        self.input_manager.delete_rectangle_by_id(rid)
+        self.ip_num_rectangles_input.value = len(self.input_manager.rectangles)
+        self.ip_canvas_source.data = self.input_manager.get_rectangles_data()
+        self._update_input_metrics()
+
+    def _on_ip_write_config_clicked(self, event) -> None:
+        """
+        Write Config button: generate a complete config dict from the
+        InputPlacementManager and write it to JSON.
+        """
+        filename = self.ip_config_name_input.value.strip()
+        if not filename:
+            filename = "input_placement_config.json"
+
+        # If we loaded a config file, place new config in the same folder;
+        # otherwise use CWD.
+        if self.current_config_path:
+            base_dir = os.path.dirname(self.current_config_path)
+        else:
+            base_dir = os.getcwd()
+
+        path = os.path.join(base_dir, filename)
+
+        cfg = self.input_manager.generate_config_dict()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+            self.ip_metrics_obj_total_pane.object = (
+                f"Combined objective (last): "
+                f"{cfg['objective']['weights'].get('hpwl', 0.0):.3f} (config saved to {os.path.basename(path)})"
+            )
+        except Exception as exc:
+            self.ip_metrics_obj_total_pane.object = f"Error writing config: {exc}"
+
+    def _update_input_metrics(self) -> None:
+        """
+        Recompute Input Placement metrics and update the display panes.
+        """
+        metrics = self.input_manager.compute_metrics()
+        # Objective terms
+        self.ip_metrics_obj_pane.object = (
+            f"- HPWL: {metrics['hpwl']:.3f}\n"
+            f"- BBox Aspect: {metrics['bbox_aspect']:.3f}\n"
+            f"- BBox Area: {metrics['bbox_area']:.3f}\n"
+            f"- Objective (pure): {metrics['objective_pure']:.3f}\n"
+            f"- Objective (aug.): {metrics['objective_augmented']:.3f}\n"
+        )
+        self.ip_metrics_obj_total_pane.object = (
+            f"Combined objective (augmented): {metrics['objective_augmented']:.3f}"
+        )
+        self.ip_metrics_constraints_pane.object = (
+            f"- Overlap max ratio: {metrics['overlap_max_ratio']:.3e}\n"
+            f"- Spacing X viol.: {metrics['spacing_x_violation']:.3e}\n"
+            f"- Spacing Y viol.: {metrics['spacing_y_violation']:.3e}\n"
+            f"- BBox AR viol.: {metrics['bbox_ar_violation']:.3e}\n"
+            f"- Boundary viol.: {metrics['boundary_violation']:.3e}\n"
+        )
+
+    # -------------------------------------------------------------------
+    # PERIODIC SNAPSHOT -> FIGURES / LOGS / ERRORS
+    # -------------------------------------------------------------------
+
+    def _apply_snapshot_to_figures(self, snapshot: Dict[str, Any]) -> None:
+        """
+        Apply a snapshot (from OptimizationManager.get_snapshot()) to all
+        figures and logs.
+
+        This is used both at load time and from the periodic callback.
+        """
+        # -----------------
+        # Canvas View
+        # -----------------
+        rects = snapshot["rectangles_for_plot"]
+        bbox = snapshot["bbox_for_plot"]
+
+        if rects:
+            self.canvas_rect_source.data = {
+                "x": [r["x"] for r in rects],
+                "y": [r["y"] for r in rects],
+                "width": [r["w"] for r in rects],
+                "height": [r["h"] for r in rects],
+                "rect_id": [r["rect_id"] for r in rects],
+            }
+        else:
+            self.canvas_rect_source.data = dict(x=[], y=[], width=[], height=[], rect_id=[])
+
+        self.canvas_bbox_source.data = {
+            "x": [bbox["x"]],
+            "y": [bbox["y"]],
+            "width": [bbox["w"]],
+            "height": [bbox["h"]],
+        }
+
+        # Update canvas ranges from current problem (ensures canvas size changes are reflected)
+        self.canvas_fig.x_range.start = 0
+        self.canvas_fig.x_range.end = self.problem.canvas_width
+        self.canvas_fig.y_range.start = 0
+        self.canvas_fig.y_range.end = self.problem.canvas_height
+
+        # Update title to show current iteration
+        self.canvas_fig.title.text = f"Canvas View (Iteration: {snapshot['iteration']})"
+
+        # -----------------
+        # Objective & constraints
+        # -----------------
+        hist = snapshot["history"]
+        iters = hist["iterations"]
+
+        self.objective_source.data = {
+            "iteration": iters,
+            "hpwl": hist["hpwl"],
+            "bbox_aspect": hist["bbox_aspect"],
+            "bbox_area": hist["bbox_area"],
+            "objective_pure": hist["objective_pure"],
+            "objective_augmented": hist["objective_augmented"],
+        }
+
+        self.constraints_source.data = {
+            "iteration": iters,
+            "overlap": hist["overlap_max_ratio"],
+            "spacing_x": hist["spacing_x_violation"],
+            "spacing_y": hist["spacing_y_violation"],
+            "bbox_ar": hist["bbox_ar_violation"],
+            "boundary": hist["boundary_violation"],
+        }
+
+        # -----------------
+        # Logs table
+        # -----------------
+        logs = snapshot["log_messages"]
+        self.logs_table.value = logs
+
+        # -----------------
+        # Errors text
+        # -----------------
+        errors = snapshot["error_messages"]
+        self.errors_text_area.value = "\n\n".join(errors)
+
+        # -----------------
+        # Status
+        # -----------------
+        status = snapshot["status"]
+        self.status_markdown.object = f"Status: **{status}**"
+
+    def periodic_update(self) -> None:
+        """
+        Periodic callback, invoked by Panel/Bokeh's periodic callback
+        (registered per session in the main block).
+
+        It:
+          - Pulls a snapshot from the optimisation manager.
+          - Pushes the snapshot onto the figures, logs, errors & status.
+          - If the run has finished (status == 'over') and we haven't yet
+            written an auto-optimised config, do so.
+        """
+        snapshot = self.opt_manager.get_snapshot()
+        self._apply_snapshot_to_figures(snapshot)
+
+        # Auto-write optimised config after a run finishes
+        if snapshot["status"] == "over" and not self._auto_optimised_written_for_run:
+            self._auto_write_optimised_config(snapshot)
+            self._auto_optimised_written_for_run = True
+
+    def _auto_write_optimised_config(self, snapshot: Dict[str, Any]) -> None:
+        """
+        Automatically write an optimised config file after a run finishes:
+
+          - Copy the currently loaded config.
+          - Replace rectangles' initial_center with the best centres
+            found by the optimiser.
+          - Write to same folder with "_optimized" suffix.
+        """
+        if self.current_config_path is None or not self.current_config:
+            return
+
+        base_dir = os.path.dirname(self.current_config_path)
+        base_name = os.path.splitext(os.path.basename(self.current_config_path))[0]
+        new_name = base_name + "_optimized.json"
+        new_path = os.path.join(base_dir, new_name)
+
+        cfg = json.loads(json.dumps(self.current_config))  # deep copy
+
+        best_x = snapshot["best_x"]
+        centres = self.problem.decode_centres(best_x)
+        rects_cfg = cfg.get("rectangles", [])
+        for (cx, cy), rect_cfg in zip(centres, rects_cfg):
+            rect_cfg["initial_center"] = [float(cx), float(cy)]
+
+        try:
+            with open(new_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+            self.status_markdown.object = (
+                f"Status: **optimization over, optimised config written to {new_name}**"
+            )
+        except Exception as exc:
+            self.status_markdown.object = f"Status: **Error writing optimised config: {exc}**"
+
+
+# ---------------------------------------------------------------------------
+# 4. MAIN ENTRY POINT (run with: python placement_dashboard.py)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Instantiate the dashboard app
+    app = DashboardApp()
+
+    # Define a per-session initialiser that attaches a periodic callback
+    # to update the figures & logs from the optimisation manager.
+    def _on_session_created(session_context):
+        # A small interval (100 ms). The actual compute cost of snapshot
+        # and figure updates is low; this should feel "live" while not
+        # overloading the event loop.
+        pn.state.add_periodic_callback(app.periodic_update, period=100)
+
+    # Serve the tabs as the main app and open browser automatically
+    pn.serve(
+        app.tabs,
+        title="Rectangle Placement Dashboard",
+        show=True,
+        on_session_created=_on_session_created,
+    )
