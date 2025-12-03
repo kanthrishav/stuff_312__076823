@@ -1,0 +1,1566 @@
+"""
+optimization_manager.py
+=======================
+
+This module defines the `OptimizationManager` class, which is responsible
+for running optimisations on a `PlacementProblem` instance.
+
+It is **pure backend logic**:
+
+- No Panel, Vaex, or Bokeh imports here.
+- No browser, no event loop integration.
+- Only deals with:
+    * Numerics (via numpy and optionally scipy)
+    * Multi-threading (via threading and ThreadPoolExecutor)
+    * Logging of iterations, metrics, warnings, and errors.
+
+The dashboard (Panel/Bokeh) will:
+    - Instantiate a PlacementProblem from a JSON config.
+    - Instantiate an OptimizationManager(problem).
+    - Configure the manager with:
+        * Algorithm name (string)
+        * Algorithm parameters (dict)
+        * Stop conditions (max iter, optional objective target)
+        * Number of threads to use
+        * Updated objective weights and constraint penalties
+    - Call manager.start(resume=False/True) when the Run/Resume buttons
+      are clicked.
+    - Call manager.pause(), manager.stop(), manager.save_state(), etc.
+
+The manager *internally*:
+    - Runs optimisers in a dedicated worker thread.
+    - Periodically records metrics for:
+        * Objective terms
+        * Constraint terms
+        * Current vector (centres)
+        * "Placement ID" (monotonically increasing integer)
+    - Provides thread-safe snapshots of:
+        * Latest iteration number
+        * History arrays for live plotting
+        * Latest rectangles/bounding-box shapes for the canvas view
+        * Logs and errors
+
+--------------------------------------------------------------
+SUPPORTED ALGORITHMS (at least 10 optimisation techniques)
+--------------------------------------------------------------
+
+1. Scipy local gradient-based / direct methods (if scipy is available):
+    - "Nelder-Mead"
+    - "Powell"
+    - "CG"
+    - "BFGS"
+    - "L-BFGS-B"
+    - "TNC"
+    - "SLSQP"
+    - "trust-constr"   (used as "Quadratic Programming-style" method)
+
+2. Scipy global / stochastic methods (if scipy is available):
+    - "Differential Evolution"
+    - "Dual Annealing" (simulated annealing style)
+
+3. Custom population-based method:
+    - "Genetic Algorithm" (multi-threaded objective evaluation)
+
+4. Custom adaptive step method:
+    - "Adam (Simple)" (gradient-free approximate variant)
+
+All algorithms are accessible via their names in SUPPORTED_ALGORITHMS
+and are run through a uniform interface.
+
+IMPORTANT:
+----------
+- Wherever possible, **scipy** algorithms are used.
+- Only GA and Adam are written explicitly here, as requested.
+- If scipy is not available, those algorithms are marked as unavailable,
+  and an informative error is recorded which the dashboard can show.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import logging
+import threading
+import time
+import traceback
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+
+try:
+    # SciPy is used whenever possible for optimisation algorithms
+    import scipy.optimize as sp_opt
+
+    HAVE_SCIPY = True
+except Exception:  # pragma: no cover - handled gracefully
+    HAVE_SCIPY = False
+
+# Import the core geometric/problem definition
+from placement_problem import PlacementProblem
+
+
+# ---------------------------------------------------------------------------
+# INTERNAL EXCEPTION CLASS
+# ---------------------------------------------------------------------------
+
+class _StopRequested(Exception):
+    """
+    Internal control-flow exception used to terminate optimisation loops
+    early when the user presses the Stop button or when a stop condition
+    (max iterations / objective target) is satisfied.
+
+    We do NOT expose this exception outside the module.
+    """
+
+
+# ---------------------------------------------------------------------------
+# DATA STRUCTURE: SavedState
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SavedState:
+    """
+    Container for a complete snapshot of an optimisation run.
+
+    This is serialisable (only plain Python/numpy types), so the dashboard
+    can store/load such states to/from JSON or pickle if needed.
+
+    Attributes
+    ----------
+    name : str
+        User-provided name for this saved state.
+
+    algorithm_name : str
+        Name of the algorithm used when this state was captured.
+
+    iteration : int
+        Current iteration index at the moment of saving.
+
+    placement_counter : int
+        Global placement ID counter at the moment of saving.
+
+    current_x : np.ndarray
+        Current parameter vector of shape (2 * n_rects,).
+
+    best_x : np.ndarray
+        Best parameter vector found so far.
+
+    best_objective : float
+        Best augmented objective value found so far.
+
+    history : Dict[str, List[float]]
+        All history arrays (objective terms, constraints) up to this point.
+        Keys:
+            "iterations", "hpwl", "bbox_aspect", "bbox_area",
+            "objective_pure", "objective_augmented",
+            "overlap_max_ratio", "spacing_x_violation",
+            "spacing_y_violation", "bbox_ar_violation",
+            "boundary_violation"
+
+    log_messages : List[Dict[str, Any]]
+        Copy of all log messages up to this point.
+
+    Notes
+    -----
+    The dashboard will typically:
+        - Call manager.save_state("user_given_name")
+        - Persist this SavedState by converting to JSON/pickle/etc.
+        - Later, load it and pass it to manager.load_state(saved_state)
+    """
+
+    name: str
+    algorithm_name: str
+    iteration: int
+    placement_counter: int
+    current_x: np.ndarray
+    best_x: np.ndarray
+    best_objective: float
+    history: Dict[str, List[float]]
+    log_messages: List[Dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------
+# OPTIMIZATION MANAGER
+# ---------------------------------------------------------------------------
+
+class OptimizationManager:
+    """
+    Central coordinator for running optimisation on a PlacementProblem.
+
+    This class is carefully designed to:
+
+    - Be completely independent of any UI framework.
+    - Allow robust interaction from a dashboard (Panel/Bokeh):
+        * start() / pause() / resume() / stop()
+        * update configuration (algorithm, parameters, stop conditions)
+        * get live snapshots of metrics for plotting
+        * log and error reporting for Logs & Errors tabs
+        * save and load internal optimisation state
+
+    - Use multi-threading in two places:
+        * A dedicated worker thread runs the optimisation algorithm so
+          that the UI remains responsive.
+        * For population-based methods (GA, etc.), a ThreadPoolExecutor
+          is used to evaluate multiple candidate solutions in parallel.
+
+    Public usage pattern (high-level)
+    ---------------------------------
+    manager = OptimizationManager(problem)
+
+    # Configure run before hitting "Run" in UI:
+    manager.configure(
+        algorithm_name="Differential Evolution",
+        algorithm_params={...},
+        stop_max_iter=200,
+        stop_on_objective=True,
+        objective_target=123.4,
+        num_threads=4,
+    )
+
+    # Start optimisation
+    manager.start(resume=False)
+
+    # UI (Panel) periodically calls:
+    snapshot = manager.get_snapshot()
+    # to update plots and canvas in the dashboard.
+
+    # Pause and resume
+    manager.pause()
+    manager.resume()
+
+    # Stop and auto-save state
+    manager.stop()
+
+    See individual method docstrings for details.
+    """
+
+    # -------------------------------------------------------------------
+    # CONSTRUCTOR
+    # -------------------------------------------------------------------
+
+    def __init__(self, problem: PlacementProblem):
+        """
+        Parameters
+        ----------
+        problem : PlacementProblem
+            Instance describing the canvas, rectangles, constraints, and
+            objective terms.
+
+        The constructor initialises:
+
+        - Internal references (problem, dim, initial vector).
+        - Threading primitives (lock, pause event, etc.).
+        - History arrays for objective and constraints.
+        - Log and error buffers.
+        - Saved-state registry.
+        """
+        self.problem = problem
+
+        # Dimension of optimisation vector
+        self.dim: int = self.problem.num_variables()
+
+        # Current parameter vector (start at initial centres)
+        self.current_x: np.ndarray = self.problem.initial_vector().copy()
+
+        # Best solution found so far
+        self.best_x: np.ndarray = self.current_x.copy()
+        # Best augmented objective value found so far
+        self.best_objective: float = float("inf")
+
+        # Iteration counter for current run
+        self.iteration: int = 0
+
+        # Global "placement" counter, incremented every time we record
+        # a new placement (used as a unique placement ID in logs)
+        self.placement_counter: int = 0
+
+        # Algorithm configuration
+        self.algorithm_name: str = "Differential Evolution"
+        self.algorithm_params: Dict[str, Any] = {}
+        self.stop_max_iter: int = 100
+        self.stop_on_objective: bool = False
+        self.objective_target: float = 0.0
+
+        # Thread configuration: number of threads to use for population
+        # evaluation (GA, etc.). This is set via configure().
+        self.num_threads: int = 1
+
+        # Threading primitives:
+        # - _control_lock protects access to all shared state that can
+        #   be read/written from both the UI thread and the worker thread.
+        self._control_lock = threading.RLock()
+
+        # - _pause_event is "set" when PAUSE is requested.
+        self._pause_event = threading.Event()
+        # - _stop_flag is True when STOP is requested.
+        self._stop_flag: bool = False
+
+        # Worker thread handle; None if no optimisation is currently running.
+        self._worker_thread: Optional[threading.Thread] = None
+
+        # Run state string used by the dashboard for Status display:
+        #   "idle", "running", "paused", "stopped", "over", "error"
+        self.status: str = "idle"
+
+        # Flag indicating if we are currently in the middle of an
+        # optimisation run; used to avoid double starts.
+        self._is_running: bool = False
+
+        # -----------------------
+        # History arrays
+        # -----------------------
+        # Each entry in these lists corresponds to a single recorded
+        # iteration (placement), and arrays are kept aligned in time.
+        self.history_iterations: List[int] = []
+        self.history_hpwl: List[float] = []
+        self.history_bbox_aspect: List[float] = []
+        self.history_bbox_area: List[float] = []
+        self.history_objective_pure: List[float] = []
+        self.history_objective_augmented: List[float] = []
+        self.history_overlap_max_ratio: List[float] = []
+        self.history_spacing_x_violation: List[float] = []
+        self.history_spacing_y_violation: List[float] = []
+        self.history_bbox_ar_violation: List[float] = []
+        self.history_boundary_violation: List[float] = []
+
+        # -----------------------
+        # Logs and errors
+        # -----------------------
+        # log_messages: iteration-wise logs containing all metrics and
+        # the full vector; used by the "Logs" tab.
+        self.log_messages: List[Dict[str, Any]] = []
+
+        # error_messages: textual errors/warnings; used by the "Errors" tab.
+        self.error_messages: List[str] = []
+
+        # Auto-saved state when STOP is pressed
+        self._auto_saved_state: Optional[SavedState] = None
+
+        # Named saved states (for manual save/load in UI)
+        self.saved_states: Dict[str, SavedState] = {}
+
+        # General-purpose logger backing the manager; we keep it simple and
+        # also use our own in-memory buffers for UI presentation.
+        self.logger = logging.getLogger("OptimizationManager")
+        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            # Attach a default StreamHandler so messages go to stderr/console.
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                "[%(asctime)s] [%(levelname)s] %(name)s: %(message)s"
+            )
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+
+    # -------------------------------------------------------------------
+    # CONFIGURATION
+    # -------------------------------------------------------------------
+
+    def configure(
+        self,
+        algorithm_name: str,
+        algorithm_params: Dict[str, Any],
+        stop_max_iter: int,
+        stop_on_objective: bool,
+        objective_target: float,
+        num_threads: int,
+    ) -> None:
+        """
+        Configure the optimisation run before pressing the "Run" button.
+
+        This method is called from the dashboard when:
+        - The user selects an optimiser from the dropdown.
+        - The user sets algorithm-specific parameters (population size,
+          mutation rate, learning rate, etc.).
+        - The user sets stop conditions (max iterations, optional objective
+          target).
+        - The user sets the desired number of threads to use.
+
+        Parameters
+        ----------
+        algorithm_name : str
+            Name of the optimiser. Must be one of SUPPORTED_ALGORITHMS keys.
+
+        algorithm_params : Dict[str, Any]
+            Arbitrary optimiser-specific parameters.
+            Examples:
+                For "Differential Evolution":
+                    { "popsize": 20, "mutation": 0.8, "recombination": 0.7 }
+                For "Genetic Algorithm":
+                    { "population_size": 30, "mutation_rate": 0.1, ... }
+                For "Adam (Simple)":
+                    { "learning_rate": 0.05, "beta1": 0.9, "beta2": 0.999 }
+
+        stop_max_iter : int
+            Hard limit on number of iterations / generations / epochs.
+
+        stop_on_objective : bool
+            If True, we also stop early when objective <= objective_target.
+
+        objective_target : float
+            Target augmented objective value for early stopping.
+
+        num_threads : int
+            Number of threads to use for multi-threaded candidate evaluation.
+            This mostly affects population-based methods like GA; for
+            Scipy methods, the main run is still executed in a single thread,
+            but we preserve this parameter in case you want to extend the
+            implementation.
+        """
+        with self._control_lock:
+            self.algorithm_name = algorithm_name
+            self.algorithm_params = dict(algorithm_params or {})
+            self.stop_max_iter = int(max(1, stop_max_iter))
+            self.stop_on_objective = bool(stop_on_objective)
+            self.objective_target = float(objective_target)
+            self.num_threads = max(1, int(num_threads))
+
+    # -------------------------------------------------------------------
+    # CONTROL METHODS: START / PAUSE / RESUME / STOP
+    # -------------------------------------------------------------------
+
+    def start(self, resume: bool = False) -> None:
+        """
+        Start an optimisation run in a dedicated worker thread.
+
+        Parameters
+        ----------
+        resume : bool, optional
+            If False (default), we treat this as a **new run**:
+                - Reset iteration counter
+                - Reset history arrays
+                - Use `problem.initial_vector()` as starting point
+                  (unless a saved state was loaded beforehand).
+            If True, we treat this as a **continuation**:
+                - Keep current_x, best_x, history, and iteration as they are.
+                - Continue from the current_x vector.
+
+        Notes
+        -----
+        - If a run is already active (`_is_running` is True), this method
+          quietly returns without starting another thread.
+        - The worker thread will update `status` as:
+            "running" -> ... -> "over" or "stopped" or "error"
+        """
+        with self._control_lock:
+            if self._is_running:
+                # Avoid starting two runs simultaneously
+                self.logger.warning("start() called while already running.")
+                return
+
+            # Reset flags for the new run
+            self._stop_flag = False
+            self._pause_event.clear()
+            self.status = "running"
+            self._is_running = True
+
+            if not resume:
+                # New run -> reset counters and history
+                self.iteration = 0
+                self.placement_counter = 0
+                self.best_objective = float("inf")
+                self.best_x = self.problem.initial_vector().copy()
+                self.current_x = self.best_x.copy()
+
+                self._clear_history()
+                self.log_messages.clear()
+                # Do not clear error_messages here; those reflect cumulative
+                # errors that the user might still want to see.
+
+            # Spawn the worker thread
+            self._worker_thread = threading.Thread(
+                target=self._run_worker,
+                name="OptimizationWorker",
+                daemon=True,  # daemon so it doesn't block process exit
+            )
+            self._worker_thread.start()
+
+    def pause(self) -> None:
+        """
+        Request a pause in the optimisation.
+
+        The worker thread periodically checks `_pause_event` via
+        `_check_pause_stop()`. When it sees that `_pause_event` is set, it
+        enters a loop that sleeps in small increments until `resume()` is
+        called.
+
+        The status string is updated to "paused" when the worker observes
+        the pause event. (We do not set it here to avoid race conditions
+        where pause is requested but not yet acknowledged.)
+        """
+        with self._control_lock:
+            if not self._is_running:
+                return
+            self._pause_event.set()
+
+    def resume(self) -> None:
+        """
+        Resume optimisation after a pause.
+
+        This method simply clears the `_pause_event`. The worker thread,
+        which will be blocked inside `_check_pause_stop()`, then proceeds
+        with the next iteration.
+
+        The status string is updated back to "running" when the worker
+        observes the cleared pause event.
+        """
+        with self._control_lock:
+            self._pause_event.clear()
+
+    def stop(self) -> None:
+        """
+        Request a hard stop of the current optimisation run.
+
+        - Sets the `_stop_flag` which is checked by the worker.
+        - The worker responds by raising `_StopRequested` inside loops and
+          gracefully unwinding.
+        - An auto-saved state of the current run is captured and stored
+          in `_auto_saved_state`.
+
+        The status string is eventually set to "stopped".
+
+        Notes
+        -----
+        This method does **not** block until the worker thread finishes;
+        it just signals the stop request. The UI can poll `status` to
+        detect when the run has fully stopped.
+        """
+        with self._control_lock:
+            if not self._is_running:
+                return
+            self._stop_flag = True  # worker will see this and bail
+
+    # -------------------------------------------------------------------
+    # HISTORY & STATE UTILITIES
+    # -------------------------------------------------------------------
+
+    def _clear_history(self) -> None:
+        """
+        Internal helper to clear all history lists.
+
+        Called on new runs to ensure that plotting starts from a clean
+        slate.
+
+        NOTE: We do NOT clear `log_messages` and `error_messages` here
+        since the user might want to inspect them across runs. Clearing
+        logs is a separate UI concern, not handled here.
+        """
+        self.history_iterations.clear()
+        self.history_hpwl.clear()
+        self.history_bbox_aspect.clear()
+        self.history_bbox_area.clear()
+        self.history_objective_pure.clear()
+        self.history_objective_augmented.clear()
+        self.history_overlap_max_ratio.clear()
+        self.history_spacing_x_violation.clear()
+        self.history_spacing_y_violation.clear()
+        self.history_bbox_ar_violation.clear()
+        self.history_boundary_violation.clear()
+
+    def save_state(self, name: str) -> SavedState:
+        """
+        Save the current optimisation state under a user-provided name.
+
+        Parameters
+        ----------
+        name : str
+            Name for this saved state. If a state with the same name
+            already exists, it will be overwritten.
+
+        Returns
+        -------
+        SavedState
+            The created SavedState object, also stored internally in
+            `self.saved_states[name]`.
+
+        Notes
+        -----
+        The dashboard can call this when the "Save State" button is
+        pressed. Typically, it might also persist this SavedState to
+        disk (e.g. via pickle or JSON-serialisation).
+        """
+        with self._control_lock:
+            history = dict(
+                iterations=list(self.history_iterations),
+                hpwl=list(self.history_hpwl),
+                bbox_aspect=list(self.history_bbox_aspect),
+                bbox_area=list(self.history_bbox_area),
+                objective_pure=list(self.history_objective_pure),
+                objective_augmented=list(self.history_objective_augmented),
+                overlap_max_ratio=list(self.history_overlap_max_ratio),
+                spacing_x_violation=list(self.history_spacing_x_violation),
+                spacing_y_violation=list(self.history_spacing_y_violation),
+                bbox_ar_violation=list(self.history_bbox_ar_violation),
+                boundary_violation=list(self.history_boundary_violation),
+            )
+
+            state = SavedState(
+                name=name,
+                algorithm_name=self.algorithm_name,
+                iteration=self.iteration,
+                placement_counter=self.placement_counter,
+                current_x=self.current_x.copy(),
+                best_x=self.best_x.copy(),
+                best_objective=float(self.best_objective),
+                history=history,
+                log_messages=list(self.log_messages),
+            )
+            self.saved_states[name] = state
+            return state
+
+    def load_state(self, state: SavedState) -> None:
+        """
+        Load a previously saved state into the manager.
+
+        Parameters
+        ----------
+        state : SavedState
+            The state object previously created by `save_state()`.
+
+        Notes
+        -----
+        After calling this, the dashboard can start a new optimisation
+        from this loaded state by calling `start(resume=True)`.
+
+        All relevant fields are restored:
+            - algorithm_name
+            - current_x / best_x
+            - best_objective
+            - iteration / placement_counter
+            - history arrays
+            - log_messages
+        """
+        with self._control_lock:
+            self.algorithm_name = state.algorithm_name
+            self.current_x = state.current_x.copy()
+            self.best_x = state.best_x.copy()
+            self.best_objective = float(state.best_objective)
+            self.iteration = int(state.iteration)
+            self.placement_counter = int(state.placement_counter)
+
+            # Restore history
+            self.history_iterations = list(state.history["iterations"])
+            self.history_hpwl = list(state.history["hpwl"])
+            self.history_bbox_aspect = list(state.history["bbox_aspect"])
+            self.history_bbox_area = list(state.history["bbox_area"])
+            self.history_objective_pure = list(state.history["objective_pure"])
+            self.history_objective_augmented = list(
+                state.history["objective_augmented"]
+            )
+            self.history_overlap_max_ratio = list(
+                state.history["overlap_max_ratio"]
+            )
+            self.history_spacing_x_violation = list(
+                state.history["spacing_x_violation"]
+            )
+            self.history_spacing_y_violation = list(
+                state.history["spacing_y_violation"]
+            )
+            self.history_bbox_ar_violation = list(
+                state.history["bbox_ar_violation"]
+            )
+            self.history_boundary_violation = list(
+                state.history["boundary_violation"]
+            )
+
+            # Restore logs
+            self.log_messages = list(state.log_messages)
+
+    def get_auto_saved_state(self) -> Optional[SavedState]:
+        """
+        Return the automatically saved state (if any) captured when
+        STOP was requested.
+
+        Returns
+        -------
+        Optional[SavedState]
+            The auto-saved state or None if no STOP-triggered save
+            has occurred yet.
+        """
+        with self._control_lock:
+            return self._auto_saved_state
+
+    # -------------------------------------------------------------------
+    # SNAPSHOT FOR DASHBOARD
+    # -------------------------------------------------------------------
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        """
+        Provide a thread-safe snapshot of the current optimisation state.
+
+        This method is **frequently** called by the dashboard's periodic
+        callback (e.g. every 50ms–100ms) to update:
+
+        - Canvas View (rectangles & bounding box)
+        - Objective Terms vs Iteration graph
+        - Constraints Terms vs Iteration graph
+        - Logs & Errors tabs
+        - Status text
+
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary containing:
+
+            - "status": str
+            - "iteration": int
+            - "placement_counter": int
+            - "current_x": np.ndarray
+            - "best_x": np.ndarray
+            - "history": Dict[str, List[float]]
+            - "log_messages": List[Dict[str, Any]]
+            - "error_messages": List[str]
+            - "rectangles_for_plot": List[Dict[str, Any]]
+            - "bbox_for_plot": Dict[str, Any]
+        """
+        with self._control_lock:
+            # Copy current/ best vectors
+            current_x = self.current_x.copy()
+            best_x = self.best_x.copy()
+
+            # Copy history arrays
+            history = dict(
+                iterations=list(self.history_iterations),
+                hpwl=list(self.history_hpwl),
+                bbox_aspect=list(self.history_bbox_aspect),
+                bbox_area=list(self.history_bbox_area),
+                objective_pure=list(self.history_objective_pure),
+                objective_augmented=list(self.history_objective_augmented),
+                overlap_max_ratio=list(self.history_overlap_max_ratio),
+                spacing_x_violation=list(self.history_spacing_x_violation),
+                spacing_y_violation=list(self.history_spacing_y_violation),
+                bbox_ar_violation=list(self.history_bbox_ar_violation),
+                boundary_violation=list(self.history_boundary_violation),
+            )
+
+            # Copy logs & errors
+            logs_copy = list(self.log_messages)
+            errors_copy = list(self.error_messages)
+
+            # Rectangles & bounding box for current_x (live canvas view)
+            rects_for_plot, bbox_for_plot = self.problem.make_rectangle_shapes(
+                current_x
+            )
+
+            return {
+                "status": self.status,
+                "iteration": self.iteration,
+                "placement_counter": self.placement_counter,
+                "current_x": current_x,
+                "best_x": best_x,
+                "history": history,
+                "log_messages": logs_copy,
+                "error_messages": errors_copy,
+                "rectangles_for_plot": rects_for_plot,
+                "bbox_for_plot": bbox_for_plot,
+            }
+
+    # -------------------------------------------------------------------
+    # INTERNAL LOGGING HELPERS
+    # -------------------------------------------------------------------
+
+    def _record_error(self, message: str, exc: Optional[BaseException] = None) -> None:
+        """
+        Internal helper to record an error or warning message.
+
+        - Appends the message (plus optional traceback) to `error_messages`.
+        - Logs it via the logger at ERROR level (if `exc` is given) or
+          WARNING level (otherwise).
+
+        Parameters
+        ----------
+        message : str
+            Human-readable error/warning description.
+
+        exc : Optional[BaseException]
+            If provided, full traceback is attached and logged.
+        """
+        with self._control_lock:
+            if exc is not None:
+                tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                full_msg = f"{message}\n{tb_str}"
+                self.error_messages.append(full_msg)
+                self.logger.error(message, exc_info=exc)
+            else:
+                self.error_messages.append(message)
+                self.logger.warning(message)
+
+    def _record_log_entry(self, x: np.ndarray, metrics: Dict[str, float]) -> None:
+        """
+        Internal helper to create a detailed log entry for the current
+        vector `x` and its metrics.
+
+        The log entry includes:
+
+        - A unique placement ID (`placement_id`).
+        - Current iteration index.
+        - All objective terms and constraint terms.
+        - The entire vector of rectangle centres (cx, cy) for each rectangle.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Current optimisation vector.
+
+        metrics : Dict[str, float]
+            Metrics dictionary as returned by `problem.compute_metrics()`.
+        """
+        centres = self.problem.decode_centres(x)
+
+        # Build a friendly representation of rectangle centres; each entry:
+        #   { "rect_id": "R0", "cx": ..., "cy": ... }
+        rect_centres_info: List[Dict[str, Any]] = []
+        for (cx, cy), rect in zip(centres, self.problem.rectangles):
+            rect_centres_info.append(
+                {
+                    "rect_id": rect.rect_id,
+                    "cx": float(cx),
+                    "cy": float(cy),
+                }
+            )
+
+        log_entry = {
+            "placement_id": self.placement_counter,
+            "iteration": self.iteration,
+            "hpwl": metrics["hpwl"],
+            "bbox_aspect": metrics["bbox_aspect"],
+            "bbox_area": metrics["bbox_area"],
+            "objective_pure": metrics["objective_pure"],
+            "objective_augmented": metrics["objective_augmented"],
+            "overlap_max_ratio": metrics["overlap_max_ratio"],
+            "spacing_x_violation": metrics["spacing_x_violation"],
+            "spacing_y_violation": metrics["spacing_y_violation"],
+            "bbox_ar_violation": metrics["bbox_ar_violation"],
+            "boundary_violation": metrics["boundary_violation"],
+            "rectangles": rect_centres_info,
+        }
+
+        self.log_messages.append(log_entry)
+
+    # -------------------------------------------------------------------
+    # INTERNAL CONTROL CHECK
+    # -------------------------------------------------------------------
+
+    def _check_pause_stop(self) -> None:
+        """
+        Internal helper to honour PAUSE and STOP requests.
+
+        Called frequently from within optimisation loops. It:
+
+        1. If `_stop_flag` is True, raises `_StopRequested` immediately.
+        2. If `_pause_event` is set, enters a loop:
+             - status becomes "paused"
+             - sleeps briefly
+             - exits when `_pause_event` is cleared
+             - status becomes "running" again
+
+        This function is always called under `_control_lock`, so any status
+        updates are thread-safe.
+        """
+        with self._control_lock:
+            # Hard stop requested?
+            if self._stop_flag:
+                raise _StopRequested("Stop requested by user.")
+
+        # Pause loop is handled outside the lock to avoid blocking other
+        # access to shared state while we sleep.
+        while self._pause_event.is_set():
+            with self._control_lock:
+                self.status = "paused"
+            time.sleep(0.05)
+
+        # When pause is cleared, set status back to running
+        with self._control_lock:
+            if not self._stop_flag:
+                self.status = "running"
+
+    # -------------------------------------------------------------------
+    # INTERNAL ITERATION RECORDING
+    # -------------------------------------------------------------------
+
+    def _record_iteration(self, x: np.ndarray) -> None:
+        """
+        Internal helper called on every successful iteration / generation.
+
+        It performs the following tasks:
+
+        1. Increase iteration counter and placement counter.
+        2. Compute metrics via `problem.compute_metrics(x)`.
+        3. Update history arrays (for plotting).
+        4. Update `current_x` and (if improved) `best_x` + `best_objective`.
+        5. Append a detailed log entry (placement ID, metrics, centres).
+        6. Check stop conditions:
+             - If stop_max_iter reached, raise `_StopRequested`.
+             - If stop_on_objective and objective <= objective_target,
+               raise `_StopRequested`.
+        """
+        with self._control_lock:
+            # Update iteration & placement counters
+            self.iteration += 1
+            self.placement_counter += 1
+
+            # Compute metrics for this vector
+            metrics = self.problem.compute_metrics(x)
+
+            # Append metrics to history arrays
+            self.history_iterations.append(self.iteration)
+            self.history_hpwl.append(metrics["hpwl"])
+            self.history_bbox_aspect.append(metrics["bbox_aspect"])
+            self.history_bbox_area.append(metrics["bbox_area"])
+            self.history_objective_pure.append(metrics["objective_pure"])
+            self.history_objective_augmented.append(
+                metrics["objective_augmented"]
+            )
+            self.history_overlap_max_ratio.append(metrics["overlap_max_ratio"])
+            self.history_spacing_x_violation.append(
+                metrics["spacing_x_violation"]
+            )
+            self.history_spacing_y_violation.append(
+                metrics["spacing_y_violation"]
+            )
+            self.history_bbox_ar_violation.append(
+                metrics["bbox_ar_violation"]
+            )
+            self.history_boundary_violation.append(
+                metrics["boundary_violation"]
+            )
+
+            # Update current vector
+            self.current_x = x.copy()
+
+            # Update best solution if improved
+            if metrics["objective_augmented"] < self.best_objective:
+                self.best_objective = metrics["objective_augmented"]
+                self.best_x = x.copy()
+
+            # Append to logs
+            self._record_log_entry(x, metrics)
+
+            # Check iteration-based stop condition
+            if self.iteration >= self.stop_max_iter:
+                raise _StopRequested(
+                    f"Maximum iterations reached: {self.stop_max_iter}"
+                )
+
+            # Check objective-based stop condition
+            if self.stop_on_objective and metrics["objective_augmented"] <= self.objective_target:
+                raise _StopRequested(
+                    f"Objective target reached: {metrics['objective_augmented']:.6f} <= {self.objective_target:.6f}"
+                )
+
+    # -------------------------------------------------------------------
+    # OBJECTIVE FUNCTION FOR SCIPY
+    # -------------------------------------------------------------------
+
+    def _scipy_objective(self, x: np.ndarray) -> float:
+        """
+        Objective function wrapper for Scipy-based optimisers.
+
+        - Ensures x is a 1D numpy array of correct length.
+        - Computes augmented objective via `problem.compute_metrics(x)`.
+        - Does **not** record iteration here; instead, recording is done
+          in the Scipy callback so that we can control the frequency of
+          history/log updates and centralise stopping logic there.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Candidate vector from Scipy optimiser.
+
+        Returns
+        -------
+        float
+            Augmented objective value.
+        """
+        x = np.asarray(x, dtype=float).ravel()
+        metrics = self.problem.compute_metrics(x)
+        return float(metrics["objective_augmented"])
+
+    def _scipy_callback(self, xk: np.ndarray) -> bool:
+        """
+        Callback for Scipy minimisers.
+
+        This is called by Scipy after each iteration (when the algorithm
+        accepts a new step). We use it to:
+
+        - Record an iteration (metrics, history, logs).
+        - Check pause/stop flags and stop conditions.
+
+        Parameters
+        ----------
+        xk : np.ndarray
+            Current vector at this iteration.
+
+        Returns
+        -------
+        bool
+            If True is returned, Scipy stops the optimisation early.
+            We return True if a stop condition or STOP button is triggered.
+
+        Notes
+        -----
+        - We gracefully handle _StopRequested raised inside `_record_iteration`
+          or `_check_pause_stop()` by converting it into a True return.
+        """
+        try:
+            # Honour PAUSE / STOP
+            self._check_pause_stop()
+
+            # Record metrics and logs for this iteration
+            self._record_iteration(np.asarray(xk, dtype=float))
+
+            return False  # continue
+        except _StopRequested as e:
+            # We translate this into True for Scipy to stop
+            self._record_error(f"Scipy callback stop: {str(e)}")
+            return True
+        except Exception as exc:
+            # Any unexpected error also stops the optimisation
+            self._record_error("Exception in Scipy callback", exc)
+            return True
+
+    # -------------------------------------------------------------------
+    # INTERNAL WORKER THREAD ENTRY POINT
+    # -------------------------------------------------------------------
+
+    def _run_worker(self) -> None:
+        """
+        Main worker-thread function.
+
+        This is where we:
+
+        - Wrap the entire run in a `warnings.catch_warnings` context to
+          capture and store warnings in `error_messages`.
+        - Dispatch to the appropriate algorithm-specific runner based on
+          `self.algorithm_name`.
+        - Catch _StopRequested, normal completion, and unexpected errors,
+          and update `status` accordingly.
+        """
+        try:
+            with warnings.catch_warnings(record=True) as wlist:
+                warnings.simplefilter("always")
+
+                try:
+                    # Dispatch to algorithm-specific runner
+                    self._run_selected_algorithm()
+                    # If we reach here without _StopRequested or Exception:
+                    with self._control_lock:
+                        # Only mark as "over" if STOP wasn't requested
+                        if not self._stop_flag:
+                            self.status = "over"
+                except _StopRequested:
+                    # Stop requested either from STOP button or stop condition
+                    with self._control_lock:
+                        self.status = "stopped"
+                        # Capture auto-saved state for resume
+                        self._auto_saved_state = self.save_state("autosave")
+                except Exception as exc:
+                    # Unexpected error during optimisation
+                    self._record_error("Exception in optimisation worker", exc)
+                    with self._control_lock:
+                        self.status = "error"
+
+                # Record any warnings that occurred
+                for w in wlist:
+                    msg = f"Warning: {w.message} (category={w.category.__name__}, file={w.filename}, line={w.lineno})"
+                    self._record_error(msg)
+
+        finally:
+            # Mark as not running and clear worker thread handle
+            with self._control_lock:
+                self._is_running = False
+                self._worker_thread = None
+
+    # -------------------------------------------------------------------
+    # ALGORITHM DISPATCH
+    # -------------------------------------------------------------------
+
+    def _run_selected_algorithm(self) -> None:
+        """
+        Dispatch to the appropriate algorithm-specific runner based on
+        `self.algorithm_name`.
+
+        The available options (case-sensitive names):
+
+        - "Nelder-Mead"        (Scipy minimise)
+        - "Powell"             (Scipy minimise)
+        - "CG"                 (Scipy minimise)
+        - "BFGS"               (Scipy minimise)
+        - "L-BFGS-B"           (Scipy minimise)
+        - "TNC"                (Scipy minimise)
+        - "SLSQP"              (Scipy minimise)
+        - "trust-constr"       (Scipy minimise, used as QP-style method)
+        - "Differential Evolution" (Scipy differential_evolution)
+        - "Dual Annealing"     (Scipy dual_annealing)
+        - "Genetic Algorithm"  (Custom GA)
+        - "Adam (Simple)"      (Custom adaptive-step method)
+        """
+        name = self.algorithm_name
+
+        if name in (
+            "Nelder-Mead",
+            "Powell",
+            "CG",
+            "BFGS",
+            "L-BFGS-B",
+            "TNC",
+            "SLSQP",
+            "trust-constr",
+        ):
+            self._run_scipy_minimize(method=name)
+        elif name == "Differential Evolution":
+            self._run_differential_evolution()
+        elif name == "Dual Annealing":
+            self._run_dual_annealing()
+        elif name == "Genetic Algorithm":
+            self._run_ga()
+        elif name == "Adam (Simple)":
+            self._run_adam_simple()
+        else:
+            # Unknown algorithm name
+            raise ValueError(f"Unsupported algorithm: {name}")
+
+    # -------------------------------------------------------------------
+    # SCIPY MINIMISE WRAPPER
+    # -------------------------------------------------------------------
+
+    def _run_scipy_minimize(self, method: str) -> None:
+        """
+        Run Scipy's `minimize` with the configured method.
+
+        Parameters
+        ----------
+        method : str
+            One of Scipy's supported methods:
+              "Nelder-Mead", "Powell", "CG", "BFGS", "L-BFGS-B",
+              "TNC", "SLSQP", "trust-constr"
+
+        Notes
+        -----
+        - We do not use explicit bounds for unconstrained methods unless
+          they support it.
+        - All constraints are enforced via augmented objective and penalty
+          terms inside `PlacementProblem.compute_metrics`.
+        - `callback` is used for recording iterations and honouring pause/stop.
+        """
+        if not HAVE_SCIPY:
+            self._record_error(
+                f"Scipy not available; cannot run method '{method}'. Please install scipy."
+            )
+            return
+
+        x0 = self.current_x.copy()
+        bounds = self.problem.bounds()
+
+        # Build keyword arguments from algorithm_params; we restrict to
+        # common keys supported by Scipy's minimize to avoid errors.
+        options = dict(self.algorithm_params.get("options", {}))
+        maxiter = self.algorithm_params.get("maxiter", None)
+        if maxiter is not None:
+            # Let user override internal stop_max_iter for this method
+            options["maxiter"] = int(maxiter)
+
+        # SciPy minimise
+        sp_opt.minimize(
+            fun=self._scipy_objective,
+            x0=x0,
+            method=method,
+            bounds=bounds if method in ("L-BFGS-B", "TNC", "SLSQP", "trust-constr") else None,
+            callback=self._scipy_callback,
+            options=options if options else None,
+        )
+
+    # -------------------------------------------------------------------
+    # SCIPY DIFFERENTIAL EVOLUTION
+    # -------------------------------------------------------------------
+
+    def _run_differential_evolution(self) -> None:
+        """
+        Run Scipy's `differential_evolution` (global optimiser).
+
+        Uses the augmented objective as the target function and the
+        manager's callback for per-generation logging.
+
+        Notes
+        -----
+        - `differential_evolution` supports a `callback(xk, convergence)`
+          which we wrap similarly to `_scipy_callback`.
+        - Bounds are taken directly from `PlacementProblem.bounds()`.
+        """
+        if not HAVE_SCIPY:
+            self._record_error(
+                "Scipy not available; cannot run Differential Evolution. Please install scipy."
+            )
+            return
+
+        bounds = self.problem.bounds()
+
+        # Extract DE-specific parameters, with sensible defaults
+        popsize = int(self.algorithm_params.get("popsize", 15))
+        mutation = float(self.algorithm_params.get("mutation", 0.8))
+        recombination = float(self.algorithm_params.get("recombination", 0.7))
+        strategy = self.algorithm_params.get("strategy", "best1bin")
+
+        def de_callback(xk, convergence) -> bool:
+            """
+            Differential Evolution callback.
+
+            Parameters
+            ----------
+            xk : np.ndarray
+                Best solution vector at this generation.
+            convergence : float
+                Convergence measure (not used here).
+
+            Returns
+            -------
+            bool
+                True to stop, False to continue.
+            """
+            try:
+                self._check_pause_stop()
+                self._record_iteration(np.asarray(xk, dtype=float))
+                return False
+            except _StopRequested as e:
+                self._record_error(f"DE callback stop: {str(e)}")
+                return True
+            except Exception as exc:
+                self._record_error("Exception in DE callback", exc)
+                return True
+
+        sp_opt.differential_evolution(
+            func=self._scipy_objective,
+            bounds=bounds,
+            strategy=strategy,
+            maxiter=self.stop_max_iter * 10,  # DE's "maxiter" = generations; we keep our own stop
+            popsize=popsize,
+            mutation=mutation,
+            recombination=recombination,
+            callback=de_callback,
+            polish=False,  # we don't need local polishing here
+        )
+
+    # -------------------------------------------------------------------
+    # SCIPY DUAL ANNEALING (SIMULATED ANNEALING STYLE)
+    # -------------------------------------------------------------------
+
+    def _run_dual_annealing(self) -> None:
+        """
+        Run Scipy's `dual_annealing` (simulated annealing style).
+
+        Notes
+        -----
+        - Bounds are taken from `PlacementProblem.bounds()`.
+        - `dual_annealing` supports a callback(x, f, context) that we use
+          for logging and stop/pause checks.
+        """
+        if not HAVE_SCIPY:
+            self._record_error(
+                "Scipy not available; cannot run Dual Annealing. Please install scipy."
+            )
+            return
+
+        bounds_list = self.problem.bounds()
+        # dual_annealing expects bounds as [(low, high), ...]
+        da_bounds = [(low, high) for (low, high) in bounds_list]
+
+        maxiter = int(self.algorithm_params.get("maxiter", self.stop_max_iter))
+
+        def da_callback(x, f, context) -> bool:
+            """
+            Dual Annealing callback.
+
+            Parameters
+            ----------
+            x : np.ndarray
+                Current solution.
+            f : float
+                Current objective value.
+            context : int
+                Additional context flag (not used here).
+
+            Returns
+            -------
+            bool
+                True to stop, False to continue.
+            """
+            try:
+                self._check_pause_stop()
+                self._record_iteration(np.asarray(x, dtype=float))
+                return False
+            except _StopRequested as e:
+                self._record_error(f"Dual Annealing stop: {str(e)}")
+                return True
+            except Exception as exc:
+                self._record_error("Exception in Dual Annealing callback", exc)
+                return True
+
+        sp_opt.dual_annealing(
+            func=self._scipy_objective,
+            bounds=da_bounds,
+            maxiter=maxiter,
+            callback=da_callback,
+        )
+
+    # -------------------------------------------------------------------
+    # GENETIC ALGORITHM (CUSTOM, MULTI-THREADED EVALUATION)
+    # -------------------------------------------------------------------
+
+    def _run_ga(self) -> None:
+        """
+        Custom Genetic Algorithm implementation.
+
+        This GA is intentionally simple but fully functional:
+
+        - Population of candidate vectors.
+        - Tournament selection.
+        - Simulated binary crossover (SBX-like but simplified).
+        - Gaussian mutation with clipping to bounds.
+        - Multi-threaded objective evaluation using ThreadPoolExecutor
+          with `self.num_threads` workers.
+
+        We record a single iteration per generation using the **best**
+        individual of that generation.
+        """
+        bounds = self.problem.bounds()
+        dim = self.dim
+
+        # Extract GA parameters with defaults
+        pop_size = int(self.algorithm_params.get("population_size", 20))
+        crossover_rate = float(self.algorithm_params.get("crossover_rate", 0.9))
+        mutation_rate = float(self.algorithm_params.get("mutation_rate", 0.1))
+        mutation_std = float(self.algorithm_params.get("mutation_std", 1.0))
+        tournament_size = int(self.algorithm_params.get("tournament_size", 3))
+
+        # Helper: random individual within bounds
+        def random_individual() -> np.ndarray:
+            vals = []
+            for (low, high) in bounds:
+                vals.append(np.random.uniform(low, high))
+            return np.array(vals, dtype=float)
+
+        # Initialise population around current_x for some diversity
+        population = []
+        for i in range(pop_size):
+            if i == 0:
+                # Include current_x as seed
+                candidate = self.current_x.copy()
+            else:
+                candidate = random_individual()
+            population.append(candidate)
+
+        # Evaluate population in parallel
+        def eval_individual(ind: np.ndarray) -> float:
+            metrics = self.problem.compute_metrics(ind)
+            return float(metrics["objective_augmented"])
+
+        def eval_population(pop: List[np.ndarray]) -> List[float]:
+            # Multi-threaded evaluation of population: uses a thread pool
+            # with `self.num_threads` workers.
+            fitness: List[float] = [0.0] * len(pop)
+            with ThreadPoolExecutor(max_workers=self.num_threads) as ex:
+                futures = {}
+                for idx, ind in enumerate(pop):
+                    futures[ex.submit(eval_individual, ind)] = idx
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    fitness[idx] = future.result()
+            return fitness
+
+        # Helper: tournament selection index
+        def tournament_select(fitnesses: List[float]) -> int:
+            best_idx = None
+            for _ in range(tournament_size):
+                i = np.random.randint(0, len(fitnesses))
+                if best_idx is None or fitnesses[i] < fitnesses[best_idx]:
+                    best_idx = i
+            return best_idx
+
+        # Helper: crossover (blend / SBX-like)
+        def crossover(p1: np.ndarray, p2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            if np.random.rand() > crossover_rate:
+                return p1.copy(), p2.copy()
+            alpha = np.random.uniform(-0.5, 1.5, size=dim)
+            c1 = alpha * p1 + (1 - alpha) * p2
+            c2 = alpha * p2 + (1 - alpha) * p1
+            # Clip to bounds
+            for i, (low, high) in enumerate(bounds):
+                c1[i] = np.clip(c1[i], low, high)
+                c2[i] = np.clip(c2[i], low, high)
+            return c1, c2
+
+        # Helper: mutation
+        def mutate(ind: np.ndarray) -> None:
+            for i in range(dim):
+                if np.random.rand() < mutation_rate:
+                    ind[i] += np.random.normal(0.0, mutation_std)
+                    low, high = bounds[i]
+                    ind[i] = np.clip(ind[i], low, high)
+
+        # Main GA loop: each generation corresponds to one iteration
+        generation = 0
+        while True:
+            self._check_pause_stop()  # handle pause/stop
+
+            # Evaluate current population
+            fitness = eval_population(population)
+
+            # Find best individual in this generation
+            best_idx = int(np.argmin(fitness))
+            best_candidate = population[best_idx].copy()
+
+            # Record iteration using best candidate
+            self._record_iteration(best_candidate)
+
+            # After recording, check for stop conditions inside _record_iteration
+            # If not stopped, continue with GA evolution.
+
+            # Create new population
+            new_population: List[np.ndarray] = []
+
+            while len(new_population) < pop_size:
+                # Selection
+                i1 = tournament_select(fitness)
+                i2 = tournament_select(fitness)
+                parent1 = population[i1]
+                parent2 = population[i2]
+
+                # Crossover
+                child1, child2 = crossover(parent1, parent2)
+
+                # Mutation
+                mutate(child1)
+                mutate(child2)
+
+                new_population.append(child1)
+                if len(new_population) < pop_size:
+                    new_population.append(child2)
+
+            population = new_population
+            generation += 1
+
+    # -------------------------------------------------------------------
+    # ADAM (SIMPLE, GRADIENT-FREE APPROXIMATION)
+    # -------------------------------------------------------------------
+
+    def _run_adam_simple(self) -> None:
+        """
+        Simple Adam-like optimiser using finite-difference gradient
+        approximation.
+
+        IMPORTANT:
+        ----------
+        - This is **not** a full automatic-differentiation implementation.
+        - We approximate gradients via central finite differences, which
+          can be expensive for high-dimensional problems.
+        - However, this provides an "Adam-style" adaptive step optimiser
+          as requested, with the following hyperparameters:
+
+            * learning_rate (float)
+            * beta1 (float)
+            * beta2 (float)
+            * epsilon (float)
+            * fd_epsilon (float)  # step size for finite differences
+
+        - We record one iteration per Adam update.
+        """
+        dim = self.dim
+        bounds = self.problem.bounds()
+
+        # Hyperparameters with reasonable defaults
+        lr = float(self.algorithm_params.get("learning_rate", 0.05))
+        beta1 = float(self.algorithm_params.get("beta1", 0.9))
+        beta2 = float(self.algorithm_params.get("beta2", 0.999))
+        eps = float(self.algorithm_params.get("epsilon", 1e-8))
+        fd_eps = float(self.algorithm_params.get("fd_epsilon", 1e-3))
+
+        # Adam internal state: first and second moments
+        m = np.zeros(dim, dtype=float)
+        v = np.zeros(dim, dtype=float)
+
+        # Start from current_x
+        x = self.current_x.copy()
+
+        # Helper: compute augmented objective at x
+        def f(xvec: np.ndarray) -> float:
+            metrics = self.problem.compute_metrics(xvec)
+            return float(metrics["objective_augmented"])
+
+        t = 0  # Adam time step
+
+        while True:
+            self._check_pause_stop()  # handle pause/stop
+
+            # Approximate gradient using central finite differences
+            grad = np.zeros(dim, dtype=float)
+            fx = f(x)
+            for i in range(dim):
+                # Perturb in + and - directions
+                x_plus = x.copy()
+                x_minus = x.copy()
+                x_plus[i] += fd_eps
+                x_minus[i] -= fd_eps
+
+                # Clip to bounds
+                low, high = bounds[i]
+                x_plus[i] = np.clip(x_plus[i], low, high)
+                x_minus[i] = np.clip(x_minus[i], low, high)
+
+                f_plus = f(x_plus)
+                f_minus = f(x_minus)
+                grad[i] = (f_plus - f_minus) / (2.0 * fd_eps)
+
+            # Adam update
+            t += 1
+            m = beta1 * m + (1.0 - beta1) * grad
+            v = beta2 * v + (1.0 - beta2) * (grad ** 2)
+
+            # Bias corrections
+            m_hat = m / (1.0 - beta1 ** t)
+            v_hat = v / (1.0 - beta2 ** t)
+
+            # Parameter update (gradient descent)
+            x = x - lr * m_hat / (np.sqrt(v_hat) + eps)
+
+            # Clip to bounds
+            for i, (low, high) in enumerate(bounds):
+                x[i] = np.clip(x[i], low, high)
+
+            # Record iteration
+            self._record_iteration(x)
+
+            # Stop conditions are checked within _record_iteration
+            # If they are triggered, _StopRequested is raised and will be
+            # caught by the worker wrapper.
+
+    # -------------------------------------------------------------------
+    # SUPPORTED ALGORITHMS HELPER
+    # -------------------------------------------------------------------
+
+    @staticmethod
+    def get_supported_algorithms() -> List[str]:
+        """
+        Return the list of algorithm names supported by this manager.
+
+        Returns
+        -------
+        List[str]
+            List of algorithm names as strings, suitable to populate
+            a dropdown in the dashboard UI.
+        """
+        return [
+            "Nelder-Mead",
+            "Powell",
+            "CG",
+            "BFGS",
+            "L-BFGS-B",
+            "TNC",
+            "SLSQP",
+            "trust-constr",
+            "Differential Evolution",
+            "Dual Annealing",
+            "Genetic Algorithm",
+            "Adam (Simple)",
+        ]
