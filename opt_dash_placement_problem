@@ -1,0 +1,874 @@
+"""
+placement_problem.py
+=====================
+
+This module defines the *core geometric & cost model* for the rectangle
+placement problem. It is **completely independent** of Panel/Bokeh/UI, and
+only depends on:
+
+- The JSON-like config dictionary
+- Numpy
+- Standard Python libraries
+
+It contains two main definitions:
+
+1. `RectangleDef`:
+   ----------------
+   - A small dataclass holding the static properties of a rectangle
+     (ID, width, height, initial centre).
+
+2. `PlacementProblem`:
+   --------------------
+   - Encapsulates:
+       * Canvas size
+       * List of rectangles
+       * Constraints configuration
+       * Objective weights
+   - Provides methods to:
+       * Encode/decode optimisation vectors
+       * Compute bounding boxes and HPWL-like measures
+       * Evaluate constraints and penalties
+       * Compute the full augmented objective
+       * Generate plotting-friendly shapes (centre + width/height)
+
+This module is used by:
+
+- `OptimizationManager` (in optimization_manager.py) to evaluate objectives,
+  constraints, and to generate shapes for the live canvas view.
+
+- `InputPlacementManager` (in input_placement_manager.py) to quickly compute
+  objective/constraint metrics for interactive placements.
+
+The **interface** of `PlacementProblem` is intentionally stable and
+documented in detail so you can safely modify or extend the internals
+without breaking the rest of the system.
+"""
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+
+
+# -------------------------------------------------------------------
+# DATA STRUCTURE: RectangleDef
+# -------------------------------------------------------------------
+
+@dataclass
+class RectangleDef:
+    """
+    Lightweight container for a single rectangle's *static* attributes.
+
+    Attributes
+    ----------
+    rect_id : str
+        A unique identifier for the rectangle. This is used for display
+        in the UI (labels, hover tooltips, logs, etc).
+
+    width : float
+        Width of the rectangle (in canvas coordinate units).
+
+    height : float
+        Height of the rectangle (in canvas coordinate units).
+
+    init_cx : float
+        Initial x-coordinate of the rectangle centre.
+
+    init_cy : float
+        Initial y-coordinate of the rectangle centre.
+
+    Notes
+    -----
+    The **centre** of a rectangle is used as the optimisation variable,
+    not its corners. For each rectangle, we optimise (cx, cy).
+    """
+    rect_id: str
+    width: float
+    height: float
+    init_cx: float
+    init_cy: float
+
+
+# -------------------------------------------------------------------
+# CLASS: PlacementProblem
+# -------------------------------------------------------------------
+
+class PlacementProblem:
+    """
+    Encapsulates a complete rectangle placement optimisation problem.
+
+    This class is responsible for:
+
+    1. Parsing and storing problem data from a JSON-like `config` dict.
+       - Canvas size (width, height)
+       - Rectangles (width, height, initial centre)
+       - Constraints configuration
+       - Objective weights
+
+    2. Providing a **vector representation** for optimisation:
+       - x = [cx_0, cy_0, cx_1, cy_1, ..., cx_{N-1}, cy_{N-1}]
+
+    3. Computing:
+       - Half-perimeter wire length (HPWL-like)
+       - Overall bounding box (min_x, min_y, max_x, max_y)
+       - Bounding box aspect ratio & area
+       - Constraint violations:
+           * Overlap ratio
+           * Minimum spacing violations (dx, dy)
+           * Bounding box aspect ratio violation
+           * Canvas boundary violation
+       - Objective and augmented objective:
+           * objective_pure = w_hpwl * HPWL
+                            + w_bbox_aspect * bbox_aspect
+                            + w_bbox_area * bbox_area
+           * penalty = weighted sum of squared violations
+           * objective_augmented = objective_pure + penalty
+
+    4. Generating plotting-friendly shapes:
+       - For each rectangle: (centre, width, height)
+       - For the bounding box: (centre, width, height)
+
+    The **public methods** used by other modules are:
+
+    - num_variables()
+    - initial_vector()
+    - bounds()
+    - decode_centres(x)
+    - compute_metrics(x)
+    - make_rectangle_shapes(x)
+
+    All of these have detailed docstrings below.
+    """
+
+    # -----------------------------------------------------------------
+    # INITIALISATION
+    # -----------------------------------------------------------------
+
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Construct a PlacementProblem from a JSON-like config dictionary.
+
+        Parameters
+        ----------
+        config : Dict[str, Any]
+            Dictionary with at least the following (if some keys are missing,
+            sensible defaults are used):
+
+            {
+              "canvas": {
+                "width": float,
+                "height": float
+              },
+              "rectangles": [
+                {
+                  "id": str,
+                  "width": float,
+                  "height": float,
+                  "initial_center": [cx, cy]
+                },
+                ...
+              ],
+              "constraints": {
+                "no_overlap": {
+                  "enabled": bool,
+                  "penalty_weight": float
+                },
+                "min_spacing": {
+                  "enabled": bool,
+                  "min_dx": float,
+                  "min_dy": float,
+                  "penalty_weight": float
+                },
+                "bbox_aspect_ratio": {
+                  "enabled": bool,
+                  "type": "less_than" or "greater_than",
+                  "threshold": float,
+                  "penalty_weight": float
+                },
+                "canvas_boundary": {
+                  "enabled": bool,
+                  "penalty_weight": float
+                }
+              },
+              "objective": {
+                "weights": {
+                  "hpwl": float,
+                  "bbox_aspect": float,
+                  "bbox_area": float
+                }
+              }
+            }
+
+        Notes
+        -----
+        - `config` is usually read from a JSON file.
+        - The dashboard code dynamically updates `config["constraints"]`
+          and `config["objective"]["weights"]` based on UI controls and
+          then reuses this class.
+        """
+        # Store a reference to the config so it can be updated externally
+        self.config: Dict[str, Any] = config
+
+        # -----------------------------
+        # Canvas size (width, height)
+        # -----------------------------
+        canvas_cfg = config.get("canvas", {})
+        self.canvas_width: float = float(canvas_cfg.get("width", 1000.0))
+        self.canvas_height: float = float(canvas_cfg.get("height", 800.0))
+
+        # -----------------------------
+        # Rectangles list
+        # -----------------------------
+        self.rectangles: List[RectangleDef] = []
+        for i, r in enumerate(config.get("rectangles", [])):
+            # Fallback ID if not provided
+            rect_id = r.get("id", f"R{i}")
+
+            # Width, height, and initial centre
+            width = float(r["width"])
+            height = float(r["height"])
+            cx, cy = r["initial_center"]
+
+            self.rectangles.append(
+                RectangleDef(
+                    rect_id=rect_id,
+                    width=width,
+                    height=height,
+                    init_cx=float(cx),
+                    init_cy=float(cy),
+                )
+            )
+
+        self.n_rects: int = len(self.rectangles)
+
+        # -----------------------------
+        # Constraints configuration
+        # -----------------------------
+        # Saved as a single dict so that external code can update it:
+        # e.g. manager.config["constraints"][...] and then
+        #      problem.constraints_cfg = manager.config["constraints"]
+        self.constraints_cfg: Dict[str, Any] = config.get("constraints", {})
+
+        # -----------------------------
+        # Objective weights
+        # -----------------------------
+        # These can be updated **at runtime** via the dashboard UI and
+        # then written back into config["objective"]["weights"].
+        obj_cfg = config.get("objective", {})
+        weights = obj_cfg.get("weights", {})
+
+        # Weight for HPWL term
+        self.weight_hpwl: float = float(weights.get("hpwl", 1.0))
+
+        # Weight for bounding box aspect ratio term
+        self.weight_bbox_aspect: float = float(weights.get("bbox_aspect", 0.5))
+
+        # Weight for bounding box area term
+        self.weight_bbox_area: float = float(weights.get("bbox_area", 0.01))
+
+    # -----------------------------------------------------------------
+    # BASIC VECTOR ENCODING / DECODING
+    # -----------------------------------------------------------------
+
+    def num_variables(self) -> int:
+        """
+        Number of optimisation variables in the vector representation.
+
+        Each rectangle contributes two variables:
+        - cx (centre x-coordinate)
+        - cy (centre y-coordinate)
+
+        Returns
+        -------
+        int
+            2 * number_of_rectangles
+        """
+        return 2 * self.n_rects
+
+    def initial_vector(self) -> np.ndarray:
+        """
+        Build the initial optimisation vector from the rectangles' centres.
+
+        Returns
+        -------
+        np.ndarray
+            A 1D numpy array of shape (2 * n_rects,), containing:
+            [cx_0, cy_0, cx_1, cy_1, ..., cx_{N-1}, cy_{N-1}]
+        """
+        values: List[float] = []
+        for rect in self.rectangles:
+            values.append(rect.init_cx)
+            values.append(rect.init_cy)
+        return np.array(values, dtype=float)
+
+    def bounds(self) -> List[Tuple[float, float]]:
+        """
+        Compute per-variable bounds to keep rectangles inside the canvas.
+
+        For each rectangle:
+          - centre_x in [width/2, canvas_width - width/2]
+          - centre_y in [height/2, canvas_height - height/2]
+
+        Returns
+        -------
+        List[Tuple[float, float]]
+            A list of (lower, upper) bounds, one per variable in the
+            vector representation.
+        """
+        bounds: List[Tuple[float, float]] = []
+
+        for rect in self.rectangles:
+            half_w = rect.width / 2.0
+            half_h = rect.height / 2.0
+
+            # Horizontal bounds
+            x_min = half_w
+            x_max = self.canvas_width - half_w
+
+            # Vertical bounds
+            y_min = half_h
+            y_max = self.canvas_height - half_h
+
+            bounds.append((x_min, x_max))  # centre_x bounds
+            bounds.append((y_min, y_max))  # centre_y bounds
+
+        return bounds
+
+    def decode_centres(self, x: np.ndarray) -> List[Tuple[float, float]]:
+        """
+        Convert an optimisation vector back into a list of centres.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            1D numpy array of length 2 * n_rects, where:
+            - x[2*i]   = cx_i
+            - x[2*i+1] = cy_i
+
+        Returns
+        -------
+        List[Tuple[float, float]]
+            A list of (cx, cy) pairs, one per rectangle, in the same
+            order as `self.rectangles`.
+        """
+        centres: List[Tuple[float, float]] = []
+        for i in range(self.n_rects):
+            cx = float(x[2 * i])
+            cy = float(x[2 * i + 1])
+            centres.append((cx, cy))
+        return centres
+
+    # -----------------------------------------------------------------
+    # INTERNAL GEOMETRY HELPERS
+    # -----------------------------------------------------------------
+
+    def _compute_bounding_box(
+        self,
+        centres: List[Tuple[float, float]],
+    ) -> Tuple[float, float, float, float]:
+        """
+        Compute the axis-aligned bounding box that encloses all rectangles.
+
+        Parameters
+        ----------
+        centres : List[Tuple[float, float]]
+            List of (cx, cy) centre coordinates for each rectangle.
+
+        Returns
+        -------
+        (min_x, min_y, max_x, max_y) : Tuple[float, float, float, float]
+            Coordinates of the bounding box corners.
+
+        Notes
+        -----
+        The bounding box is computed using each rectangle's width and
+        height, not just centres.
+        """
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = -float("inf")
+        max_y = -float("inf")
+
+        for (cx, cy), rect in zip(centres, self.rectangles):
+            half_w = rect.width / 2.0
+            half_h = rect.height / 2.0
+
+            left = cx - half_w
+            right = cx + half_w
+            bottom = cy - half_h
+            top = cy + half_h
+
+            if left < min_x:
+                min_x = left
+            if right > max_x:
+                max_x = right
+            if bottom < min_y:
+                min_y = bottom
+            if top > max_y:
+                max_y = top
+
+        return min_x, min_y, max_x, max_y
+
+    def _compute_hpwl(self, centres: List[Tuple[float, float]]) -> float:
+        """
+        Compute a simple Half-Perimeter Wire Length (HPWL)-like measure.
+
+        The standard HPWL used in placement is:
+            HPWL = (max_x - min_x) + (max_y - min_y)
+
+        In this simplified version:
+        - We treat the rectangle centres as "pins".
+        - We compute the bounding box around those pins and sum width + height.
+
+        Parameters
+        ----------
+        centres : List[Tuple[float, float]]
+            List of (cx, cy) centre coordinates for each rectangle.
+
+        Returns
+        -------
+        float
+            The HPWL-like measure.
+        """
+        xs = [c[0] for c in centres]
+        ys = [c[1] for c in centres]
+        return (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+    # -----------------------------------------------------------------
+    # CONSTRAINTS & VIOLATION MEASURES
+    # -----------------------------------------------------------------
+
+    def _constraints_from_centres(
+        self,
+        centres: List[Tuple[float, float]],
+    ) -> Dict[str, float]:
+        """
+        Compute constraint violations for a given set of rectangle centres.
+
+        The following constraint categories are supported:
+
+        1. No Overlap (`no_overlap`)
+           --------------------------
+           - If enabled, we compute the **maximum overlap ratio** over all
+             rectangle pairs. Overlap ratio for a pair is:
+                 overlap_area / min(area_i, area_j)
+           - If zero, no overlap; if > 0, violation.
+           - We return only the **maximum** over all pairs:
+                 "overlap_max_ratio"
+
+        2. Minimum Spacing (`min_spacing`)
+           -------------------------------
+           - If enabled, we enforce a minimum gap in x and y directions
+             between rectangles:
+                 min_dx : minimum horizontal spacing
+                 min_dy : minimum vertical spacing
+           - For each pair, we compute horizontal and vertical gaps:
+               * If rectangles overlap or touch along an axis, the gap
+                 on that axis is 0.
+               * Otherwise, the gap is the distance between nearest edges.
+           - We track **maximum violation** along x and y:
+               "spacing_x_violation" = max( min_dx - horiz_gap, 0 )
+               "spacing_y_violation" = max( min_dy - vert_gap, 0 )
+
+        3. Bounding Box Aspect Ratio (`bbox_aspect_ratio`)
+           -----------------------------------------------
+           - If enabled, we compute the bounding box around all rectangles
+             and its aspect ratio:
+                 ar = width / height
+           - Two modes:
+               * type == "less_than":   we enforce ar <= threshold
+               * type == "greater_than": we enforce ar >= threshold
+           - Violation is:
+               * for "less_than":   max(0, ar - threshold)
+               * for "greater_than": max(0, threshold - ar)
+           - Returned as:
+               "bbox_ar_violation"
+
+        4. Canvas Boundary (`canvas_boundary`)
+           -----------------------------------
+           - If enabled, we ensure rectangles do not go outside the canvas.
+           - For each rectangle, we check how much it is outside each side:
+               * left < 0   -> violation -left
+               * right > W  -> violation right - W
+               * bottom < 0 -> violation -bottom
+               * top > H    -> violation top - H
+           - We sum these amounts over all rectangles:
+               "boundary_violation"
+
+        Parameters
+        ----------
+        centres : List[Tuple[float, float]]
+            List of (cx, cy) centre coordinates.
+
+        Returns
+        -------
+        Dict[str, float]
+            {
+              "overlap_max_ratio": float,
+              "spacing_x_violation": float,
+              "spacing_y_violation": float,
+              "bbox_ar_violation": float,
+              "boundary_violation": float
+            }
+        """
+        cons_cfg = self.constraints_cfg
+
+        # Flags
+        no_ov_cfg = cons_cfg.get("no_overlap", {})
+        min_sp_cfg = cons_cfg.get("min_spacing", {})
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+
+        no_overlap_enabled: bool = no_ov_cfg.get("enabled", True)
+        min_spacing_enabled: bool = min_sp_cfg.get("enabled", True)
+        bbox_ar_enabled: bool = bbox_ar_cfg.get("enabled", False)
+        boundary_enabled: bool = boundary_cfg.get("enabled", True)
+
+        # Minimum spacing thresholds
+        min_dx: float = float(min_sp_cfg.get("min_dx", 0.0))
+        min_dy: float = float(min_sp_cfg.get("min_dy", 0.0))
+
+        # Prepare accumulators
+        overlap_max_ratio: float = 0.0
+        spacing_x_violation: float = 0.0
+        spacing_y_violation: float = 0.0
+
+        # Precompute rectangle edges: (left, right, bottom, top, width, height)
+        edges: List[Tuple[float, float, float, float, float, float]] = []
+        for (cx, cy), rect in zip(centres, self.rectangles):
+            half_w = rect.width / 2.0
+            half_h = rect.height / 2.0
+
+            left = cx - half_w
+            right = cx + half_w
+            bottom = cy - half_h
+            top = cy + half_h
+
+            edges.append((left, right, bottom, top, rect.width, rect.height))
+
+        # Pairwise checks for overlap & spacing
+        n = self.n_rects
+        for i in range(n):
+            left_i, right_i, bottom_i, top_i, wi, hi = edges[i]
+            area_i = wi * hi
+
+            for j in range(i + 1, n):
+                left_j, right_j, bottom_j, top_j, wj, hj = edges[j]
+                area_j = wj * hj
+
+                # -----------------------
+                # Overlap area
+                # -----------------------
+                overlap_x = max(0.0, min(right_i, right_j) - max(left_i, left_j))
+                overlap_y = max(0.0, min(top_i, top_j) - max(bottom_i, bottom_j))
+                overlap_area = overlap_x * overlap_y
+
+                if no_overlap_enabled and overlap_area > 0.0:
+                    smaller_area = min(area_i, area_j)
+                    if smaller_area > 0.0:
+                        ratio = overlap_area / smaller_area
+                    else:
+                        # Degenerate case (zero area) -> treat as full overlap
+                        ratio = 1.0
+                    overlap_max_ratio = max(overlap_max_ratio, ratio)
+
+                # -----------------------
+                # Horizontal gap
+                # -----------------------
+                if right_i <= left_j:
+                    # Rectangle i is strictly to the left of j
+                    horiz_gap = left_j - right_i
+                elif right_j <= left_i:
+                    # Rectangle j is strictly to the left of i
+                    horiz_gap = left_i - right_j
+                else:
+                    # Overlap or touch in x direction -> gap = 0
+                    horiz_gap = 0.0
+
+                # -----------------------
+                # Vertical gap
+                # -----------------------
+                if top_i <= bottom_j:
+                    # Rectangle i is strictly below j
+                    vert_gap = bottom_j - top_i
+                elif top_j <= bottom_i:
+                    # Rectangle j is strictly below i
+                    vert_gap = bottom_i - top_j
+                else:
+                    # Overlap or touch in y direction -> gap = 0
+                    vert_gap = 0.0
+
+                # -----------------------
+                # Spacing violations
+                # -----------------------
+                if min_spacing_enabled:
+                    if horiz_gap < min_dx:
+                        spacing_x_violation = max(
+                            spacing_x_violation, (min_dx - horiz_gap)
+                        )
+                    if vert_gap < min_dy:
+                        spacing_y_violation = max(
+                            spacing_y_violation, (min_dy - vert_gap)
+                        )
+
+        # ---------------------------
+        # Bounding box aspect ratio
+        # ---------------------------
+        bbox_ar_violation: float = 0.0
+        if bbox_ar_enabled:
+            min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+            width = max_x - min_x
+            height = max_y - min_y
+
+            if width <= 0.0 or height <= 0.0:
+                # Degenerate case: no area
+                ar = 1.0
+            else:
+                ar = width / height
+
+            # Constraint type and threshold
+            ar_type: str = bbox_ar_cfg.get("type", "less_than")
+            thr: float = float(bbox_ar_cfg.get("threshold", 1.0))
+
+            if ar_type == "less_than":
+                # Enforce ar <= thr -> violation if ar > thr
+                bbox_ar_violation = max(0.0, ar - thr)
+            else:
+                # Enforce ar >= thr -> violation if ar < thr
+                bbox_ar_violation = max(0.0, thr - ar)
+
+        # ---------------------------
+        # Canvas boundary violation
+        # ---------------------------
+        boundary_violation: float = 0.0
+        if boundary_enabled:
+            for (cx, cy), rect in zip(centres, self.rectangles):
+                half_w = rect.width / 2.0
+                half_h = rect.height / 2.0
+
+                left = cx - half_w
+                right = cx + half_w
+                bottom = cy - half_h
+                top = cy + half_h
+
+                # Left boundary
+                if left < 0.0:
+                    boundary_violation += -left
+
+                # Right boundary
+                if right > self.canvas_width:
+                    boundary_violation += right - self.canvas_width
+
+                # Bottom boundary
+                if bottom < 0.0:
+                    boundary_violation += -bottom
+
+                # Top boundary
+                if top > self.canvas_height:
+                    boundary_violation += top - self.canvas_height
+
+        # ---------------------------
+        # Final dictionary
+        # ---------------------------
+        return {
+            "overlap_max_ratio": float(overlap_max_ratio if no_overlap_enabled else 0.0),
+            "spacing_x_violation": float(spacing_x_violation if min_spacing_enabled else 0.0),
+            "spacing_y_violation": float(spacing_y_violation if min_spacing_enabled else 0.0),
+            "bbox_ar_violation": float(bbox_ar_violation if bbox_ar_enabled else 0.0),
+            "boundary_violation": float(boundary_violation if boundary_enabled else 0.0),
+        }
+
+    # -----------------------------------------------------------------
+    # METRIC & OBJECTIVE COMPUTATION
+    # -----------------------------------------------------------------
+
+    def compute_metrics(self, x: np.ndarray) -> Dict[str, float]:
+        """
+        Compute objective terms, constraint violations, and augmented objective.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Optimisation vector (centres) of shape (2 * n_rects,).
+
+        Returns
+        -------
+        Dict[str, float]
+            Dictionary containing:
+              - "hpwl"
+              - "bbox_aspect"
+              - "bbox_area"
+              - "objective_pure"
+              - "objective_augmented"
+              - "overlap_max_ratio"
+              - "spacing_x_violation"
+              - "spacing_y_violation"
+              - "bbox_ar_violation"
+              - "boundary_violation"
+
+        Objective
+        ---------
+        1. Pure objective:
+           objective_pure =
+               weight_hpwl       * hpwl
+             + weight_bbox_aspect * bbox_aspect
+             + weight_bbox_area   * bbox_area
+
+        2. Constraint penalty (quadratic):
+           penalty =
+               w_overlap      * overlap_max_ratio^2
+             + w_spacing      * (spacing_x_violation^2 + spacing_y_violation^2)
+             + w_bbox_ar_con  * bbox_ar_violation^2
+             + w_boundary     * boundary_violation^2
+
+        3. Augmented objective:
+           objective_augmented = objective_pure + penalty
+
+        The penalty weights are read from `self.constraints_cfg` and
+        may be updated at runtime by external code (dashboard UI).
+        """
+        # 1) Decode centres from vector
+        centres = self.decode_centres(x)
+
+        # 2) Compute HPWL-like measure
+        hpwl = self._compute_hpwl(centres)
+
+        # 3) Bounding box (width, height, aspect ratio, area)
+        min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+        width = max_x - min_x
+        height = max_y - min_y
+
+        if width <= 0.0 or height <= 0.0:
+            bbox_aspect = 1.0
+            bbox_area = 0.0
+        else:
+            bbox_aspect = width / height
+            bbox_area = width * height
+
+        # 4) Pure objective
+        objective_pure = (
+            self.weight_hpwl * hpwl
+            + self.weight_bbox_aspect * bbox_aspect
+            + self.weight_bbox_area * bbox_area
+        )
+
+        # 5) Constraint violations
+        cons = self._constraints_from_centres(centres)
+        overlap_max_ratio = cons["overlap_max_ratio"]
+        spacing_x_violation = cons["spacing_x_violation"]
+        spacing_y_violation = cons["spacing_y_violation"]
+        bbox_ar_violation = cons["bbox_ar_violation"]
+        boundary_violation = cons["boundary_violation"]
+
+        # 6) Penalty weights (read from constraints config)
+        cons_cfg = self.constraints_cfg
+
+        no_ov_cfg = cons_cfg.get("no_overlap", {})
+        min_sp_cfg = cons_cfg.get("min_spacing", {})
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+
+        w_overlap = float(no_ov_cfg.get("penalty_weight", 1000.0))
+        w_spacing = float(min_sp_cfg.get("penalty_weight", 500.0))
+        w_bbox_ar_con = float(bbox_ar_cfg.get("penalty_weight", 50.0))
+        w_boundary = float(boundary_cfg.get("penalty_weight", 500.0))
+
+        # 7) Quadratic penalty for each violation
+        penalty = 0.0
+        penalty += w_overlap * (overlap_max_ratio ** 2)
+        penalty += w_spacing * ((spacing_x_violation ** 2) + (spacing_y_violation ** 2))
+        penalty += w_bbox_ar_con * (bbox_ar_violation ** 2)
+        penalty += w_boundary * (boundary_violation ** 2)
+
+        # 8) Augmented objective
+        objective_augmented = objective_pure + penalty
+
+        # 9) Pack into dictionary
+        return {
+            "hpwl": float(hpwl),
+            "bbox_aspect": float(bbox_aspect),
+            "bbox_area": float(bbox_area),
+            "objective_pure": float(objective_pure),
+            "objective_augmented": float(objective_augmented),
+            "overlap_max_ratio": float(overlap_max_ratio),
+            "spacing_x_violation": float(spacing_x_violation),
+            "spacing_y_violation": float(spacing_y_violation),
+            "bbox_ar_violation": float(bbox_ar_violation),
+            "boundary_violation": float(boundary_violation),
+        }
+
+    # -----------------------------------------------------------------
+    # SHAPES FOR PLOTTING
+    # -----------------------------------------------------------------
+
+    def make_rectangle_shapes(
+        self,
+        x: np.ndarray,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Generate plotting-friendly descriptions of rectangles and bounding box.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Optimisation vector (centres) of shape (2 * n_rects,).
+
+        Returns
+        -------
+        (rects, bbox) : (List[Dict[str, Any]], Dict[str, Any])
+            - rects: list of dictionaries, one per rectangle:
+                {
+                  "x": centre_x,
+                  "y": centre_y,
+                  "w": width,
+                  "h": height,
+                  "rect_id": rectangle_id
+                }
+
+            - bbox: a single dictionary describing the bounding box:
+                {
+                  "x": bbox_centre_x,
+                  "y": bbox_centre_y,
+                  "w": bbox_width,
+                  "h": bbox_height
+                }
+
+        Notes
+        -----
+        This is used by the dashboard to update the **canvas view**:
+        - Rectangles are drawn via `fig.rect(..., width=w, height=h, ...)`.
+        - Bounding box is drawn similarly with a dashed line style.
+        """
+        # Decode centres from vector
+        centres = self.decode_centres(x)
+
+        # Prepare rectangle records
+        rectangles_for_plot: List[Dict[str, Any]] = []
+        for (cx, cy), rect in zip(centres, self.rectangles):
+            rectangles_for_plot.append(
+                {
+                    "x": cx,
+                    "y": cy,
+                    "w": rect.width,
+                    "h": rect.height,
+                    "rect_id": rect.rect_id,
+                }
+            )
+
+        # Compute bounding box for all rectangles
+        min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+        width = max_x - min_x
+        height = max_y - min_y
+
+        # Centre of bounding box
+        bbox_cx = min_x + width / 2.0
+        bbox_cy = min_y + height / 2.0
+
+        bbox_for_plot: Dict[str, Any] = {
+            "x": bbox_cx,
+            "y": bbox_cy,
+            "w": width,
+            "h": height,
+        }
+
+        return rectangles_for_plot, bbox_for_plot
