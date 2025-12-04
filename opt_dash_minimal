@@ -1,0 +1,850 @@
+"""
+Minimal backend-only rectangle placement optimizer using Adam.
+
+- No dashboard / Panel / server code.
+- Reads a JSON config file from CONFIG_PATH.
+- Uses the same PlacementProblem structure & constraints as the full dashboard,
+  but only implements a single optimizer: pure-Python Adam (finite-diff grad).
+- After optimization, writes a single HTML file with:
+    * Canvas View (final placement)
+    * Objective Terms vs Iteration
+    * Constraint Terms vs Iteration
+  arranged as:
+      Column(
+        Canvas Figure,
+        Row(Objective Figure, Constraint Figure)
+      )
+
+Run:
+    python placement_adam_backend.py
+"""
+
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+
+from bokeh.io import output_file, save
+from bokeh.layouts import column, row
+from bokeh.models import ColumnDataSource, HoverTool
+from bokeh.plotting import figure
+
+# =====================================================================
+# USER CONTROLS (ALL PARAMETERS & WEIGHTS HERE)
+# =====================================================================
+
+# ---- Config file path ----
+CONFIG_PATH = "rectangles_config.json"   # <-- change to your config file
+
+# ---- Adam optimizer hyperparameters ----
+ADAM_LR = 0.01          # learning rate
+ADAM_MAXITER = 200      # number of iterations
+ADAM_BETA1 = 0.9
+ADAM_BETA2 = 0.999
+ADAM_EPS = 1e-8
+ADAM_FD_STEP = 1e-3     # finite difference step for gradient
+
+# If TARGET_OBJECTIVE > 0, stop early when augmented objective <= TARGET_OBJECTIVE.
+# If <= 0, ignore and run full ADAM_MAXITER.
+TARGET_OBJECTIVE = 0.0
+
+# ---- Objective weights (override config objective.weights) ----
+W_HPWL = 1.0
+W_BBOX_ASPECT = 0.5
+W_BBOX_AREA = 0.01
+
+# ---- Constraint penalty weights (override config.penalty weights) ----
+W_OVERLAP = 1000.0      # penalty weight for overlap_max_ratio^2
+W_SPACING = 500.0       # penalty weight for (dx_viol^2 + dy_viol^2)
+W_BBOX_AR_CON = 50.0    # penalty weight for bbox_ar_violation^2
+W_BOUNDARY = 500.0      # penalty weight for boundary_violation^2
+
+# ---- Output HTML filename ----
+OUTPUT_HTML = "placement_adam_result.html"
+
+# ---- Basic colour palette (for nicer visuals, no UI code) ----
+UI_TEXT_COLOR = "#FFB338"
+UI_BG_COLOR = "#050816"
+
+COLORS = {
+    "bg": UI_BG_COLOR,
+    "panel_bg": "#0b1020",
+    "primary": "#FFB300",
+    "secondary": "#29B6F6",
+    "accent": "#AB47BC",
+    "grid": "#263238",
+    "rect_fill": "#29B6F6",
+    "rect_line": "#ECEFF1",
+    "bbox_line": "#FF7043",
+}
+
+# =====================================================================
+# PLACEMENT PROBLEM DEFINITION (same logic as in dashboard)
+# =====================================================================
+
+@dataclass
+class RectangleDef:
+    """Container for a rectangle definition."""
+    rect_id: str
+    width: float
+    height: float
+    init_cx: float
+    init_cy: float
+
+
+class PlacementProblem:
+    """
+    Encapsulates:
+      - Canvas size
+      - Rectangles
+      - Constraints
+      - Objective weights
+    and computes metrics & penalties.
+
+    Objective (pure):
+        Obj_pure = w_hpwl * HPWL
+                 + w_bbox_aspect * BBoxAspect
+                 + w_bbox_area * BBoxArea
+
+    Penalty (constraints):
+        Penalty =
+            w_overlap * overlap_max_ratio^2
+          + w_spacing * (spacing_x_violation^2 + spacing_y_violation^2)
+          + w_bbox_ar_con * bbox_ar_violation^2
+          + w_boundary * boundary_violation^2
+
+    Augmented objective:
+        Obj_aug = Obj_pure + Penalty
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+
+        # Canvas
+        canvas_cfg = config.get("canvas", {})
+        self.canvas_width = float(canvas_cfg.get("width", 1000.0))
+        self.canvas_height = float(canvas_cfg.get("height", 800.0))
+
+        # Rectangles
+        self.rectangles: List[RectangleDef] = []
+        for i, r in enumerate(config.get("rectangles", [])):
+            rid = r.get("id", f"R{i}")
+            w = float(r["width"])
+            h = float(r["height"])
+            cx, cy = r["initial_center"]
+            self.rectangles.append(
+                RectangleDef(
+                    rect_id=rid,
+                    width=w,
+                    height=h,
+                    init_cx=float(cx),
+                    init_cy=float(cy),
+                )
+            )
+        self.n_rects = len(self.rectangles)
+
+        # Constraints & objective weights from config (to be overridden)
+        self.constraints_cfg = config.get("constraints", {})
+        obj_cfg = config.get("objective", {})
+        weights = obj_cfg.get("weights", {})
+
+        # Start from config, then override with global constants
+        self.weight_hpwl = float(weights.get("hpwl", W_HPWL))
+        self.weight_bbox_aspect = float(weights.get("bbox_aspect", W_BBOX_ASPECT))
+        self.weight_bbox_area = float(weights.get("bbox_area", W_BBOX_AREA))
+
+        self._override_weights_from_globals()
+
+    def _override_weights_from_globals(self):
+        """
+        Override problem weights with top-of-file constants, and
+        update self.config accordingly so everything is consistent.
+        """
+        # Objective
+        self.weight_hpwl = W_HPWL
+        self.weight_bbox_aspect = W_BBOX_ASPECT
+        self.weight_bbox_area = W_BBOX_AREA
+
+        self.config.setdefault("objective", {}).setdefault("weights", {})
+        self.config["objective"]["weights"]["hpwl"] = W_HPWL
+        self.config["objective"]["weights"]["bbox_aspect"] = W_BBOX_ASPECT
+        self.config["objective"]["weights"]["bbox_area"] = W_BBOX_AREA
+
+        # Constraints
+        cons_cfg = self.config.setdefault("constraints", {})
+
+        no_ov_cfg = cons_cfg.setdefault("no_overlap", {})
+        no_ov_cfg.setdefault("enabled", True)
+        no_ov_cfg["penalty_weight"] = W_OVERLAP
+
+        min_sp_cfg = cons_cfg.setdefault("min_spacing", {})
+        min_sp_cfg.setdefault("enabled", True)
+        min_sp_cfg["penalty_weight"] = W_SPACING
+
+        bbox_ar_cfg = cons_cfg.setdefault("bbox_aspect_ratio", {})
+        bbox_ar_cfg.setdefault("enabled", True)
+        bbox_ar_cfg["penalty_weight"] = W_BBOX_AR_CON
+
+        boundary_cfg = cons_cfg.setdefault("canvas_boundary", {})
+        boundary_cfg.setdefault("enabled", True)
+        boundary_cfg["penalty_weight"] = W_BOUNDARY
+
+        self.constraints_cfg = cons_cfg
+
+    # ---------- Encoding / decoding ----------
+
+    def num_variables(self) -> int:
+        """Number of optimisation variables: 2 per rectangle (cx, cy)."""
+        return 2 * self.n_rects
+
+    def initial_vector(self) -> np.ndarray:
+        """Flatten initial centres [cx1, cy1, cx2, cy2, ...]."""
+        arr: List[float] = []
+        for r in self.rectangles:
+            arr.extend([r.init_cx, r.init_cy])
+        return np.array(arr, dtype=float)
+
+    def bounds(self) -> List[Tuple[float, float]]:
+        """
+        Centre bounds so rectangles stay inside canvas:
+        cx in [w/2, canvas_width - w/2], cy likewise.
+        """
+        bnds: List[Tuple[float, float]] = []
+        for r in self.rectangles:
+            half_w = r.width / 2.0
+            half_h = r.height / 2.0
+            x_min = half_w
+            x_max = self.canvas_width - half_w
+            y_min = half_h
+            y_max = self.canvas_height - half_h
+            bnds.append((x_min, x_max))
+            bnds.append((y_min, y_max))
+        return bnds
+
+    def decode_centres(self, x: np.ndarray) -> List[Tuple[float, float]]:
+        """Convert optimisation vector -> list of (cx, cy)."""
+        centres: List[Tuple[float, float]] = []
+        for i in range(self.n_rects):
+            centres.append((float(x[2 * i]), float(x[2 * i + 1])))
+        return centres
+
+    # ---------- Geometry helpers ----------
+
+    def _compute_bounding_box(
+        self, centres: List[Tuple[float, float]]
+    ) -> Tuple[float, float, float, float]:
+        """Bounding box around all rectangles (left, bottom, right, top)."""
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = -float("inf")
+        max_y = -float("inf")
+
+        for (cx, cy), r in zip(centres, self.rectangles):
+            half_w = r.width / 2.0
+            half_h = r.height / 2.0
+            left = cx - half_w
+            right = cx + half_w
+            bottom = cy - half_h
+            top = cy + half_h
+            min_x = min(min_x, left)
+            max_x = max(max_x, right)
+            min_y = min(min_y, bottom)
+            max_y = max(max_y, top)
+
+        return min_x, min_y, max_x, max_y
+
+    def _compute_hpwl(self, centres: List[Tuple[float, float]]) -> float:
+        """Half-perimeter wirelength-like objective."""
+        xs = [c[0] for c in centres]
+        ys = [c[1] for c in centres]
+        return (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+    # ---------- Constraints ----------
+
+    def _constraints_from_centres(
+        self, centres: List[Tuple[float, float]]
+    ) -> Dict[str, float]:
+        """
+        Compute constraint violation metrics:
+        - overlap_max_ratio
+        - spacing_x_violation
+        - spacing_y_violation
+        - bbox_ar_violation
+        - boundary_violation
+        """
+        cons_cfg = self.constraints_cfg
+
+        no_ov = cons_cfg.get("no_overlap", {}).get("enabled", True)
+        min_sp = cons_cfg.get("min_spacing", {}).get("enabled", True)
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+
+        bbox_ar_enabled = bbox_ar_cfg.get("enabled", False)
+        boundary_enabled = boundary_cfg.get("enabled", True)
+
+        min_dx = float(cons_cfg.get("min_spacing", {}).get("min_dx", 0.0))
+        min_dy = float(cons_cfg.get("min_spacing", {}).get("min_dy", 0.0))
+
+        overlap_max_ratio = 0.0
+        spacing_x_violation = 0.0
+        spacing_y_violation = 0.0
+
+        # Precompute edges
+        edges = []
+        for (cx, cy), r in zip(centres, self.rectangles):
+            half_w = r.width / 2.0
+            half_h = r.height / 2.0
+            left = cx - half_w
+            right = cx + half_w
+            bottom = cy - half_h
+            top = cy + half_h
+            edges.append((left, right, bottom, top, r.width, r.height))
+
+        n = self.n_rects
+        for i in range(n):
+            left_i, right_i, bottom_i, top_i, wi, hi = edges[i]
+            area_i = wi * hi
+            for j in range(i + 1, n):
+                left_j, right_j, bottom_j, top_j, wj, hj = edges[j]
+                area_j = wj * hj
+
+                # Overlap area
+                overlap_x = max(0.0, min(right_i, right_j) - max(left_i, left_j))
+                overlap_y = max(0.0, min(top_i, top_j) - max(bottom_i, bottom_j))
+                overlap_area = overlap_x * overlap_y
+
+                if no_ov and overlap_area > 0.0:
+                    smaller_area = min(area_i, area_j)
+                    ratio = overlap_area / smaller_area if smaller_area > 0 else 1.0
+                    overlap_max_ratio = max(overlap_max_ratio, ratio)
+
+                # Horizontal gap
+                if right_i <= left_j:
+                    horiz_gap = left_j - right_i
+                elif right_j <= left_i:
+                    horiz_gap = left_i - right_j
+                else:
+                    horiz_gap = 0.0
+
+                # Vertical gap
+                if top_i <= bottom_j:
+                    vert_gap = bottom_j - top_i
+                elif top_j <= bottom_i:
+                    vert_gap = bottom_i - top_j
+                else:
+                    vert_gap = 0.0
+
+                if min_sp:
+                    if horiz_gap < min_dx:
+                        spacing_x_violation = max(
+                            spacing_x_violation, (min_dx - horiz_gap)
+                        )
+                    if vert_gap < min_dy:
+                        spacing_y_violation = max(
+                            spacing_y_violation, (min_dy - vert_gap)
+                        )
+
+        # Bounding box aspect ratio violation
+        bbox_ar_violation = 0.0
+        if bbox_ar_enabled:
+            min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+            width = max_x - min_x
+            height = max_y - min_y
+            if width <= 0 or height <= 0:
+                ar = 1.0
+            else:
+                ar = width / height
+
+            ar_type = bbox_ar_cfg.get("type", "less_than")
+            thr = float(bbox_ar_cfg.get("threshold", 1.0))
+            if ar_type == "less_than":
+                bbox_ar_violation = max(0.0, ar - thr)
+            else:
+                bbox_ar_violation = max(0.0, thr - ar)
+
+        # Boundary violation
+        boundary_violation = 0.0
+        if boundary_enabled:
+            for (cx, cy), r in zip(centres, self.rectangles):
+                half_w = r.width / 2.0
+                half_h = r.height / 2.0
+                left = cx - half_w
+                right = cx + half_w
+                bottom = cy - half_h
+                top = cy + half_h
+                if left < 0.0:
+                    boundary_violation += -left
+                if right > self.canvas_width:
+                    boundary_violation += right - self.canvas_width
+                if bottom < 0.0:
+                    boundary_violation += -bottom
+                if top > self.canvas_height:
+                    boundary_violation += top - self.canvas_height
+
+        return {
+            "overlap_max_ratio": float(overlap_max_ratio if no_ov else 0.0),
+            "spacing_x_violation": float(spacing_x_violation if min_sp else 0.0),
+            "spacing_y_violation": float(spacing_y_violation if min_sp else 0.0),
+            "bbox_ar_violation": float(bbox_ar_violation if bbox_ar_enabled else 0.0),
+            "boundary_violation": float(boundary_violation if boundary_enabled else 0.0),
+        }
+
+    # ---------- Metrics & objective ----------
+
+    def compute_metrics(self, x: np.ndarray) -> Dict[str, float]:
+        """
+        Compute:
+        - hpwl
+        - bbox_aspect, bbox_area
+        - objective_pure
+        - objective_augmented
+        - all constraint violation terms
+        """
+        centres = self.decode_centres(x)
+
+        # Primary geometry
+        hpwl = self._compute_hpwl(centres)
+        min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+        width = max_x - min_x
+        height = max_y - min_y
+        if width <= 0 or height <= 0:
+            bbox_aspect = 1.0
+            bbox_area = 0.0
+        else:
+            bbox_aspect = width / height
+            bbox_area = width * height
+
+        pure_obj = (
+            self.weight_hpwl * hpwl
+            + self.weight_bbox_aspect * bbox_aspect
+            + self.weight_bbox_area * bbox_area
+        )
+
+        cons = self._constraints_from_centres(centres)
+        overlap_max_ratio = cons["overlap_max_ratio"]
+        spacing_x_violation = cons["spacing_x_violation"]
+        spacing_y_violation = cons["spacing_y_violation"]
+        bbox_ar_violation = cons["bbox_ar_violation"]
+        boundary_violation = cons["boundary_violation"]
+
+        # Penalty from global constraint weights
+        penalty = 0.0
+        penalty += W_OVERLAP * (overlap_max_ratio ** 2)
+        penalty += W_SPACING * (
+            spacing_x_violation ** 2 + spacing_y_violation ** 2
+        )
+        penalty += W_BBOX_AR_CON * (bbox_ar_violation ** 2)
+        penalty += W_BOUNDARY * (boundary_violation ** 2)
+
+        augmented_obj = pure_obj + penalty
+
+        return {
+            "hpwl": float(hpwl),
+            "bbox_aspect": float(bbox_aspect),
+            "bbox_area": float(bbox_area),
+            "objective_pure": float(pure_obj),
+            "objective_augmented": float(augmented_obj),
+            "overlap_max_ratio": float(overlap_max_ratio),
+            "spacing_x_violation": float(spacing_x_violation),
+            "spacing_y_violation": float(spacing_y_violation),
+            "bbox_ar_violation": float(bbox_ar_violation),
+            "boundary_violation": float(boundary_violation),
+        }
+
+    # ---------- Shapes for plotting ----------
+
+    def make_rectangle_shapes(
+        self, x: np.ndarray
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Return:
+        - list of rectangles: {x, y, w, h, rect_id}
+        - bounding box: {x, y, w, h}
+        where (x,y) are centres and w,h are widths/heights.
+        """
+        centres = self.decode_centres(x)
+        rects: List[Dict[str, Any]] = []
+
+        min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+        width = max_x - min_x
+        height = max_y - min_y
+        bbox_cx = min_x + width / 2.0
+        bbox_cy = min_y + height / 2.0
+
+        for (cx, cy), r in zip(centres, self.rectangles):
+            rects.append(
+                {"x": cx, "y": cy, "w": r.width, "h": r.height, "rect_id": r.rect_id}
+            )
+
+        bbox = {"x": bbox_cx, "y": bbox_cy, "w": width, "h": height}
+        return rects, bbox
+
+
+# =====================================================================
+# OPTIMIZATION MANAGER (ONLY ADAM IMPLEMENTATION)
+# =====================================================================
+
+class OptimizationManager:
+    """
+    Minimal manager that:
+      - holds PlacementProblem
+      - runs pure-Python Adam
+      - records per-iteration metrics in `history`
+    """
+
+    def __init__(self, problem: PlacementProblem):
+        self.problem = problem
+        self.history: List[Dict[str, Any]] = []  # per-iteration records
+        self.best_x: Optional[np.ndarray] = None
+        self.best_metrics: Optional[Dict[str, float]] = None
+
+    def _objective(self, x: np.ndarray) -> float:
+        """Augmented objective as scalar."""
+        return self.problem.compute_metrics(x)["objective_augmented"]
+
+    def _gradient(self, x: np.ndarray) -> np.ndarray:
+        """
+        Simple forward-difference gradient of augmented objective.
+        Uses ADAM_FD_STEP as finite-difference step.
+        """
+        g = np.zeros_like(x)
+        fx = self._objective(x)
+        h = ADAM_FD_STEP
+        for i in range(len(x)):
+            x_up = x.copy()
+            x_up[i] += h
+            g[i] = (self._objective(x_up) - fx) / h
+        return g
+
+    def _register_step(self, iter_idx: int, x: np.ndarray):
+        """Compute metrics and append to history."""
+        metrics = self.problem.compute_metrics(x)
+        rec = {
+            "iteration": iter_idx,
+            "x_vector": x.tolist(),
+            **metrics,
+        }
+        self.history.append(rec)
+
+        if (
+            self.best_metrics is None
+            or metrics["objective_augmented"] < self.best_metrics["objective_augmented"]
+        ):
+            self.best_x = x.copy()
+            self.best_metrics = metrics
+
+    def run_adam(self):
+        """
+        Run pure-Python Adam on the problem using the hyperparameters defined
+        at the top of this file. Uses bounds to clamp variables after each step.
+        """
+        x = self.problem.initial_vector()
+        bounds = self.problem.bounds()
+
+        lr = ADAM_LR
+        maxiter = ADAM_MAXITER
+        beta1 = ADAM_BETA1
+        beta2 = ADAM_BETA2
+        eps = ADAM_EPS
+
+        m = np.zeros_like(x)
+        v = np.zeros_like(x)
+
+        for t in range(1, maxiter + 1):
+            g = self._gradient(x)
+            m = beta1 * m + (1.0 - beta1) * g
+            v = beta2 * v + (1.0 - beta2) * (g ** 2)
+            m_hat = m / (1.0 - beta1 ** t)
+            v_hat = v / (1.0 - beta2 ** t)
+            x = x - lr * m_hat / (np.sqrt(v_hat) + eps)
+
+            # Clamp to bounds
+            for i, (lo, hi) in enumerate(bounds):
+                x[i] = np.clip(x[i], lo, hi)
+
+            # Register this step
+            self._register_step(t, x)
+
+            # Early stop if target objective reached
+            if TARGET_OBJECTIVE > 0.0:
+                current_obj = self.problem.compute_metrics(x)["objective_augmented"]
+                if current_obj <= TARGET_OBJECTIVE:
+                    break
+
+        # Ensure best_x is set even if no improvement happened
+        if self.best_x is None:
+            self.best_x = x.copy()
+            self.best_metrics = self.problem.compute_metrics(x)
+
+
+# =====================================================================
+# PLOTTING (BOKEH ONLY)
+# =====================================================================
+
+def build_figures(problem: PlacementProblem, manager: OptimizationManager):
+    """
+    Build three Bokeh figures:
+      - Canvas View (final placement)
+      - Objective Terms vs Iteration
+      - Constraint Terms vs Iteration
+
+    Returns:
+        (canvas_fig, objective_fig, constraint_fig)
+    """
+    # ---------- Final placement data ----------
+    best_x = manager.best_x if manager.best_x is not None else problem.initial_vector()
+    rects, bbox = problem.make_rectangle_shapes(best_x)
+
+    canvas_source = ColumnDataSource(
+        data=dict(
+            x=[r["x"] for r in rects],
+            y=[r["y"] for r in rects],
+            w=[r["w"] for r in rects],
+            h=[r["h"] for r in rects],
+            rect_id=[r["rect_id"] for r in rects],
+        )
+    )
+    bbox_source = ColumnDataSource(
+        data=dict(
+            x=[bbox["x"]],
+            y=[bbox["y"]],
+            w=[bbox["w"]],
+            h=[bbox["h"]],
+        )
+    )
+
+    # ---------- History sources ----------
+    iterations = [rec["iteration"] for rec in manager.history]
+    obj_source = ColumnDataSource(
+        data=dict(
+            iteration=iterations,
+            hpwl=[rec["hpwl"] for rec in manager.history],
+            bbox_aspect=[rec["bbox_aspect"] for rec in manager.history],
+            bbox_area=[rec["bbox_area"] for rec in manager.history],
+            objective_augmented=[rec["objective_augmented"] for rec in manager.history],
+        )
+    )
+    con_source = ColumnDataSource(
+        data=dict(
+            iteration=iterations,
+            overlap_max_ratio=[rec["overlap_max_ratio"] for rec in manager.history],
+            spacing_x_violation=[
+                rec["spacing_x_violation"] for rec in manager.history
+            ],
+            spacing_y_violation=[
+                rec["spacing_y_violation"] for rec in manager.history
+            ],
+            bbox_ar_violation=[rec["bbox_ar_violation"] for rec in manager.history],
+            boundary_violation=[rec["boundary_violation"] for rec in manager.history],
+        )
+    )
+
+    # ---------- Canvas figure ----------
+    canvas_fig = figure(
+        title="Canvas View (Final Placement)",
+        match_aspect=True,
+        tools="pan,wheel_zoom,reset",
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
+        toolbar_location="right",
+    )
+    canvas_fig.grid.grid_line_color = COLORS["grid"]
+    canvas_fig.title.text_color = COLORS["primary"]
+    canvas_fig.axis.axis_label_text_color = UI_TEXT_COLOR
+    canvas_fig.axis.major_label_text_color = UI_TEXT_COLOR
+
+    canvas_fig.rect(
+        x="x",
+        y="y",
+        width="w",
+        height="h",
+        source=canvas_source,
+        fill_alpha=0.25,
+        line_alpha=0.9,
+        fill_color=COLORS["rect_fill"],
+        line_color=COLORS["rect_line"],
+    )
+    canvas_fig.rect(
+        x="x",
+        y="y",
+        width="w",
+        height="h",
+        source=bbox_source,
+        fill_alpha=0.0,
+        line_alpha=0.7,
+        line_dash="dashed",
+        line_width=2,
+        line_color=COLORS["bbox_line"],
+    )
+    canvas_fig.add_tools(
+        HoverTool(
+            tooltips=[
+                ("Rect", "@rect_id"),
+                ("x", "@x{0.0}"),
+                ("y", "@y{0.0}"),
+                ("w", "@w{0.0}"),
+                ("h", "@h{0.0}"),
+            ]
+        )
+    )
+    canvas_fig.x_range.start = 0
+    canvas_fig.x_range.end = problem.canvas_width
+    canvas_fig.y_range.start = 0
+    canvas_fig.y_range.end = problem.canvas_height
+
+    # ---------- Objective figure ----------
+    objective_fig = figure(
+        title="Objective Terms vs Iteration",
+        x_axis_label="Iteration",
+        y_axis_label="Value",
+        tools="pan,wheel_zoom,reset",
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
+        toolbar_location="right",
+    )
+    objective_fig.grid.grid_line_color = COLORS["grid"]
+    objective_fig.axis.axis_label_text_color = UI_TEXT_COLOR
+    objective_fig.axis.major_label_text_color = UI_TEXT_COLOR
+    objective_fig.title.text_color = COLORS["primary"]
+
+    objective_fig.line(
+        "iteration", "hpwl",
+        source=obj_source,
+        legend_label="HPWL",
+        line_width=2,
+        alpha=0.9,
+        color="#FF6F00",
+        line_dash="solid",
+    )
+    objective_fig.line(
+        "iteration", "bbox_aspect",
+        source=obj_source,
+        legend_label="BBox AR",
+        line_width=2,
+        alpha=0.9,
+        color="#29B6F6",
+        line_dash="dashed",
+    )
+    objective_fig.line(
+        "iteration", "bbox_area",
+        source=obj_source,
+        legend_label="BBox Area",
+        line_width=2,
+        alpha=0.9,
+        color="#AB47BC",
+        line_dash="dotdash",
+    )
+    objective_fig.line(
+        "iteration", "objective_augmented",
+        source=obj_source,
+        legend_label="Aug Obj",
+        line_width=3,
+        alpha=0.95,
+        color="#FF1744",
+        line_dash="solid",
+    )
+    objective_fig.legend.location = "top_left"
+    objective_fig.legend.click_policy = "hide"
+
+    # ---------- Constraint figure ----------
+    constraint_fig = figure(
+        title="Constraint Terms vs Iteration",
+        x_axis_label="Iteration",
+        y_axis_label="Violation",
+        tools="pan,wheel_zoom,reset",
+        background_fill_color=COLORS["panel_bg"],
+        border_fill_color=COLORS["panel_bg"],
+        toolbar_location="right",
+    )
+    constraint_fig.grid.grid_line_color = COLORS["grid"]
+    constraint_fig.axis.axis_label_text_color = UI_TEXT_COLOR
+    constraint_fig.axis.major_label_text_color = UI_TEXT_COLOR
+    constraint_fig.title.text_color = COLORS["secondary"]
+
+    constraint_fig.line(
+        "iteration", "overlap_max_ratio",
+        source=con_source,
+        legend_label="Overlap",
+        line_width=2,
+        alpha=0.9,
+        color="#E53935",
+        line_dash="solid",
+    )
+    constraint_fig.line(
+        "iteration", "spacing_x_violation",
+        source=con_source,
+        legend_label="dx Viol",
+        line_width=2,
+        alpha=0.9,
+        color="#FB8C00",
+        line_dash="dashed",
+    )
+    constraint_fig.line(
+        "iteration", "spacing_y_violation",
+        source=con_source,
+        legend_label="dy Viol",
+        line_width=2,
+        alpha=0.9,
+        color="#1E88E5",
+        line_dash="dotdash",
+    )
+    constraint_fig.line(
+        "iteration", "bbox_ar_violation",
+        source=con_source,
+        legend_label="AR Viol",
+        line_width=2,
+        alpha=0.9,
+        color="#8E24AA",
+        line_dash="dotted",
+    )
+    constraint_fig.line(
+        "iteration", "boundary_violation",
+        source=con_source,
+        legend_label="Boundary",
+        line_width=2,
+        alpha=0.9,
+        color="#00C853",
+        line_dash="dashdot",
+    )
+    constraint_fig.legend.location = "top_left"
+    constraint_fig.legend.click_policy = "hide"
+
+    return canvas_fig, objective_fig, constraint_fig
+
+
+# =====================================================================
+# MAIN EXECUTION
+# =====================================================================
+
+def main():
+    # 1. Load config
+    if not os.path.exists(CONFIG_PATH):
+        raise FileNotFoundError(f"Config file not found: {CONFIG_PATH}")
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    # 2. Build problem with overridden weights
+    problem = PlacementProblem(cfg)
+
+    # 3. Run Adam
+    manager = OptimizationManager(problem)
+    manager.run_adam()
+
+    # 4. Build figures
+    canvas_fig, objective_fig, constraint_fig = build_figures(problem, manager)
+
+    # 5. Arrange and save to a single HTML file
+    layout = column(
+        canvas_fig,
+        row(objective_fig, constraint_fig),
+    )
+    output_file(OUTPUT_HTML, title="Rectangle Placement - Adam Result")
+    save(layout)
+    print(f"Saved results to {OUTPUT_HTML}")
+
+
+if __name__ == "__main__":
+    main()
