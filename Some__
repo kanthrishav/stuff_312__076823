@@ -1,0 +1,451 @@
+some # 1
+
+
+# --- SECONDARY PARAMETERS ----------------------------------------------
+# Centres array: centres is shape (N,2) [[x1,y1],...]
+xs = centres[:, 0]
+ys = centres[:, 1]
+N = centres.shape[0]
+
+# 1) Global spread radius R_rms
+cx_mean = xs.mean()
+cy_mean = ys.mean()
+dx = xs - cx_mean
+dy = ys - cy_mean
+R_rms = float(np.sqrt((dx**2 + dy**2).mean()))
+
+# 2) Anisotropy alpha
+Cxx = float((dx * dx).mean())
+Cyy = float((dy * dy).mean())
+Cxy = float((dx * dy).mean())
+C = np.array([[Cxx, Cxy],
+              [Cxy, Cyy]], dtype=float)
+evals, _ = np.linalg.eigh(C)
+evals = np.sort(evals)
+lambda2 = max(0.0, float(evals[0]))
+lambda1 = max(0.0, float(evals[1]))
+if lambda1 + lambda2 > 0:
+    alpha = (lambda1 - lambda2) / (lambda1 + lambda2)
+else:
+    alpha = 0.0
+
+# 3) Local crowding / packing index C_pack
+# Effective nearest gap / min_spacing_scale
+if self.min_spacing_scale is not None:
+    delta_min = self.min_spacing_scale
+else:
+    # Fallback scale if no constraint: choose something based on canvas
+    delta_min = max(1e-6, self.canvas_diagonal / 10.0)
+
+g_locals = []
+for i in range(N):
+    gx_min = np.inf
+    gy_min = np.inf
+    xi, yi = xs[i], ys[i]
+    for j in range(N):
+        if i == j:
+            continue
+        xj, yj = xs[j], ys[j]
+        # x-intervals
+        wi = self.widths[i]
+        wj = self.widths[j]
+        hi = self.heights[i]
+        hj = self.heights[j]
+        Li = xi - wi/2.0
+        Ri = xi + wi/2.0
+        Lj = xj - wj/2.0
+        Rj = xj + wj/2.0
+        Bi = yi - hi/2.0
+        Ti = yi + hi/2.0
+        Bj = yj - hj/2.0
+        Tj = yj + hj/2.0
+        # x gap
+        if Ri <= Lj:
+            gx = Lj - Ri
+        elif Rj <= Li:
+            gx = Li - Rj
+        else:
+            gx = 0.0
+        # y gap
+        if Ti <= Bj:
+            gy = Bj - Ti
+        elif Tj <= Bi:
+            gy = Bi - Tj
+        else:
+            gy = 0.0
+        gx_min = min(gx_min, gx)
+        gy_min = min(gy_min, gy)
+    g_min = max(0.0, min(gx_min, gy_min))
+    g_locals.append(g_min / delta_min)
+if g_locals:
+    C_pack = float(np.median(g_locals))
+else:
+    C_pack = 0.0
+
+# 4) Connectivity stretch S_conn via MST
+from scipy.spatial.distance import pdist, squareform
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+coords = np.column_stack([xs, ys])
+D = squareform(pdist(coords, metric="euclidean"))  # full distance matrix
+if N >= 2:
+    mst = minimum_spanning_tree(D)
+    # mst is sparse, get nonzero entries
+    mst_edges = mst.data
+    if mst_edges.size > 0:
+        L_mst = float(mst_edges.mean())
+        S_conn = L_mst / self.canvas_diagonal
+    else:
+        S_conn = 0.0
+else:
+    S_conn = 0.0
+
+metrics["sec_R_rms"] = R_rms
+metrics["sec_anisotropy"] = alpha
+metrics["sec_C_pack"] = C_pack
+metrics["sec_S_conn"] = S_conn
+# -----------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+some # 2
+
+self.history.append({
+    "iteration": iteration,
+    "objective": metrics["objective_augmented"],  # or your key
+    ...
+    "sec_R_rms": metrics["sec_R_rms"],
+    "sec_anisotropy": metrics["sec_anisotropy"],
+    "sec_C_pack": metrics["sec_C_pack"],
+    "sec_S_conn": metrics["sec_S_conn"],
+})
+
+
+
+
+
+some # 3
+
+# --- Surface plot data structures --------------------------------------
+self.surface_samples = []  # each element: dict with sec params + objective
+self.surface_slider_param_name = "sec_anisotropy"  # or "sec_S_conn" if you prefer
+
+# ranges for axes based on canvas + constraints
+D_c = self.problem.canvas_diagonal
+if self.problem.min_spacing_scale is not None:
+    delta_min = self.problem.min_spacing_scale
+else:
+    delta_min = max(1e-6, D_c / 10.0)
+
+self.surface_R_min = 0.0
+self.surface_R_max = D_c
+
+self.surface_C_min = 0.0
+self.surface_C_max = D_c / delta_min
+
+# slider param range
+self.surface_slider_min = 0.0
+self.surface_slider_max = 1.0  # both anisotropy and S_conn lie in [0,1]
+
+# z-range (objective) will be dynamic from seen data
+self.surface_obj_min = None
+self.surface_obj_max = None
+
+# Placeholders for UI controls (will be attached later)
+self.surface_slider = None
+self.surface_slider_enable_checkbox = None
+self.surface_pane = None  # Panel Plotly pane
+self.surface_figure = None  # Plotly figure object
+# -----------------------------------------------------------------------
+
+
+
+
+
+some #4
+
+def attach_surface_controls(self, slider, enable_checkbox, surface_pane, surface_figure):
+    self.surface_slider = slider
+    self.surface_slider_enable_checkbox = enable_checkbox
+    self.surface_pane = surface_pane
+    self.surface_figure = surface_figure
+
+
+
+
+
+some # t
+# --- Update surface samples and z-range --------------------------------
+sec_R = metrics["sec_R_rms"]
+sec_C = metrics["sec_C_pack"]
+sec_slider = metrics[self.surface_slider_param_name]
+obj_val = metrics["objective_augmented"]  # adapt to your key
+
+self.surface_samples.append({
+    "R_rms": sec_R,
+    "C_pack": sec_C,
+    "slider": sec_slider,
+    "objective": obj_val,
+})
+
+if self.surface_obj_min is None:
+    self.surface_obj_min = obj_val
+    self.surface_obj_max = obj_val
+else:
+    self.surface_obj_min = min(self.surface_obj_min, obj_val)
+    self.surface_obj_max = max(self.surface_obj_max, obj_val)
+# -----------------------------------------------------------------------
+
+
+
+
+
+some # 6
+
+# --- Update slider and ball position on surface ------------------------
+if self.surface_slider is not None and self.surface_figure is not None:
+    # 1) update slider to current optimizer 4th parameter
+    #    (temporarily disable slider callback if you have it)
+    self.surface_slider.value = float(sec_slider)
+
+    # 2) update "ball" trace (assume trace index 1 is the ball, 0 is surface)
+    try:
+        ball_trace = self.surface_figure.data[1]
+        ball_trace.x = [sec_R]
+        ball_trace.y = [sec_C]
+        ball_trace.z = [obj_val]
+    except (IndexError, AttributeError):
+        pass
+
+    # 3) refresh the pane so Panel sees the updated figure
+    if self.surface_pane is not None:
+        self.surface_pane.object = self.surface_figure
+# -----------------------------------------------------------------------
+
+
+
+some # 7
+
+def rebuild_surface_for_slider(self, slider_value):
+    """
+    Build a coarse surface f(R_rms, C_pack) for the given slider_value,
+    using the collected samples in self.surface_samples.
+    """
+    if self.surface_figure is None:
+        return
+
+    if not self.surface_samples:
+        return
+
+    import numpy as np
+
+    # Filter samples by slider value if slider-impact is enabled,
+    # or use all samples if slider-impact is disabled.
+    if self.surface_slider_enable_checkbox is not None and self.surface_slider_enable_checkbox.value:
+        # Keep samples whose slider parameter is close to slider_value
+        samples = [
+            s for s in self.surface_samples
+            if abs(s["slider"] - slider_value) <= 0.05  # tolerance, can tweak
+        ]
+        if not samples:
+            samples = self.surface_samples  # fallback
+    else:
+        # slider-impact disabled: ignore slider dimension
+        samples = self.surface_samples
+
+    R_vals = np.array([s["R_rms"] for s in samples])
+    C_vals = np.array([s["C_pack"] for s in samples])
+    Z_vals = np.array([s["objective"] for s in samples])
+
+    # Define a regular grid in (R,C) based on theoretical ranges
+    R_lin = np.linspace(self.surface_R_min, self.surface_R_max, 30)
+    C_lin = np.linspace(self.surface_C_min, self.surface_C_max, 30)
+    RR, CC = np.meshgrid(R_lin, C_lin)
+
+    # Interpolate scattered Z onto grid (simple nearest-neighbour)
+    from scipy.interpolate import griddata
+    points = np.column_stack([R_vals, C_vals])
+    ZZ = griddata(points, Z_vals, (RR, CC), method="linear")
+    # Fill NaNs with nearest
+    mask = np.isnan(ZZ)
+    if np.any(mask):
+        ZZ_nn = griddata(points, Z_vals, (RR, CC), method="nearest")
+        ZZ[mask] = ZZ_nn[mask]
+
+    # Update z-range from actual data (plus small padding)
+    zmin = float(Z_vals.min()) if self.surface_obj_min is None else self.surface_obj_min
+    zmax = float(Z_vals.max()) if self.surface_obj_max is None else self.surface_obj_max
+    if zmax == zmin:
+        zmax = zmin + 1.0
+
+    # Update the surface trace (assume trace 0)
+    try:
+        surface_trace = self.surface_figure.data[0]
+        surface_trace.x = R_lin
+        surface_trace.y = C_lin
+        surface_trace.z = ZZ
+        surface_trace.update(colorbar=dict(
+            title="Objective",
+            min=zmin,
+            max=zmax,
+        ))
+    except (IndexError, AttributeError):
+        pass
+
+    if self.surface_pane is not None:
+        self.surface_pane.object = self.surface_figure
+
+
+
+some # 8
+
+# --- Surface controls ---------------------------------------------------
+surface_slider = pn.widgets.FloatSlider(
+    name="Surface slider (anisotropy / S_conn)",
+    start=manager.surface_slider_min,
+    end=manager.surface_slider_max,
+    step=0.01,
+    value=0.0,
+)
+
+surface_slider_enable = pn.widgets.Checkbox(
+    name="Link slider to surface & filter",
+    value=True,
+)
+# ------------------------------------------------------------------------
+
+
+some # 9
+
+# --- Plotly 3D surface figure ------------------------------------------
+# Initial empty grid using theoretical ranges
+R_lin = np.linspace(manager.surface_R_min, manager.surface_R_max, 2)
+C_lin = np.linspace(manager.surface_C_min, manager.surface_C_max, 2)
+RR, CC = np.meshgrid(R_lin, C_lin)
+ZZ = np.zeros_like(RR)
+
+surface_trace = go.Surface(
+    x=R_lin,
+    y=C_lin,
+    z=ZZ,
+    colorscale="Viridis",
+    showscale=True,
+    colorbar=dict(title="Objective"),
+    contours=dict(
+        x=dict(show=True, project=dict(x=True)),
+        y=dict(show=True, project=dict(y=True)),
+        z=dict(show=False),
+    ),
+)
+
+ball_trace = go.Scatter3d(
+    x=[0],
+    y=[0],
+    z=[0],
+    mode="markers",
+    marker=dict(size=5, color="red"),
+    name="Current iterate",
+)
+
+surface_fig = go.Figure(data=[surface_trace, ball_trace])
+surface_fig.update_layout(
+    scene=dict(
+        xaxis_title="R_rms (global spread)",
+        yaxis_title="C_pack (local crowding)",
+        zaxis_title="Objective",
+        xaxis=dict(range=[manager.surface_R_min, manager.surface_R_max]),
+        yaxis=dict(range=[manager.surface_C_min, manager.surface_C_max]),
+        # z-axis range will be updated dynamically in rebuild_surface_for_slider
+        aspectmode="cube",  # 1:1:1
+        camera=dict(
+            projection=dict(type="orthographic"),
+        ),
+    ),
+    margin=dict(l=0, r=0, t=30, b=0),
+    title="Secondary-Parameter Surface",
+)
+
+surface_pane = pn.pane.Plotly(surface_fig, height=500, sizing_mode="stretch_width")
+# ------------------------------------------------------------------------
+
+
+
+
+some # 10
+
+manager.attach_surface_controls(
+    slider=surface_slider,
+    enable_checkbox=surface_slider_enable,
+    surface_pane=surface_pane,
+    surface_figure=surface_fig,
+)
+
+
+
+
+
+some # 11
+def _on_surface_slider_change(event):
+    if manager.surface_pane is None:
+        return
+    # Rebuild surface for new slider value (if impact is enabled, method will filter)
+    manager.rebuild_surface_for_slider(event.new)
+
+surface_slider.param.watch(_on_surface_slider_change, "value")
+
+def _on_surface_enable_change(event):
+    # When toggled, rebuild surface for current slider value
+    manager.rebuild_surface_for_slider(surface_slider.value)
+
+surface_slider_enable.param.watch(_on_surface_enable_change, "value")
+
+
+some # 12
+
+top_row = pn.Row(parameters_panel, live_updates_panel, sizing_mode="stretch_both")
+first_tab_content = top_row
+
+
+
+some # 13
+
+surface_controls_row = pn.Row(
+    surface_slider,
+    surface_slider_enable,
+    sizing_mode="stretch_width",
+)
+
+surface_section = pn.Column(
+    surface_controls_row,
+    surface_pane,
+    sizing_mode="stretch_both",
+)
+
+first_tab_content = pn.Column(
+    top_row,
+    surface_section,
+    sizing_mode="stretch_both",
+)
+
+
+some # 14
+
+ball_trace = self.surface_figure.data[1]
+ball_trace.x = [sec_R]
+ball_trace.y = [sec_C]
+ball_trace.z = [obj_val]
+
+
+
+
+some # 15
+
