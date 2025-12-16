@@ -1,0 +1,874 @@
+    def _objective_augmented_torch(self, x_t, widths_t, heights_t):
+        """
+        Torch-based constraint penalty term to be added to the main objective.
+
+        This mirrors the numpy `_constraints_from_centres` logic for:
+          - Overlaps (no_overlap)
+          - Minimum spacing (min_spacing)
+          - Canvas boundary (canvas_boundary)
+
+        The secondary visual metrics (spread radius, anisotropy, etc.) are
+        intentionally **not** computed here, because they are not needed in
+        the optimisation loss.
+        """
+        import torch
+
+        device   = x_t.device
+        cons_cfg = self.problem.constraints_cfg
+
+        # ------------------------------------------------------------------ #
+        # Shortcuts to constraint configs (with safe defaults)
+        # ------------------------------------------------------------------ #
+        no_ov_cfg    = cons_cfg.get("no_overlap", {}) or {}
+        spacing_cfg  = cons_cfg.get("min_spacing", {}) or {}
+        bbox_ar_cfg  = cons_cfg.get("bbox_aspect_ratio", {}) or {}
+        boundary_cfg = cons_cfg.get("canvas_boundary", {}) or {}
+
+        no_ov_enabled    = bool(no_ov_cfg.get("enabled", False))
+        spacing_enabled  = bool(spacing_cfg.get("enabled", False))
+        bbox_ar_enabled  = bool(bbox_ar_cfg.get("enabled", False))
+        boundary_enabled = bool(boundary_cfg.get("enabled", False))
+
+        ov_norm_mode = str(no_ov_cfg.get("normalization", "min_pair_area"))
+        ov_agg_mode  = str(no_ov_cfg.get("aggregation",  "max"))
+        ov_buffer    = float(no_ov_cfg.get("buffer", 0.0))
+
+        sp_norm_mode = str(spacing_cfg.get("normalization", "no norm"))
+        sp_agg_mode  = str(spacing_cfg.get("aggregation",  "max"))
+
+        bd_norm_mode = str(boundary_cfg.get("normalization", "no norm"))
+        bd_agg_mode  = str(boundary_cfg.get("aggregation",  "sum"))
+
+        min_dx = float(spacing_cfg.get("min_dx", 0.0))
+        min_dy = float(spacing_cfg.get("min_dy", 0.0))
+
+        target_ar = float(bbox_ar_cfg.get("target_ar", 1.0))
+        ar_mode   = str(bbox_ar_cfg.get("mode", "less_than"))
+
+        canvas_w = float(self.problem.canvas_width)
+        canvas_h = float(self.problem.canvas_height)
+        canvas_area      = max(canvas_w * canvas_h, 1e-9)
+        canvas_perimeter = max(2.0 * (canvas_w + canvas_h), 1e-9)
+
+        # ------------------------------------------------------------------ #
+        # Geometry (torch)
+        # ------------------------------------------------------------------ #
+        n = x_t.shape[0]
+        cx = x_t[:, 0]
+        cy = x_t[:, 1]
+
+        widths  = widths_t
+        heights = heights_t
+
+        half_w = 0.5 * widths
+        half_h = 0.5 * heights
+
+        left   = cx - half_w
+        right  = cx + half_w
+        bottom = cy - half_h
+        top    = cy + half_h
+
+        areas      = widths * heights
+        perimeters = 2.0 * (widths + heights)
+
+        total_rect_area  = torch.clamp(areas.sum(),      min=1e-9)
+        max_rect_area    = torch.clamp(areas.max(),      min=1e-9)
+        min_rect_area    = torch.clamp(areas.min(),      min=1e-9)
+
+        total_rect_perim = torch.clamp(perimeters.sum(), min=1e-9)
+        max_rect_perim   = torch.clamp(perimeters.max(), min=1e-9)
+        min_rect_perim   = torch.clamp(perimeters.min(), min=1e-9)
+
+        # Bounding box
+        bbox_left,   _ = torch.min(left,   dim=0)
+        bbox_right,  _ = torch.max(right,  dim=0)
+        bbox_bottom, _ = torch.min(bottom, dim=0)
+        bbox_top,    _ = torch.max(top,    dim=0)
+
+        bbox_w = torch.clamp(bbox_right - bbox_left, min=1e-9)
+        bbox_h = torch.clamp(bbox_top   - bbox_bottom, min=1e-9)
+        bbox_area      = torch.clamp(bbox_w * bbox_h, min=1e-9)
+        bbox_perimeter = torch.clamp(2.0 * (bbox_w + bbox_h), min=1e-9)
+
+        # ------------------------------------------------------------------ #
+        # Helpers: normalisation (torch)
+        # ------------------------------------------------------------------ #
+        def _norm_overlap_t(raw_val, i, j):
+            """
+            Normalise a single pairwise overlap penalty (torch scalar).
+            All normalisation options follow the numpy version.
+            """
+            if ov_norm_mode == "no norm":
+                denom = torch.tensor(1.0, device=device)
+            elif ov_norm_mode == "min_pair_area":
+                denom = torch.clamp(torch.min(areas[i], areas[j]), min=1e-9)
+            elif ov_norm_mode == "max_pair_area":
+                denom = torch.clamp(torch.max(areas[i], areas[j]), min=1e-9)
+            elif ov_norm_mode == "sum_pair_area":
+                denom = torch.clamp(areas[i] + areas[j], min=1e-9)
+            elif ov_norm_mode == "total_rect_area":
+                denom = total_rect_area
+            elif ov_norm_mode == "max_canvas_rect_area":
+                denom = max_rect_area
+            elif ov_norm_mode == "min_canvas_rect_area":
+                denom = min_rect_area
+            elif ov_norm_mode == "bbox_area":
+                denom = bbox_area
+            elif ov_norm_mode == "canvas_area":
+                denom = torch.tensor(canvas_area, device=device)
+            else:
+                # Fallback to old behaviour: min_pair_area
+                denom = torch.clamp(torch.min(areas[i], areas[j]), min=1e-9)
+
+            return raw_val / denom
+
+        def _norm_spacing_or_boundary_t(raw_val, i=None, j=None, is_boundary=False):
+            """
+            Torch version of spacing/boundary normalisation.
+            - For spacing, (i,j) is a pair.
+            - For boundary, 'i' is the rectangle index.
+            """
+            mode = bd_norm_mode if is_boundary else sp_norm_mode
+
+            if mode == "no norm":
+                denom = torch.tensor(1.0, device=device)
+
+            elif mode == "self_rect_perimeter":
+                if is_boundary:
+                    denom = torch.clamp(perimeters[i], min=1e-9)
+                else:
+                    if i is None or j is None:
+                        denom = max_rect_perim
+                    else:
+                        denom = torch.clamp(
+                            torch.min(perimeters[i], perimeters[j]),
+                            min=1e-9
+                        )
+
+            elif mode == "total_rect_perimeter":
+                denom = total_rect_perim
+            elif mode == "max_rect_perimeter":
+                denom = max_rect_perim
+            elif mode == "min_rect_perimeter":
+                denom = min_rect_perim
+            elif mode == "bbox_perimeter":
+                denom = bbox_perimeter
+            elif mode == "canvas_perimeter":
+                denom = torch.tensor(canvas_perimeter, device=device)
+            else:
+                denom = torch.tensor(1.0, device=device)
+
+            return raw_val / denom
+
+        def _aggregate_t(values, weights, mode):
+            """
+            Torch version of the aggregation helper.
+            Takes a list of torch scalars and an optional list of weights.
+            """
+            if not values:
+                return torch.tensor(0.0, device=device)
+
+            v = torch.stack(values)
+            eps = torch.tensor(1e-12, device=device)
+
+            if mode == "max":
+                return torch.max(v)
+            if mode == "sum":
+                return torch.sum(v)
+            if mode == "product":
+                return torch.prod(v)
+            if mode == "mean":
+                return torch.mean(v)
+            if mode == "geometric_mean":
+                return torch.exp(torch.mean(torch.log(v + eps)))
+
+            # Weighted variants
+            if weights is None or len(weights) == 0:
+                # Fallback: no weights → unweighted mean
+                return torch.mean(v)
+
+            w = torch.stack(weights)
+            if torch.sum(w) <= 0.0:
+                return torch.mean(v)
+
+            if mode == "weighted_sum":
+                return torch.sum(v * w)
+            if mode == "weighted_mean":
+                return torch.sum(v * w) / torch.sum(w)
+            if mode == "weighted_product":
+                return torch.exp(torch.sum(w * torch.log(v + eps)))
+            if mode == "weighted_geometric_mean":
+                return torch.exp(torch.sum(w * torch.log(v + eps)) / torch.sum(w))
+
+            # Fallback
+            return torch.max(v)
+
+        # ================================================================== #
+        # 1) Overlap penalties with buffer (torch)
+        # ================================================================== #
+        overlap_vals_t    = []
+        overlap_weights_t = []
+
+        if no_ov_enabled:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    li = left[i]   - ov_buffer
+                    ri = right[i]  + ov_buffer
+                    bi = bottom[i] - ov_buffer
+                    ti = top[i]    + ov_buffer
+
+                    lj = left[j]   - ov_buffer
+                    rj = right[j]  + ov_buffer
+                    bj = bottom[j] - ov_buffer
+                    tj = top[j]    + ov_buffer
+
+                    overlap_x = torch.clamp(
+                        torch.min(ri, rj) - torch.max(li, lj), min=0.0
+                    )
+                    overlap_y = torch.clamp(
+                        torch.min(ti, tj) - torch.max(bi, bj), min=0.0
+                    )
+                    overlap_area = overlap_x * overlap_y
+
+                    if torch.any(overlap_area > 0.0):
+                        v_norm = _norm_overlap_t(overlap_area, i, j)
+                        if torch.any(v_norm > 0.0):
+                            overlap_vals_t.append(v_norm)
+                            # Area-based weight for the pair
+                            overlap_weights_t.append(areas[i] + areas[j])
+
+        overlap_violation_t = _aggregate_t(
+            overlap_vals_t, overlap_weights_t, ov_agg_mode
+        )
+
+        # ================================================================== #
+        # 2) Minimum spacing violations (torch)
+        # ================================================================== #
+        spacing_x_vals_t    = []
+        spacing_y_vals_t    = []
+        spacing_x_weights_t = []
+        spacing_y_weights_t = []
+
+        if spacing_enabled and (min_dx > 0.0 or min_dy > 0.0):
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # Horizontal gap
+                    cond_i_left = right[i] <= left[j]
+                    cond_j_left = right[j] <= left[i]
+
+                    gap_x = torch.where(
+                        cond_i_left,
+                        left[j] - right[i],
+                        torch.where(
+                            cond_j_left,
+                            left[i] - right[j],
+                            torch.tensor(0.0, device=device),
+                        ),
+                    )
+
+                    # Vertical gap
+                    cond_i_below = top[i] <= bottom[j]
+                    cond_j_below = top[j] <= bottom[i]
+
+                    gap_y = torch.where(
+                        cond_i_below,
+                        bottom[j] - top[i],
+                        torch.where(
+                            cond_j_below,
+                            bottom[i] - top[j],
+                            torch.tensor(0.0, device=device),
+                        ),
+                    )
+
+                    if min_dx > 0.0:
+                        v_x = torch.clamp(
+                            torch.tensor(min_dx, device=device) - gap_x, min=0.0
+                        )
+                        if torch.any(v_x > 0.0):
+                            v_x_norm = _norm_spacing_or_boundary_t(
+                                v_x, i=i, j=j, is_boundary=False
+                            )
+                            spacing_x_vals_t.append(v_x_norm)
+                            spacing_x_weights_t.append(perimeters[i] + perimeters[j])
+
+                    if min_dy > 0.0:
+                        v_y = torch.clamp(
+                            torch.tensor(min_dy, device=device) - gap_y, min=0.0
+                        )
+                        if torch.any(v_y > 0.0):
+                            v_y_norm = _norm_spacing_or_boundary_t(
+                                v_y, i=i, j=j, is_boundary=False
+                            )
+                            spacing_y_vals_t.append(v_y_norm)
+                            spacing_y_weights_t.append(perimeters[i] + perimeters[j])
+
+        spacing_x_violation_t = _aggregate_t(
+            spacing_x_vals_t, spacing_x_weights_t, sp_agg_mode
+        )
+        spacing_y_violation_t = _aggregate_t(
+            spacing_y_vals_t, spacing_y_weights_t, sp_agg_mode
+        )
+
+        # ================================================================== #
+        # 3) Bounding-box aspect-ratio violation (torch)
+        # ================================================================== #
+        bbox_ar = bbox_w / bbox_h
+        if not bbox_ar_enabled:
+            bbox_ar_violation_t = torch.tensor(0.0, device=device)
+        else:
+            if ar_mode == "less_than":
+                bbox_ar_violation_t = torch.clamp(
+                    bbox_ar - target_ar, min=0.0
+                )
+            else:
+                bbox_ar_violation_t = torch.clamp(
+                    target_ar - bbox_ar, min=0.0
+                )
+
+        # ================================================================== #
+        # 4) Boundary violations (torch)
+        # ================================================================== #
+        boundary_vals_t    = []
+        boundary_weights_t = []
+
+        if boundary_enabled:
+            for i in range(n):
+                v = torch.tensor(0.0, device=device)
+                if left[i] < 0.0:
+                    v = v + (-left[i])
+                if right[i] > canvas_w:
+                    v = v + (right[i] - canvas_w)
+                if bottom[i] < 0.0:
+                    v = v + (-bottom[i])
+                if top[i] > canvas_h:
+                    v = v + (top[i] - canvas_h)
+
+                if torch.any(v > 0.0):
+                    v_norm = _norm_spacing_or_boundary_t(
+                        v, i=i, j=None, is_boundary=True
+                    )
+                    boundary_vals_t.append(v_norm)
+                    boundary_weights_t.append(perimeters[i])
+
+        boundary_violation_t = _aggregate_t(
+            boundary_vals_t, boundary_weights_t, bd_agg_mode
+        )
+
+        # ------------------------------------------------------------------ #
+        # Combine with penalty weights (UNCHANGED names/semantics)
+        # ------------------------------------------------------------------ #
+        w_overlap  = float(self.penalty_weights.get("no_overlap", 0.0))
+        w_spacing  = float(self.penalty_weights.get("min_spacing", 0.0))
+        w_bbox_ar  = float(self.penalty_weights.get("bbox_aspect_ratio", 0.0))
+        w_boundary = float(self.penalty_weights.get("canvas_boundary", 0.0))
+
+        penalty_t = (
+            w_overlap  * (overlap_violation_t ** 2)
+            + w_spacing * (spacing_x_violation_t ** 2 + spacing_y_violation_t ** 2)
+            + w_bbox_ar * (bbox_ar_violation_t ** 2)
+            + w_boundary * (boundary_violation_t ** 2)
+        )
+
+        # NOTE:
+        # If in your previous version this function returned:
+        #   base_objective_t + penalty_t
+        # then simply do:
+        #   return base_objective_t + penalty_t
+        # instead of returning penalty_t alone.
+        return penalty_t
+
+
+    def _constraints_from_centres(self, centres):
+        """
+        Compute constraint metrics from rectangle centres.
+
+        This version adds flexible normalisation and aggregation options for:
+          - Overlap penalties (self.constraints_cfg["no_overlap"])
+          - Minimum spacing penalties (self.constraints_cfg["min_spacing"])
+          - Canvas boundary penalties (self.constraints_cfg["canvas_boundary"])
+
+        It ALSO computes four additional *visualisation-only* secondary parameters:
+          - global_spread_radius
+          - anisotropy_index
+          - crowding_index
+          - connectivity_stretch_index
+
+        Everything else (signature, returned keys used by the rest of the code)
+        remains compatible with the previous implementation.
+        """
+        import numpy as np  # keep local to avoid circular import issues
+
+        cons_cfg = self.constraints_cfg
+
+        # ------------------------------------------------------------------ #
+        # Convenience handles for constraint sub-configs (with safe defaults)
+        # ------------------------------------------------------------------ #
+        no_ov_cfg    = cons_cfg.get("no_overlap", {}) or {}
+        spacing_cfg  = cons_cfg.get("min_spacing", {}) or {}
+        bbox_ar_cfg  = cons_cfg.get("bbox_aspect_ratio", {}) or {}
+        boundary_cfg = cons_cfg.get("canvas_boundary", {}) or {}
+
+        no_ov_enabled    = bool(no_ov_cfg.get("enabled", False))
+        spacing_enabled  = bool(spacing_cfg.get("enabled", False))
+        bbox_ar_enabled  = bool(bbox_ar_cfg.get("enabled", False))
+        boundary_enabled = bool(boundary_cfg.get("enabled", False))
+
+        # Normalisation and aggregation modes with backwards-compatible defaults
+        ov_norm_mode  = str(no_ov_cfg.get("normalization", "min_pair_area"))
+        ov_agg_mode   = str(no_ov_cfg.get("aggregation",  "max"))
+        ov_buffer     = float(no_ov_cfg.get("buffer", 0.0))   # new buffer zone
+
+        sp_norm_mode  = str(spacing_cfg.get("normalization", "no norm"))
+        sp_agg_mode   = str(spacing_cfg.get("aggregation",  "max"))
+
+        bd_norm_mode  = str(boundary_cfg.get("normalization", "no norm"))
+        bd_agg_mode   = str(boundary_cfg.get("aggregation",  "sum"))
+
+        # Thresholds and aspect-ratio params (unchanged semantics)
+        min_dx = float(spacing_cfg.get("min_dx", 0.0))
+        min_dy = float(spacing_cfg.get("min_dy", 0.0))
+
+        target_ar = float(bbox_ar_cfg.get("target_ar", 1.0))
+        ar_mode   = str(bbox_ar_cfg.get("mode", "less_than"))  # "less_than" or "greater_than"
+
+        canvas_w = float(self.canvas_width)
+        canvas_h = float(self.canvas_height)
+        canvas_area      = max(canvas_w * canvas_h, 1e-9)
+        canvas_perimeter = max(2.0 * (canvas_w + canvas_h), 1e-9)
+
+        # ------------------------------------------------------------------ #
+        # Geometry arrays
+        # ------------------------------------------------------------------ #
+        n = len(self.rectangles)
+        if n == 0:
+            # Degenerate case: no rectangles at all
+            return dict(
+                overlap_max_ratio=0.0,
+                spacing_x_violation=0.0,
+                spacing_y_violation=0.0,
+                bbox_ar_violation=0.0,
+                boundary_violation=0.0,
+                global_spread_radius=0.0,
+                anisotropy_index=0.0,
+                crowding_index=0.0,
+                connectivity_stretch_index=0.0,
+            )
+
+        centres_arr = np.asarray(centres, dtype=float).reshape(n, 2)
+        cx = centres_arr[:, 0]
+        cy = centres_arr[:, 1]
+
+        widths  = np.array([r["w"] for r in self.rectangles], dtype=float)
+        heights = np.array([r["h"] for r in self.rectangles], dtype=float)
+
+        half_w = 0.5 * widths
+        half_h = 0.5 * heights
+
+        left   = cx - half_w
+        right  = cx + half_w
+        bottom = cy - half_h
+        top    = cy + half_h
+
+        areas      = widths * heights
+        perimeters = 2.0 * (widths + heights)
+
+        total_rect_area  = max(float(areas.sum()), 1e-9)
+        max_rect_area    = max(float(areas.max()), 1e-9)
+        min_rect_area    = max(float(areas.min()), 1e-9)
+
+        total_rect_perim = max(float(perimeters.sum()), 1e-9)
+        max_rect_perim   = max(float(perimeters.max()), 1e-9)
+        min_rect_perim   = max(float(perimeters.min()), 1e-9)
+
+        # Bounding box (for aspect-ratio constraint and some normalisations)
+        bbox_left, bbox_right   = float(left.min()),   float(right.max())
+        bbox_bottom, bbox_top   = float(bottom.min()), float(top.max())
+        bbox_w = max(bbox_right - bbox_left, 1e-9)
+        bbox_h = max(bbox_top   - bbox_bottom, 1e-9)
+        bbox_area      = max(bbox_w * bbox_h, 1e-9)
+        bbox_perimeter = max(2.0 * (bbox_w + bbox_h), 1e-9)
+
+        # ------------------------------------------------------------------ #
+        # Helper: normalisation for overlaps (area-based)
+        # ------------------------------------------------------------------ #
+        def _norm_overlap(raw_val: float, i: int, j: int) -> float:
+            """Normalise a single pairwise overlap penalty value."""
+            if raw_val <= 0.0:
+                return 0.0
+
+            ai = areas[i]
+            aj = areas[j]
+
+            if ov_norm_mode == "no norm":
+                denom = 1.0
+            elif ov_norm_mode == "min_pair_area":
+                denom = max(float(min(ai, aj)), 1e-9)
+            elif ov_norm_mode == "max_pair_area":
+                denom = max(float(max(ai, aj)), 1e-9)
+            elif ov_norm_mode == "sum_pair_area":
+                denom = max(float(ai + aj), 1e-9)
+            elif ov_norm_mode == "total_rect_area":
+                denom = total_rect_area
+            elif ov_norm_mode == "max_canvas_rect_area":
+                denom = max_rect_area
+            elif ov_norm_mode == "min_canvas_rect_area":
+                denom = min_rect_area
+            elif ov_norm_mode == "bbox_area":
+                denom = bbox_area
+            elif ov_norm_mode == "canvas_area":
+                denom = canvas_area
+            else:
+                # Fallback to the old behaviour (min_pair_area like overlap ratio)
+                denom = max(float(min(ai, aj)), 1e-9)
+
+            return float(raw_val) / denom
+
+        # ------------------------------------------------------------------ #
+        # Helper: normalisation for spacing / boundary (perimeter-based)
+        # ------------------------------------------------------------------ #
+        def _norm_spacing_or_boundary(raw_val: float,
+                                      i: int | None = None,
+                                      j: int | None = None,
+                                      is_boundary: bool = False) -> float:
+            """
+            Normalise spacing or boundary violation values.
+
+            - For spacing we treat (i,j) as a pair of rectangles.
+            - For boundary we only have a single rectangle index i.
+
+            Normalisation modes follow:
+              sp_norm_mode for spacing,
+              bd_norm_mode for boundary.
+            """
+            if raw_val <= 0.0:
+                return 0.0
+
+            mode = bd_norm_mode if is_boundary else sp_norm_mode
+
+            if mode == "no norm":
+                denom = 1.0
+
+            elif mode == "self_rect_perimeter":
+                # For boundary → perimeter of that single rectangle.
+                # For spacing → perimeter of the "smaller" rectangle in the pair.
+                if is_boundary:
+                    denom = max(float(perimeters[i]), 1e-9)
+                else:
+                    if i is None or j is None:
+                        denom = max_rect_perim
+                    else:
+                        denom = max(float(min(perimeters[i], perimeters[j])), 1e-9)
+
+            elif mode == "total_rect_perimeter":
+                denom = total_rect_perim
+            elif mode == "max_rect_perimeter":
+                denom = max_rect_perim
+            elif mode == "min_rect_perimeter":
+                denom = min_rect_perim
+            elif mode == "bbox_perimeter":
+                denom = bbox_perimeter
+            elif mode == "canvas_perimeter":
+                denom = canvas_perimeter
+            else:
+                # Reasonable fallback
+                denom = 1.0
+
+            return float(raw_val) / denom
+
+        # ------------------------------------------------------------------ #
+        # Helper: generic aggregation (scalar list + optional weights)
+        # ------------------------------------------------------------------ #
+        def _aggregate(values, weights, mode: str) -> float:
+            """
+            Aggregate a list of scalar penalties according to 'mode'.
+
+            Supported modes:
+              - max, sum, product, mean, geometric_mean
+              - weighted_sum, weighted_mean, weighted_product, weighted_geometric_mean
+
+            Weighted cases:
+              - For overlaps: weights are based on (area_i + area_j).
+              - For spacing: weights are based on (perimeter_i + perimeter_j).
+              - For boundary: weights are perimeter_i.
+            """
+            if not values:
+                return 0.0
+
+            v = np.array(values, dtype=float)
+            w = np.array(weights, dtype=float) if weights is not None else None
+            eps = 1e-12
+
+            if mode == "max":
+                return float(v.max())
+            if mode == "sum":
+                return float(v.sum())
+            if mode == "product":
+                return float(np.prod(v))
+            if mode == "mean":
+                return float(v.mean())
+            if mode == "geometric_mean":
+                return float(np.exp(np.mean(np.log(v + eps))))
+
+            # Weighted variants
+            if w is None or w.sum() <= 0.0:
+                # Fallback: unweighted mean if weights are unavailable / degenerate
+                return float(v.mean())
+
+            if mode == "weighted_sum":
+                return float(np.sum(v * w))
+            if mode == "weighted_mean":
+                return float(np.sum(v * w) / np.sum(w))
+            if mode == "weighted_product":
+                # product_i v_i^{w_i} = exp( sum_i w_i * log(v_i) )
+                return float(np.exp(np.sum(w * np.log(v + eps))))
+            if mode == "weighted_geometric_mean":
+                # exp( sum_i w_i * log(v_i) / sum_i w_i )
+                return float(np.exp(np.sum(w * np.log(v + eps)) / np.sum(w)))
+
+            # Fallback: behave like "max" if unknown
+            return float(v.max())
+
+        # ================================================================== #
+        # 1) Overlap penalties with buffer augmentation
+        # ================================================================== #
+        overlap_vals    = []
+        overlap_weights = []
+
+        if no_ov_enabled:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # Augmented rectangles using the configured buffer (if any)
+                    li = left[i]   - ov_buffer
+                    ri = right[i]  + ov_buffer
+                    bi = bottom[i] - ov_buffer
+                    ti = top[i]    + ov_buffer
+
+                    lj = left[j]   - ov_buffer
+                    rj = right[j]  + ov_buffer
+                    bj = bottom[j] - ov_buffer
+                    tj = top[j]    + ov_buffer
+
+                    # Overlap extents using augmented boxes
+                    overlap_x = max(0.0, min(ri, rj) - max(li, lj))
+                    overlap_y = max(0.0, min(ti, tj) - max(bi, bj))
+                    overlap_area = overlap_x * overlap_y
+
+                    if overlap_area > 0.0:
+                        norm_val = _norm_overlap(overlap_area, i, j)
+                        if norm_val > 0.0:
+                            overlap_vals.append(norm_val)
+                            # Use sum of areas of the pair as weight
+                            overlap_weights.append(float(areas[i] + areas[j]))
+
+        overlap_max_ratio = _aggregate(overlap_vals, overlap_weights, ov_agg_mode)
+
+        # ================================================================== #
+        # 2) Minimum spacing violations (horizontal & vertical)
+        # ================================================================== #
+        spacing_x_vals     = []
+        spacing_y_vals     = []
+        spacing_x_weights  = []
+        spacing_y_weights  = []
+
+        # For crowding index we also store per-pair gaps
+        # pairwise_gap[i][j] → list of g_ij_hat values
+        pairwise_gap = [[[] for _ in range(n)] for _ in range(n)]
+
+        if spacing_enabled and (min_dx > 0.0 or min_dy > 0.0):
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # Horizontal clearance
+                    if right[i] <= left[j]:
+                        gap_x = left[j] - right[i]
+                    elif right[j] <= left[i]:
+                        gap_x = left[i] - right[j]
+                    else:
+                        # Intersecting in x → zero clearance
+                        gap_x = 0.0
+
+                    # Vertical clearance
+                    if top[i] <= bottom[j]:
+                        gap_y = bottom[j] - top[i]
+                    elif top[j] <= bottom[i]:
+                        gap_y = bottom[i] - top[j]
+                    else:
+                        gap_y = 0.0
+
+                    # Effective gap for crowding index:
+                    # treat negative as 0, then take min of x/y clearance.
+                    g_eff = min(max(gap_x, 0.0), max(gap_y, 0.0))
+                    pairwise_gap[i][j].append(g_eff)
+                    pairwise_gap[j][i].append(g_eff)
+
+                    # Horizontal violation vs min_dx
+                    if min_dx > 0.0:
+                        v_x = max(0.0, min_dx - gap_x)
+                        if v_x > 0.0:
+                            v_x_norm = _norm_spacing_or_boundary(
+                                v_x, i=i, j=j, is_boundary=False
+                            )
+                            if v_x_norm > 0.0:
+                                spacing_x_vals.append(v_x_norm)
+                                spacing_x_weights.append(float(perimeters[i] + perimeters[j]))
+
+                    # Vertical violation vs min_dy
+                    if min_dy > 0.0:
+                        v_y = max(0.0, min_dy - gap_y)
+                        if v_y > 0.0:
+                            v_y_norm = _norm_spacing_or_boundary(
+                                v_y, i=i, j=j, is_boundary=False
+                            )
+                            if v_y_norm > 0.0:
+                                spacing_y_vals.append(v_y_norm)
+                                spacing_y_weights.append(float(perimeters[i] + perimeters[j]))
+
+        spacing_x_violation = _aggregate(spacing_x_vals, spacing_x_weights, sp_agg_mode)
+        spacing_y_violation = _aggregate(spacing_y_vals, spacing_y_weights, sp_agg_mode)
+
+        # ================================================================== #
+        # 3) Bounding-box aspect ratio violation (unchanged semantics)
+        # ================================================================== #
+        bbox_ar = bbox_w / bbox_h
+        if not bbox_ar_enabled:
+            bbox_ar_violation = 0.0
+        else:
+            if ar_mode == "less_than":
+                # enforce: bbox_ar <= target_ar
+                bbox_ar_violation = max(0.0, bbox_ar - target_ar)
+            else:
+                # enforce: bbox_ar >= target_ar
+                bbox_ar_violation = max(0.0, target_ar - bbox_ar)
+
+        # ================================================================== #
+        # 4) Boundary violations with perimeter-based normalisation
+        # ================================================================== #
+        boundary_vals    = []
+        boundary_weights = []
+
+        if boundary_enabled:
+            for i in range(n):
+                v = 0.0
+                if left[i] < 0.0:
+                    v += -left[i]
+                if right[i] > canvas_w:
+                    v += right[i] - canvas_w
+                if bottom[i] < 0.0:
+                    v += -bottom[i]
+                if top[i] > canvas_h:
+                    v += top[i] - canvas_h
+
+                if v > 0.0:
+                    v_norm = _norm_spacing_or_boundary(
+                        v, i=i, j=None, is_boundary=True
+                    )
+                    if v_norm > 0.0:
+                        boundary_vals.append(v_norm)
+                        boundary_weights.append(float(perimeters[i]))
+
+        boundary_violation = _aggregate(boundary_vals, boundary_weights, bd_agg_mode)
+
+        # ================================================================== #
+        # 5) Secondary parameters (visualisation only)
+        # ================================================================== #
+
+        # --- (1) Global spread radius R_rms ------------------------------
+        c_mean = centres_arr.mean(axis=0)
+        diff   = centres_arr - c_mean
+        sq_dists = np.sum(diff**2, axis=1)
+        global_spread_radius = float(np.sqrt(np.mean(sq_dists))) if n > 0 else 0.0
+
+        # --- (2) Anisotropy of centre spread α ---------------------------
+        if n >= 2:
+            C = (diff.T @ diff) / float(n)   # 2x2 covariance matrix
+            evals = np.linalg.eigvalsh(C)    # sorted small..large
+            lam2, lam1 = float(evals[0]), float(evals[1])
+            if lam1 + lam2 > 1e-12:
+                anisotropy_index = float((lam1 - lam2) / (lam1 + lam2))
+            else:
+                anisotropy_index = 0.0
+        else:
+            anisotropy_index = 0.0
+
+        # --- (3) Local crowding / packing index C_pack -------------------
+        # Uses spacing config's aggregation mode for both inner and outer
+        # aggregations as requested.
+        if spacing_enabled and n > 1:
+            # Δ_ : stricter (smaller) of dx,dy if both > 0, otherwise 1.0
+            deltas = [d for d in (min_dx, min_dy) if d > 0.0]
+            delta_req = min(deltas) if deltas else 1.0
+
+            # For each rectangle i, aggregate gaps g_ij over j≠i
+            per_rect_gap = []
+            for i in range(n):
+                gaps_ij    = []
+                weights_ij = []
+                for j in range(n):
+                    if i == j:
+                        continue
+                    # We stored g_ij only once in pairwise_gap[min(i,j)][max(i,j)]
+                    idx_i = min(i, j)
+                    idx_j = max(i, j)
+                    for g_ij in pairwise_gap[idx_i][idx_j]:
+                        gaps_ij.append(g_ij)
+                        # Pair weight based on perimeter (consistent with spacing)
+                        weights_ij.append(float(perimeters[i] + perimeters[j]))
+
+                if gaps_ij:
+                    g_i = _aggregate(gaps_ij, weights_ij, sp_agg_mode)
+                else:
+                    g_i = 0.0
+                per_rect_gap.append(g_i)
+
+            # Now normalise by required spacing and aggregate over rectangles
+            r_vals        = [g_i / max(delta_req, 1e-9) for g_i in per_rect_gap]
+            rect_weights  = [float(perimeters[i]) for i in range(n)]
+            crowding_index = _aggregate(r_vals, rect_weights, sp_agg_mode)
+        else:
+            crowding_index = 0.0
+
+        # --- (4) Connectivity stretch index S_conn via MST ---------------
+        if n <= 1:
+            connectivity_stretch_index = 0.0
+        else:
+            # Pairwise Euclidean distances between centres
+            dx_mat = cx.reshape(-1, 1) - cx.reshape(1, -1)
+            dy_mat = cy.reshape(-1, 1) - cy.reshape(1, -1)
+            dist_mat = np.sqrt(dx_mat**2 + dy_mat**2)
+
+            # Prim's MST algorithm (O(N^2), OK for moderate N)
+            N = n
+            in_mst = np.zeros(N, dtype=bool)
+            key    = np.full(N, np.inf)
+            key[0] = 0.0
+
+            for _ in range(N):
+                # pick vertex u not in MST with smallest key[u]
+                u = np.argmin(np.where(in_mst, np.inf, key))
+                in_mst[u] = True
+                for v in range(N):
+                    if not in_mst[v] and dist_mat[u, v] < key[v]:
+                        key[v] = dist_mat[u, v]
+
+            # keys[1:] correspond to MST edge lengths
+            mst_edges = key[1:]
+            L_bar     = float(np.mean(mst_edges)) if len(mst_edges) > 0 else 0.0
+            canvas_diag = max(np.sqrt(canvas_w**2 + canvas_h**2), 1e-9)
+            connectivity_stretch_index = L_bar / canvas_diag
+
+        # ------------------------------------------------------------------ #
+        # Return constraints dictionary (keys used elsewhere remain the same)
+        # ------------------------------------------------------------------ #
+        return dict(
+            overlap_max_ratio=float(overlap_max_ratio),
+            spacing_x_violation=float(spacing_x_violation),
+            spacing_y_violation=float(spacing_y_violation),
+            bbox_ar_violation=float(bbox_ar_violation),
+            boundary_violation=float(boundary_violation),
+            # secondary visual-only parameters
+            global_spread_radius=float(global_spread_radius),
+            anisotropy_index=float(anisotropy_index),
+            crowding_index=float(crowding_index),
+            connectivity_stretch_index=float(connectivity_stretch_index),
+        )
+
+
