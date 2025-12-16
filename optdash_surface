@@ -1,0 +1,557 @@
+import plotly.graph_objects as go
+pn.extension("tabulator", "plotly", raw_css=[DASHBOARD_CSS])
+
+# --------------------------- SURFACE PLOT CONFIG ---------------------
+
+# Default size of the surface plot in the UI
+SURFACE_PLOT_DEFAULT_WIDTH = 400
+SURFACE_PLOT_DEFAULT_HEIGHT = 400
+
+# Grid resolution for the surface (X,Y)
+SURFACE_GRID_SIZE = 25
+
+# Mapping between nice labels and metric keys
+SURFACE_METRIC_OPTIONS = {
+    "Global Spread Radius": "global_spread_radius",
+    "Anisotropy Index": "anisotropy_index",
+    "Crowding Index": "crowding_index",
+    "Connectivity Stretch Index": "connectivity_stretch_index",
+    "Augmented Objective": "objective_augmented",
+}
+
+# Reverse map: metric key -> label
+SURFACE_METRIC_LABELS = {v: k for k, v in SURFACE_METRIC_OPTIONS.items()}
+
+# Internal flag to avoid re-entrant slider/plot updates
+surface_updating = False
+
+    def register_step(self, algo_name: str, x: np.ndarray, target_obj: float = 0.0):
+        """
+        Called by optimizers to record a single placement (one iteration
+        or generation). Append to history and buffer for streaming.
+        Also stores the 4 secondary geometric quantities used by the
+        surface plot:
+          - global_spread_radius
+          - anisotropy_index
+          - crowding_index
+          - connectivity_stretch_index
+        """
+        if self.problem is None:
+            return
+
+        with self._lock:
+            # Update counters
+            self.iteration += 1
+            self.placement_counter += 1
+            iteration = self.iteration
+            placement_id = self.placement_counter
+
+            # Compute metrics (assumes your compute_metrics already returns
+            # the 4 secondary quantities).
+            metrics = self.problem.compute_metrics(x)
+
+            global_spread_radius = float(metrics.get("global_spread_radius", 0.0))
+            anisotropy_index = float(metrics.get("anisotropy_index", 0.0))
+            crowding_index = float(metrics.get("crowding_index", 0.0))
+            connectivity_stretch_index = float(
+                metrics.get("connectivity_stretch_index", 0.0)
+            )
+
+            # Track best solution based on augmented objective
+            if (
+                self.best_metrics is None
+                or metrics["objective_augmented"] < self.best_metrics["objective_augmented"]
+            ):
+                self.best_x = np.array(x, dtype=float)
+                self.best_metrics = metrics
+
+            # Build record for history/logs/surface plot
+            rec = {
+                "iteration": iteration,
+                "placement_id": placement_id,
+                "algo": algo_name,
+                "objective_pure": float(metrics["objective_pure"]),
+                "objective_augmented": float(metrics["objective_augmented"]),
+                "hpwl": float(metrics["hpwl"]),
+                "bbox_aspect": float(metrics["bbox_aspect"]),
+                "bbox_area": float(metrics["bbox_area"]),
+                "overlap_max_ratio": float(metrics["overlap_max_ratio"]),
+                "spacing_x_violation": float(metrics["spacing_x_violation"]),
+                "spacing_y_violation": float(metrics["spacing_y_violation"]),
+                "bbox_ar_violation": float(metrics["bbox_ar_violation"]),
+                "boundary_violation": float(metrics["boundary_violation"]),
+                # Secondary geometric quantities (for surface plot)
+                "global_spread_radius": global_spread_radius,
+                "anisotropy_index": anisotropy_index,
+                "crowding_index": crowding_index,
+                "connectivity_stretch_index": connectivity_stretch_index,
+                # Store variables for reconstructing placements
+                "x_vector": x.tolist(),
+            }
+
+            # Append to history and step buffer
+            self._history_records.append(rec)
+            self._pending_steps.append(rec)
+
+            # Early stopping if target objective reached
+            if target_obj > 0.0 and metrics["objective_augmented"] <= target_obj:
+                self._stop_event.set()
+                self._update_status("optimization over (target reached)")
+
+
+# --------------------------------------------------------------------
+# SURFACE PLOT WIDGETS (NOT YET ADDED TO ANY TAB)
+# --------------------------------------------------------------------
+
+# Axis / colour / slider selectors
+surface_x_select = pn.widgets.Select(
+    name="Surface X",
+    options=SURFACE_METRIC_OPTIONS,
+    value="global_spread_radius",  # default
+    width=180,
+)
+
+surface_y_select = pn.widgets.Select(
+    name="Surface Y",
+    options=SURFACE_METRIC_OPTIONS,
+    value="anisotropy_index",
+    width=180,
+)
+
+surface_z_select = pn.widgets.Select(
+    name="Surface Z",
+    options=SURFACE_METRIC_OPTIONS,
+    value="objective_augmented",
+    width=180,
+)
+
+surface_color_select = pn.widgets.Select(
+    name="Surface Colour",
+    options=SURFACE_METRIC_OPTIONS,
+    value="crowding_index",
+    width=180,
+)
+
+surface_slider_metric_select = pn.widgets.Select(
+    name="Slider Metric",
+    options=SURFACE_METRIC_OPTIONS,
+    value="connectivity_stretch_index",
+    width=180,
+)
+
+surface_slider = pn.widgets.FloatSlider(
+    name="Metric Slice",
+    start=0.0,
+    end=1.0,
+    value=0.5,
+    step=0.01,
+    width=250,
+)
+
+# Plotly pane to hold the 3D surface
+# (You can place this in any tab/column/row you like.)
+if go is not None:
+    surface_plot_pane = pn.pane.Plotly(
+        height=SURFACE_PLOT_DEFAULT_HEIGHT,
+        width=SURFACE_PLOT_DEFAULT_WIDTH,
+        config={"displaylogo": False},
+    )
+else:
+    # Fallback if plotly is not installed: simple text pane.
+    surface_plot_pane = pn.pane.Markdown(
+        "Plotly is not installed. Install `plotly` to see the surface plot.",
+        style={"color": UI_TEXT_COLOR},
+    )
+
+# Optional convenience container you can drop into a tab if you want:
+surface_controls_panel = pn.Column(
+    pn.pane.Markdown("**Surface Plot Controls**", style={"color": UI_TEXT_COLOR}),
+    surface_x_select,
+    surface_y_select,
+    surface_z_select,
+    surface_color_select,
+    surface_slider_metric_select,
+    surface_slider,
+)
+
+
+# --------------------------------------------------------------------
+# SURFACE PLOT DATA HELPERS
+# --------------------------------------------------------------------
+
+def _get_surface_dataframe():
+    """
+    Build a DataFrame of secondary metrics + augmented objective
+    from manager._history_records.
+
+    Columns:
+      - global_spread_radius
+      - anisotropy_index
+      - crowding_index
+      - connectivity_stretch_index
+      - objective_augmented
+
+    Returns None if there is not enough valid data.
+    """
+    if not manager._history_records:
+        return None
+
+    rows = []
+    for rec in manager._history_records:
+        g = rec.get("global_spread_radius")
+        a = rec.get("anisotropy_index")
+        c = rec.get("crowding_index")
+        s = rec.get("connectivity_stretch_index")
+        obj = rec.get("objective_augmented")
+        if None in (g, a, c, s, obj):
+            continue
+        rows.append(
+            {
+                "global_spread_radius": float(g),
+                "anisotropy_index": float(a),
+                "crowding_index": float(c),
+                "connectivity_stretch_index": float(s),
+                "objective_augmented": float(obj),
+            }
+        )
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows, dtype=float)
+    return df
+
+
+def _fix_metric_range(lo: float, hi: float) -> Tuple[float, float]:
+    """
+    Ensure a metric range is non-degenerate and finite.
+    If lo == hi or range is invalid, expand a small symmetric band.
+    """
+    if not math.isfinite(lo) or not math.isfinite(hi):
+        lo, hi = 0.0, 1.0
+    if hi <= lo:
+        # Expand around this value a bit
+        delta = 0.5 if lo == 0.0 else max(abs(lo) * 0.1, 0.5)
+        lo -= delta
+        hi += delta
+    return lo, hi
+
+
+def _recompute_surface_plot(event=None):
+    """
+    Build / update the 3D surface plot based on:
+      - x-axis: chosen metric
+      - y-axis: chosen metric
+      - z-axis: chosen metric
+      - colour: chosen metric
+      - slider: chosen metric
+
+    The surface is built from all historical placements:
+      - Axes & colour ranges come from min/max of metrics across history.
+      - Surface geometry is a smoothed 2D grid in (x,y) for a fixed
+        'slider' value (4th dimension).
+      - A small red sphere marks the *current* optimiser location in
+        (x,y,z) space.
+    """
+    global surface_updating
+
+    if go is None:
+        # Plotly not available; nothing to do.
+        return
+
+    # Avoid re-entrant calls when we modify slider properties inside here.
+    if surface_updating:
+        return
+
+    surface_updating = True
+    try:
+        df = _get_surface_dataframe()
+        if df is None or len(df) < 2:
+            # Not enough data yet for a meaningful surface – show placeholder.
+            fig = go.Figure()
+            fig.update_layout(
+                title="Surface plot: waiting for optimisation data...",
+                scene=dict(
+                    xaxis=dict(title="X", showgrid=True, gridcolor=COLORS["grid"]),
+                    yaxis=dict(title="Y", showgrid=True, gridcolor=COLORS["grid"]),
+                    zaxis=dict(title="Z", showgrid=True, gridcolor=COLORS["grid"]),
+                    aspectmode="cube",
+                    camera=dict(
+                        projection=dict(type="orthographic"),
+                        eye=dict(x=1.5, y=1.5, z=1.0),
+                    ),
+                ),
+                paper_bgcolor=COLORS["panel_bg"],
+            )
+            surface_plot_pane.object = fig
+            return
+
+        # Compute min/max for each metric (including augmented objective)
+        metric_ranges = {
+            col: _fix_metric_range(float(df[col].min()), float(df[col].max()))
+            for col in df.columns
+        }
+
+        # Get chosen metrics
+        x_key = surface_x_select.value
+        y_key = surface_y_select.value
+        z_key = surface_z_select.value
+        color_key = surface_color_select.value
+        slider_key = surface_slider_metric_select.value
+
+        # Safety: all chosen keys must be present
+        for key in (x_key, y_key, z_key, color_key, slider_key):
+            if key not in metric_ranges:
+                # Should not happen if compute_metrics is consistent
+                fig = go.Figure()
+                fig.update_layout(
+                    title=f"Surface plot: missing metric '{key}'",
+                    paper_bgcolor=COLORS["panel_bg"],
+                )
+                surface_plot_pane.object = fig
+                return
+
+        # Ranges for axes, colour, slider
+        x_min, x_max = metric_ranges[x_key]
+        y_min, y_max = metric_ranges[y_key]
+        z_min, z_max = metric_ranges[z_key]
+        c_min, c_max = metric_ranges[color_key]
+        s_min, s_max = metric_ranges[slider_key]
+
+        # Ensure slider range, step, and value are consistent
+        slider_val = float(surface_slider.value)
+        if not math.isfinite(slider_val) or slider_val < s_min or slider_val > s_max:
+            slider_val = 0.5 * (s_min + s_max)
+
+        surface_slider.start = s_min
+        surface_slider.end = s_max
+        step = (s_max - s_min) / 100.0
+        if step <= 0:
+            step = 0.01
+        surface_slider.step = step
+        surface_slider.value = slider_val
+
+        # Extract arrays
+        x_data = df[x_key].values
+        y_data = df[y_key].values
+        z_data = df[z_key].values
+        c_data = df[color_key].values
+        s_data = df[slider_key].values
+
+        # Build a 2D grid in (x,y), smoothed along the slider dimension
+        nx = SURFACE_GRID_SIZE
+        ny = SURFACE_GRID_SIZE
+        gx = np.linspace(x_min, x_max, nx)
+        gy = np.linspace(y_min, y_max, ny)
+
+        Z = np.zeros((ny, nx), dtype=float)
+        C = np.zeros((ny, nx), dtype=float)
+        W = np.zeros((ny, nx), dtype=float)
+
+        s_range = s_max - s_min
+        sigma = 0.15 * s_range if s_range > 0 else 1.0
+        denom = 2.0 * sigma * sigma if sigma > 0 else 1.0
+
+        for xi, yi, zi, ci, si in zip(x_data, y_data, z_data, c_data, s_data):
+            if not (
+                math.isfinite(xi)
+                and math.isfinite(yi)
+                and math.isfinite(zi)
+                and math.isfinite(ci)
+                and math.isfinite(si)
+            ):
+                continue
+
+            # Weight based on how close this sample is in slider-metric space
+            w = math.exp(-((si - slider_val) ** 2) / denom)
+            if w < 1e-6:
+                continue
+
+            # Nearest grid cell indices
+            ix = int(round((xi - x_min) / (x_max - x_min) * (nx - 1)))
+            iy = int(round((yi - y_min) / (y_max - y_min) * (ny - 1)))
+            ix = min(max(ix, 0), nx - 1)
+            iy = min(max(iy, 0), ny - 1)
+
+            Z[iy, ix] += w * zi
+            C[iy, ix] += w * ci
+            W[iy, ix] += w
+
+        # Avoid degenerate cells: fill empty grid cells with global means
+        z_mean = float(np.mean(z_data)) if len(z_data) else 0.0
+        c_mean = float(np.mean(c_data)) if len(c_data) else 0.0
+
+        for iy in range(ny):
+            for ix in range(nx):
+                if W[iy, ix] > 0:
+                    Z[iy, ix] /= W[iy, ix]
+                    C[iy, ix] /= W[iy, ix]
+                else:
+                    Z[iy, ix] = z_mean
+                    C[iy, ix] = c_mean
+
+        # Current optimiser location -> red sphere
+        last_row = df.iloc[-1]
+        sphere_x = float(last_row[x_key])
+        sphere_y = float(last_row[y_key])
+        sphere_z = float(last_row[z_key])
+
+        # Build Plotly figure: orthographic projection + small grids
+        fig = go.Figure()
+
+        fig.add_surface(
+            x=gx,
+            y=gy,
+            z=Z,
+            surfacecolor=C,
+            cmin=c_min,
+            cmax=c_max,
+            colorscale="Viridis",
+            showscale=True,
+            name="Objective Surface",
+        )
+
+        fig.add_trace(
+            go.Scatter3d(
+                x=[sphere_x],
+                y=[sphere_y],
+                z=[sphere_z],
+                mode="markers",
+                marker=dict(
+                    size=4,
+                    color="red",
+                ),
+                name="Current Placement",
+            )
+        )
+
+        fig.update_layout(
+            scene=dict(
+                xaxis=dict(
+                    title=SURFACE_METRIC_LABELS.get(x_key, x_key),
+                    range=[x_min, x_max],
+                    showgrid=True,
+                    gridcolor=COLORS["grid"],
+                    gridwidth=1,
+                ),
+                yaxis=dict(
+                    title=SURFACE_METRIC_LABELS.get(y_key, y_key),
+                    range=[y_min, y_max],
+                    showgrid=True,
+                    gridcolor=COLORS["grid"],
+                    gridwidth=1,
+                ),
+                zaxis=dict(
+                    title=SURFACE_METRIC_LABELS.get(z_key, z_key),
+                    range=[z_min, z_max],
+                    showgrid=True,
+                    gridcolor=COLORS["grid"],
+                    gridwidth=1,
+                ),
+                aspectmode="cube",  # 1:1:1 scale (non-degenerate)
+                camera=dict(
+                    # Orthogonal projection for an "orthogonal view"
+                    projection=dict(type="orthographic"),
+                    eye=dict(x=1.5, y=1.5, z=1.2),
+                ),
+            ),
+            margin=dict(l=0, r=0, b=0, t=30),
+            paper_bgcolor=COLORS["panel_bg"],
+            plot_bgcolor=COLORS["panel_bg"],
+            font=dict(color=UI_TEXT_COLOR),
+        )
+
+        surface_plot_pane.object = fig
+
+    finally:
+        surface_updating = False
+
+
+
+
+def update_surface_slider_to_latest():
+    """
+    Called from the main periodic callback:
+    - Looks at the most recent history record.
+    - Updates the slider metric range [min, max].
+    - Sets the slider value to the current optimiser value for that metric.
+    This change in slider value triggers _recompute_surface_plot,
+    which rebuilds the surface and moves the red sphere.
+    """
+    global surface_updating
+
+    if go is None:
+        return
+
+    df = _get_surface_dataframe()
+    if df is None or df.empty:
+        return
+
+    slider_key = surface_slider_metric_select.value
+    if slider_key not in df.columns:
+        return
+
+    s_min_raw = float(df[slider_key].min())
+    s_max_raw = float(df[slider_key].max())
+    s_min, s_max = _fix_metric_range(s_min_raw, s_max_raw)
+
+    last_val = float(df[slider_key].iloc[-1])
+
+    surface_updating = True
+    try:
+        surface_slider.start = s_min
+        surface_slider.end = s_max
+        step = (s_max - s_min) / 100.0
+        if step <= 0:
+            step = 0.01
+        surface_slider.step = step
+
+        # Only change value if different, to minimise redundant redraws
+        if not math.isclose(surface_slider.value, last_val, rel_tol=1e-9, abs_tol=1e-9):
+            surface_slider.value = last_val
+        # Changing slider.value will trigger _recompute_surface_plot via watchers
+    finally:
+        surface_updating = False
+
+
+
+
+
+
+# Rebuild surface whenever the metric mapping or the slider value changes
+if go is not None:
+    surface_x_select.param.watch(_recompute_surface_plot, "value")
+    surface_y_select.param.watch(_recompute_surface_plot, "value")
+    surface_z_select.param.watch(_recompute_surface_plot, "value")
+    surface_color_select.param.watch(_recompute_surface_plot, "value")
+    surface_slider_metric_select.param.watch(_recompute_surface_plot, "value")
+    surface_slider.param.watch(_recompute_surface_plot, "value")
+
+    # Initial placeholder surface
+    _recompute_surface_plot()
+
+
+
+
+def _tick():
+    """
+    Periodic callback:
+      - Streams objective/constraint/canvas updates from manager.
+      - Keeps the surface plot slider synced to the current optimiser
+        position (which in turn updates the surface & sphere).
+    """
+    try:
+        target = float(target_objective_input.value or 0.0)
+    except Exception:
+        target = 0.0
+
+    if stop_strategy_radio.value == "max iter only":
+        target_local = 0.0
+    else:
+        target_local = target
+
+    # Update the main Bokeh plots (objective/constraints/canvas)
+    manager.periodic_update(target_local, canvas_fig)
+
+    # Update slider (and thus red sphere & surface) based on latest history
+    update_surface_slider_to_latest()
