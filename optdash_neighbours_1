@@ -1,0 +1,534 @@
+    def _constraints_from_centres(
+        self, centres: List[Tuple[float, float]]
+    ) -> Dict[str, float]:
+        """
+        Compute constraint violations given centres:
+        - overlap ratio
+        - spacing violations in x and y (only between immediate neighbours)
+        - bounding box aspect ratio violation
+        - boundary violation (outside canvas)
+        """
+        cons_cfg = self.constraints_cfg
+
+        no_ov = cons_cfg.get("no_overlap", {}).get("enabled", True)
+        min_sp = cons_cfg.get("min_spacing", {}).get("enabled", True)
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+
+        bbox_ar_enabled = bbox_ar_cfg.get("enabled", False)
+        boundary_enabled = boundary_cfg.get("enabled", True)
+
+        min_dx = float(cons_cfg.get("min_spacing", {}).get("min_dx", 0.0))
+        min_dy = float(cons_cfg.get("min_spacing", {}).get("min_dy", 0.0))
+
+        # Initialise aggregated violations
+        overlap_max_ratio = 0.0
+        spacing_x_violation = 0.0
+        spacing_y_violation = 0.0
+
+        # Precompute edges
+        edges = []
+        for (cx, cy), r in zip(centres, self.rectangles):
+            half_w = r.width / 2.0
+            half_h = r.height / 2.0
+            left = cx - half_w
+            right = cx + half_w
+            bottom = cy - half_h
+            top = cy + half_h
+            edges.append((left, right, bottom, top, r.width, r.height))
+
+        n = self.n_rects
+
+        # ------------------------------------------------------------------
+        # PRECOMPUTE NEIGHBOURS (vectorised) FOR SPACING ONLY
+        # ------------------------------------------------------------------
+        # We look for immediate neighbours for each rectangle:
+        #   - left & right neighbours (horizontal spacing)
+        #   - up & down neighbours   (vertical spacing)
+        #
+        # A horizontal neighbour must:
+        #   - be on the left/right side (by centre)
+        #   - vertically overlap or be within min_dy
+        #   - have the smallest positive horizontal gap in that direction
+        #
+        # A vertical neighbour must:
+        #   - be above/below (by centre)
+        #   - horizontally overlap or be within min_dx
+        #   - have the smallest positive vertical gap in that direction
+        # ------------------------------------------------------------------
+        right_idx = left_idx = up_idx = down_idx = None  # default if spacing disabled
+
+        if min_sp and n > 1:
+            left_arr = np.array([e[0] for e in edges], dtype=float)
+            right_arr = np.array([e[1] for e in edges], dtype=float)
+            bottom_arr = np.array([e[2] for e in edges], dtype=float)
+            top_arr = np.array([e[3] for e in edges], dtype=float)
+            cx_arr = np.array([c[0] for c in centres], dtype=float)
+            cy_arr = np.array([c[1] for c in centres], dtype=float)
+
+            left_i = left_arr[:, None]
+            left_j = left_arr[None, :]
+            right_i = right_arr[:, None]
+            right_j = right_arr[None, :]
+            bottom_i = bottom_arr[:, None]
+            bottom_j = bottom_arr[None, :]
+            top_i = top_arr[:, None]
+            top_j = top_arr[None, :]
+            cx_i = cx_arr[:, None]
+            cx_j = cx_arr[None, :]
+            cy_i = cy_arr[:, None]
+            cy_j = cy_arr[None, :]
+
+            # Vertical proximity (for horizontal neighbours)
+            overlap_y = np.minimum(top_i, top_j) - np.maximum(bottom_i, bottom_j)
+            vert_gap_mat = np.maximum(
+                0.0, np.maximum(bottom_i, bottom_j) - np.minimum(top_i, top_j)
+            )
+            vert_prox = (overlap_y > 0.0) | (vert_gap_mat <= min_dy)
+
+            # Horizontal proximity (for vertical neighbours)
+            overlap_x = np.minimum(right_i, right_j) - np.maximum(left_i, left_j)
+            horiz_gap_mat = np.maximum(
+                0.0, np.maximum(left_i, left_j) - np.minimum(right_i, right_j)
+            )
+            horiz_prox = (overlap_x > 0.0) | (horiz_gap_mat <= min_dx)
+
+            INF = 1e12
+
+            # Right neighbours -------------------------------------------------
+            gap_x_right = np.where(
+                cx_j > cx_i,
+                np.maximum(0.0, left_j - right_i),  # positive gap to the right
+                INF,
+            )
+            gap_x_right = np.where(vert_prox, gap_x_right, INF)
+            np.fill_diagonal(gap_x_right, INF)
+            right_idx = np.argmin(gap_x_right, axis=1)
+            right_gap = gap_x_right[np.arange(n), right_idx]
+            right_idx[~np.isfinite(right_gap)] = -1
+
+            # Left neighbours --------------------------------------------------
+            gap_x_left = np.where(
+                cx_j < cx_i,
+                np.maximum(0.0, left_i - right_j),  # positive gap to the left
+                INF,
+            )
+            gap_x_left = np.where(vert_prox, gap_x_left, INF)
+            np.fill_diagonal(gap_x_left, INF)
+            left_idx = np.argmin(gap_x_left, axis=1)
+            left_gap = gap_x_left[np.arange(n), left_idx]
+            left_idx[~np.isfinite(left_gap)] = -1
+
+            # Up neighbours ----------------------------------------------------
+            gap_y_up = np.where(
+                cy_j > cy_i,
+                np.maximum(0.0, bottom_j - top_i),  # positive gap above
+                INF,
+            )
+            gap_y_up = np.where(horiz_prox, gap_y_up, INF)
+            np.fill_diagonal(gap_y_up, INF)
+            up_idx = np.argmin(gap_y_up, axis=1)
+            up_gap = gap_y_up[np.arange(n), up_idx]
+            up_idx[~np.isfinite(up_gap)] = -1
+
+            # Down neighbours --------------------------------------------------
+            gap_y_down = np.where(
+                cy_j < cy_i,
+                np.maximum(0.0, bottom_i - top_j),  # positive gap below
+                INF,
+            )
+            gap_y_down = np.where(horiz_prox, gap_y_down, INF)
+            np.fill_diagonal(gap_y_down, INF)
+            down_idx = np.argmin(gap_y_down, axis=1)
+            down_gap = gap_y_down[np.arange(n), down_idx]
+            down_idx[~np.isfinite(down_gap)] = -1
+
+        # ------------------------------------------------------------------
+        # Pairwise checks (overlap as before; spacing only on neighbours)
+        # ------------------------------------------------------------------
+        for i in range(n):
+            left_i, right_i, bottom_i, top_i, wi, hi = edges[i]
+            area_i = wi * hi
+            for j in range(i + 1, n):
+                left_j, right_j, bottom_j, top_j, wj, hj = edges[j]
+                area_j = wj * hj
+
+                # Overlap area (unchanged)
+                overlap_x = max(0.0, min(right_i, right_j) - max(left_i, left_j))
+                overlap_y = max(0.0, min(top_i, top_j) - max(bottom_i, bottom_j))
+                overlap_area = overlap_x * overlap_y
+
+                if no_ov and overlap_area > 0.0:
+                    smaller_area = min(area_i, area_j)
+                    if smaller_area > 0:
+                        ratio = overlap_area / smaller_area
+                    else:
+                        ratio = 1.0
+                    overlap_max_ratio = max(overlap_max_ratio, ratio)
+
+                # Horizontal gap (unchanged)
+                if right_i <= left_j:
+                    horiz_gap = left_j - right_i
+                elif right_j <= left_i:
+                    horiz_gap = left_i - right_j
+                else:
+                    horiz_gap = 0.0
+
+                # Vertical gap (unchanged)
+                if top_i <= bottom_j:
+                    vert_gap = bottom_j - top_i
+                elif top_j <= bottom_i:
+                    vert_gap = bottom_i - top_j
+                else:
+                    vert_gap = 0.0
+
+                # Spacing penalties only between immediate neighbours
+                if min_sp and n > 1:
+                    is_x_neighbor = (
+                        j == right_idx[i]
+                        or j == left_idx[i]
+                        or i == right_idx[j]
+                        or i == left_idx[j]
+                    )
+                    is_y_neighbor = (
+                        j == up_idx[i]
+                        or j == down_idx[i]
+                        or i == up_idx[j]
+                        or i == down_idx[j]
+                    )
+
+                    if is_x_neighbor and horiz_gap < min_dx:
+                        spacing_x_violation = max(
+                            spacing_x_violation, (min_dx - horiz_gap)
+                        )
+                    if is_y_neighbor and vert_gap < min_dy:
+                        spacing_y_violation = max(
+                            spacing_y_violation, (min_dy - vert_gap)
+                        )
+
+        # Bounding box aspect ratio (unchanged)
+        bbox_ar_violation = 0.0
+        if bbox_ar_enabled:
+            min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+            width = max_x - min_x
+            height = max_y - min_y
+            if width <= 0 or height <= 0:
+                ar = 1.0
+            else:
+                ar = width / height
+
+            ar_type = bbox_ar_cfg.get("type", "less_than")
+            thr = float(bbox_ar_cfg.get("threshold", 1.0))
+            if ar_type == "less_than":
+                bbox_ar_violation = max(0.0, ar - thr)
+            else:
+                bbox_ar_violation = max(0.0, thr - ar)
+
+        # Boundary violation (unchanged)
+        boundary_violation = 0.0
+        if boundary_enabled:
+            for (cx, cy), r in zip(centres, self.rectangles):
+                half_w = r.width / 2.0
+                half_h = r.height / 2.0
+                left = cx - half_w
+                right = cx + half_w
+                bottom = cy - half_h
+                top = cy + half_h
+                if left < 0.0:
+                    boundary_violation += -left
+                if right > self.canvas_width:
+                    boundary_violation += right - self.canvas_width
+                if bottom < 0.0:
+                    boundary_violation += -bottom
+                if top > self.canvas_height:
+                    boundary_violation += top - self.canvas_height
+
+        return {
+            "overlap_max_ratio": float(overlap_max_ratio if no_ov else 0.0),
+            "spacing_x_violation": float(spacing_x_violation if min_sp else 0.0),
+            "spacing_y_violation": float(spacing_y_violation if min_sp else 0.0),
+            "bbox_ar_violation": float(bbox_ar_violation if bbox_ar_enabled else 0.0),
+            "boundary_violation": float(boundary_violation if boundary_enabled else 0.0),
+        }
+
+
+    def _objective_augmented_torch(self, x_t: "torch.Tensor", widths, heights) -> "torch.Tensor":
+        """
+        Torch version of augmented objective, mirroring the numpy logic,
+        including all the weights defined in PlacementProblem.
+
+        Spacing penalties are computed only between immediate neighbours
+        (left/right/up/down) precomputed with vectorised operations.
+        """
+        n = self.problem.n_rects
+        cx = x_t[0:2*n:2]
+        cy = x_t[1:2*n:2]
+
+        hpwl_x = torch.max(cx) - torch.min(cx)
+        hpwl_y = torch.max(cy) - torch.min(cy)
+        hpwl = hpwl_x + hpwl_y
+
+        half_w = widths / 2.0
+        half_h = heights / 2.0
+        left = cx - half_w
+        right = cx + half_w
+        bottom = cy - half_h
+        top = cy + half_h
+
+        min_x = torch.min(left)
+        max_x = torch.max(right)
+        min_y = torch.min(bottom)
+        max_y = torch.max(top)
+        width = max_x - min_x
+        height = max_y - min_y
+
+        bbox_aspect = torch.where(
+            height > 0,
+            width / torch.clamp(height, min=1e-6),
+            torch.tensor(1.0, device=x_t.device),
+        )
+        bbox_area = torch.clamp(width, min=0.0) * torch.clamp(height, min=0.0)
+
+        pure_obj = (
+            self.problem.weight_hpwl * hpwl
+            + self.problem.weight_bbox_aspect * bbox_aspect
+            + self.problem.weight_bbox_area * bbox_area
+        )
+
+        cons_cfg = self.problem.constraints_cfg
+        no_ov = cons_cfg.get("no_overlap", {}).get("enabled", True)
+        min_sp = cons_cfg.get("min_spacing", {}).get("enabled", True)
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+
+        bbox_ar_enabled = bbox_ar_cfg.get("enabled", False)
+        boundary_enabled = boundary_cfg.get("enabled", True)
+
+        min_dx = float(cons_cfg.get("min_spacing", {}).get("min_dx", 0.0))
+        min_dy = float(cons_cfg.get("min_spacing", {}).get("min_dy", 0.0))
+        min_dx_t = torch.tensor(min_dx, device=x_t.device)
+        min_dy_t = torch.tensor(min_dy, device=x_t.device)
+
+        overlap_max_ratio = torch.tensor(0.0, device=x_t.device)
+        spacing_x_violation = torch.tensor(0.0, device=x_t.device)
+        spacing_y_violation = torch.tensor(0.0, device=x_t.device)
+
+        areas = widths * heights
+
+        # ------------------------------------------------------------------
+        # PRECOMPUTE NEIGHBOURS (vectorised, Torch) FOR SPACING ONLY
+        # ------------------------------------------------------------------
+        # Same logic as NumPy version: for each rectangle, we find:
+        #   - closest left/right neighbours (horizontal spacing)
+        #   - closest up/down neighbours (vertical spacing)
+        # filtered by overlap/proximity on the perpendicular axis.
+        # ------------------------------------------------------------------
+        if min_sp and n > 1:
+            device = x_t.device
+            INF = torch.tensor(1e9, device=device)
+
+            left_i = left.view(-1, 1)
+            left_j = left.view(1, -1)
+            right_i = right.view(-1, 1)
+            right_j = right.view(1, -1)
+            bottom_i = bottom.view(-1, 1)
+            bottom_j = bottom.view(1, -1)
+            top_i = top.view(-1, 1)
+            top_j = top.view(1, -1)
+            cx_i = cx.view(-1, 1)
+            cx_j = cx.view(1, -1)
+            cy_i = cy.view(-1, 1)
+            cy_j = cy.view(1, -1)
+
+            # Vertical proximity (for horizontal neighbours)
+            overlap_y = torch.min(top_i, top_j) - torch.max(bottom_i, bottom_j)
+            vert_gap_mat = torch.clamp(
+                torch.max(bottom_i, bottom_j) - torch.min(top_i, top_j), min=0.0
+            )
+            vert_prox = (overlap_y > 0.0) | (vert_gap_mat <= min_dy_t)
+
+            # Horizontal proximity (for vertical neighbours)
+            overlap_x = torch.min(right_i, right_j) - torch.max(left_i, left_j)
+            horiz_gap_mat = torch.clamp(
+                torch.max(left_i, left_j) - torch.min(right_i, right_j), min=0.0
+            )
+            horiz_prox = (overlap_x > 0.0) | (horiz_gap_mat <= min_dx_t)
+
+            # Right neighbours -------------------------------------------------
+            gap_x_right = torch.where(
+                cx_j > cx_i,
+                torch.clamp(left_j - right_i, min=0.0),
+                INF,
+            )
+            gap_x_right = torch.where(vert_prox, gap_x_right, INF)
+            gap_x_right.fill_diagonal_(INF)
+            right_idx = torch.argmin(gap_x_right, dim=1)
+            right_gap = gap_x_right[torch.arange(n, device=device), right_idx]
+            right_idx = torch.where(
+                right_gap < INF,
+                right_idx,
+                torch.full_like(right_idx, -1),
+            )
+
+            # Left neighbours --------------------------------------------------
+            gap_x_left = torch.where(
+                cx_j < cx_i,
+                torch.clamp(left_i - right_j, min=0.0),
+                INF,
+            )
+            gap_x_left = torch.where(vert_prox, gap_x_left, INF)
+            gap_x_left.fill_diagonal_(INF)
+            left_idx = torch.argmin(gap_x_left, dim=1)
+            left_gap = gap_x_left[torch.arange(n, device=device), left_idx]
+            left_idx = torch.where(
+                left_gap < INF,
+                left_idx,
+                torch.full_like(left_idx, -1),
+            )
+
+            # Up neighbours ----------------------------------------------------
+            gap_y_up = torch.where(
+                cy_j > cy_i,
+                torch.clamp(bottom_j - top_i, min=0.0),
+                INF,
+            )
+            gap_y_up = torch.where(horiz_prox, gap_y_up, INF)
+            gap_y_up.fill_diagonal_(INF)
+            up_idx = torch.argmin(gap_y_up, dim=1)
+            up_gap = gap_y_up[torch.arange(n, device=device), up_idx]
+            up_idx = torch.where(
+                up_gap < INF,
+                up_idx,
+                torch.full_like(up_idx, -1),
+            )
+
+            # Down neighbours --------------------------------------------------
+            gap_y_down = torch.where(
+                cy_j < cy_i,
+                torch.clamp(bottom_i - top_j, min=0.0),
+                INF,
+            )
+            gap_y_down = torch.where(horiz_prox, gap_y_down, INF)
+            gap_y_down.fill_diagonal_(INF)
+            down_idx = torch.argmin(gap_y_down, dim=1)
+            down_gap = gap_y_down[torch.arange(n, device=device), down_idx]
+            down_idx = torch.where(
+                down_gap < INF,
+                down_idx,
+                torch.full_like(down_idx, -1),
+            )
+
+            # Convert neighbour indices to CPU numpy arrays for cheap comparisons
+            right_idx_np = right_idx.cpu().numpy()
+            left_idx_np = left_idx.cpu().numpy()
+            up_idx_np = up_idx.cpu().numpy()
+            down_idx_np = down_idx.cpu().numpy()
+        else:
+            right_idx_np = left_idx_np = up_idx_np = down_idx_np = None
+
+        # ------------------------------------------------------------------
+        # Pairwise checks (overlap identical; spacing only on neighbours)
+        # ------------------------------------------------------------------
+        for i in range(n):
+            for j in range(i + 1, n):
+                overlap_x = torch.clamp(
+                    torch.min(right[i], right[j]) - torch.max(left[i], left[j]),
+                    min=0.0,
+                )
+                overlap_y = torch.clamp(
+                    torch.min(top[i], top[j]) - torch.max(bottom[i], bottom[j]),
+                    min=0.0,
+                )
+                overlap_area = overlap_x * overlap_y
+                if no_ov:
+                    smaller_area = torch.min(areas[i], areas[j])
+                    ratio = torch.where(
+                        smaller_area > 0,
+                        overlap_area / torch.clamp(smaller_area, min=1e-6),
+                        torch.tensor(1.0, device=x_t.device),
+                    )
+                    overlap_max_ratio = torch.maximum(overlap_max_ratio, ratio)
+
+                # Horizontal gap (unchanged)
+                if right[i] <= left[j]:
+                    horiz_gap = left[j] - right[i]
+                elif right[j] <= left[i]:
+                    horiz_gap = left[i] - right[j]
+                else:
+                    horiz_gap = torch.tensor(0.0, device=x_t.device)
+
+                # Vertical gap (unchanged)
+                if top[i] <= bottom[j]:
+                    vert_gap = bottom[j] - top[i]
+                elif top[j] <= bottom[i]:
+                    vert_gap = bottom[i] - top[j]
+                else:
+                    vert_gap = torch.tensor(0.0, device=x_t.device)
+
+                # Spacing penalties only between immediate neighbours
+                if min_sp and right_idx_np is not None:
+                    is_x_neighbor = (
+                        j == right_idx_np[i]
+                        or j == left_idx_np[i]
+                        or i == right_idx_np[j]
+                        or i == left_idx_np[j]
+                    )
+                    is_y_neighbor = (
+                        j == up_idx_np[i]
+                        or j == down_idx_np[i]
+                        or i == up_idx_np[j]
+                        or i == down_idx_np[j]
+                    )
+
+                    if is_x_neighbor:
+                        spacing_x_violation = torch.maximum(
+                            spacing_x_violation,
+                            torch.clamp(min_dx_t - horiz_gap, min=0.0),
+                        )
+                    if is_y_neighbor:
+                        spacing_y_violation = torch.maximum(
+                            spacing_y_violation,
+                            torch.clamp(min_dy_t - vert_gap, min=0.0),
+                        )
+
+        bbox_ar_violation = torch.tensor(0.0, device=x_t.device)
+        if bbox_ar_enabled:
+            ar_type = bbox_ar_cfg.get("type", "less_than")
+            thr = float(bbox_ar_cfg.get("threshold", 1.0))
+            ar = torch.where(
+                height > 0,
+                width / torch.clamp(height, min=1e-6),
+                torch.tensor(1.0, device=x_t.device),
+            )
+            if ar_type == "less_than":
+                bbox_ar_violation = torch.clamp(ar - thr, min=0.0)
+            else:
+                bbox_ar_violation = torch.clamp(thr - ar, min=0.0)
+
+        boundary_violation = torch.tensor(0.0, device=x_t.device)
+        if boundary_enabled:
+            cvw = self.problem.canvas_width
+            cvh = self.problem.canvas_height
+            boundary_violation += torch.sum(torch.clamp(-left, min=0.0))
+            boundary_violation += torch.sum(torch.clamp(right - cvw, min=0.0))
+            boundary_violation += torch.sum(torch.clamp(-bottom, min=0.0))
+            boundary_violation += torch.sum(torch.clamp(top - cvh, min=0.0))
+
+        no_ov_cfg = cons_cfg.get("no_overlap", {})
+        min_sp_cfg = cons_cfg.get("min_spacing", {})
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+
+        w_overlap = float(no_ov_cfg.get("penalty_weight", 1000.0))
+        w_spacing = float(min_sp_cfg.get("penalty_weight", 500.0))
+        w_bbox_ar_con = float(bbox_ar_cfg.get("penalty_weight", 50.0))
+        w_boundary = float(boundary_cfg.get("penalty_weight", 500.0))
+
+        penalty = (
+            w_overlap * (overlap_max_ratio ** 2)
+            + w_spacing * ((spacing_x_violation ** 2) + (spacing_y_violation ** 2))
+            + w_bbox_ar_con * (bbox_ar_violation ** 2)
+            + w_boundary * (boundary_violation ** 2)
+        )
+
+        return pure_obj + penalty
