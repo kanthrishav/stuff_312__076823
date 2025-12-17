@@ -1,0 +1,785 @@
+Below is a surgical set of changes you can drop into your existing file without breaking the current structure. The key idea is:
+
+Keep PlacementProblem.compute_metrics(x) exactly as your “base terms” provider (objective terms + constraint measures).
+
+Add a Formulation Engine that decides how to combine those terms (or how to solve a constrained formulation via a solver).
+
+Route every optimizer’s objective call through one single function:
+manager.formulation.evaluate_scalar(decision_vector)
+(and for discrete encodings it decodes to coordinates internally).
+
+I’m not regenerating the whole code; I’m giving new functions/classes + exactly where to call them.
+
+1) UI changes: add “Formulation” dropdown + dynamic formulation parameters
+Add widgets (near your optimizer widgets)
+
+Add this right after optimizer_select / threads_input area:
+
+# ------------------ Formulation selection (NEW) ------------------
+
+FORMULATION_OPTIONS = [
+    "0. Soft penalty (weighted sum)",                       # current
+    "1. Barrier constraints (interior-point)",
+    "2. Lexicographic (hierarchical) optimization",
+    "3. Feasible direction / active-set (SQP-style)",
+    "4. Reduced space / manifold mapping",
+    "5. Discrete encoding: Sequence Pair",
+    "6. Discrete encoding: B*-tree",
+    "7. Discrete encoding: Slicing tree",
+    "8. MIP/MILP model (mixed-integer)",
+    "9. CP/CP-SAT packing",
+]
+
+formulation_select = pn.widgets.Select(
+    name="Formulation",
+    options=FORMULATION_OPTIONS,
+    value=FORMULATION_OPTIONS[0],
+    width=260,
+)
+
+# dynamic formulation params (2 rows like optimizer params)
+form_row4 = pn.Row(css_classes=["param-row"])
+form_row5 = pn.Row(css_classes=["param-row"])
+
+Add formulation-parameter widgets (only shown depending on selection)
+
+Example set (minimal but “rigorous enough” knobs):
+
+# Barrier params
+barrier_type = pn.widgets.Select(
+    name="barrier_type",
+    options=["log", "reciprocal", "reciprocal_square", "power", "exponential"],
+    value="log",
+    width=140,
+)
+barrier_mu = pn.widgets.FloatInput(name="mu", value=1.0, step=0.1, width=80)
+barrier_power_p = pn.widgets.FloatInput(name="p", value=2.0, step=0.5, width=70)  # for power barrier
+barrier_exp_k = pn.widgets.FloatInput(name="k", value=10.0, step=1.0, width=70)   # for exponential barrier
+barrier_line_beta = pn.widgets.FloatInput(name="ls_beta", value=0.5, step=0.05, width=80)
+barrier_alpha0 = pn.widgets.FloatInput(name="alpha0", value=1.0, step=0.1, width=70)
+barrier_feas_eps = pn.widgets.FloatInput(name="feas_eps", value=1e-6, step=1e-6, width=90)
+
+# Lexicographic params
+lex_v_eps = pn.widgets.FloatInput(name="eps", value=1e-4, step=1e-5, width=90)
+lex_phase1_maxiter = pn.widgets.IntInput(name="phase1_maxiter", value=200, step=10, width=110)
+lex_phase2_solver = pn.widgets.Select(
+    name="phase2_solver",
+    options=["SLSQP", "trust-constr"],
+    value="SLSQP",
+    width=120,
+)
+
+# Reduced-space params
+reduce_map = pn.widgets.Select(
+    name="map",
+    options=["sigmoid", "tanh"],
+    value="sigmoid",
+    width=120,
+)
+
+# Discrete encodings params
+disc_key_bounds = pn.widgets.FloatInput(name="key_range", value=1.0, step=0.5, width=90)
+disc_decode_spacing = pn.widgets.FloatInput(name="decode_spacing", value=1.0, step=0.1, width=120)
+
+# MILP/CP params
+int_scale = pn.widgets.IntInput(name="int_scale", value=10, step=1, width=90)
+time_limit_s = pn.widgets.FloatInput(name="time_limit_s", value=10.0, step=1.0, width=110)
+cp_num_workers = pn.widgets.IntInput(name="cp_workers", value=4, step=1, width=90)
+big_m = pn.widgets.FloatInput(name="big_M", value=10000.0, step=100.0, width=110)
+
+FORM_PARAM_WIDGETS = {
+    "0. Soft penalty (weighted sum)": [],
+    "1. Barrier constraints (interior-point)": [
+        barrier_type, barrier_mu, barrier_power_p, barrier_exp_k,
+        barrier_alpha0, barrier_line_beta, barrier_feas_eps
+    ],
+    "2. Lexicographic (hierarchical) optimization": [
+        lex_v_eps, lex_phase1_maxiter, lex_phase2_solver
+    ],
+    "3. Feasible direction / active-set (SQP-style)": [
+        lex_v_eps,  # reuse as feasibility tol / eps
+        lex_phase2_solver,
+    ],
+    "4. Reduced space / manifold mapping": [reduce_map],
+    "5. Discrete encoding: Sequence Pair": [disc_key_bounds, disc_decode_spacing],
+    "6. Discrete encoding: B*-tree": [disc_key_bounds, disc_decode_spacing],
+    "7. Discrete encoding: Slicing tree": [disc_key_bounds, disc_decode_spacing],
+    "8. MIP/MILP model (mixed-integer)": [int_scale, time_limit_s, big_m],
+    "9. CP/CP-SAT packing": [int_scale, time_limit_s, cp_num_workers],
+}
+
+def _update_formulation_rows(event=None):
+    f = formulation_select.value
+    widgets = FORM_PARAM_WIDGETS.get(f, [])
+    half = (len(widgets) + 1)//2
+    form_row4.objects = widgets[:half]
+    form_row5.objects = widgets[half:]
+
+formulation_select.param.watch(_update_formulation_rows, "value")
+_update_formulation_rows()
+
+Put formulation widgets into the Parameters section layout
+
+In your parameters_left = pn.Column(...) insert one new row + the two dynamic rows:
+
+pn.Row(formulation_select, css_classes=["param-row"]),
+form_row4,
+form_row5,
+
+
+Also: in on_run_click, collect formulation selection + params similarly to optimizers.
+
+2) Core change: add a “Formulation Engine” layer
+Add these NEW helpers inside PlacementProblem
+
+You need a way to express constraints as generic inequalities g_k(x) > 0 (for barrier + constrained solvers), and as violations (for penalties / lexicographic).
+
+Add:
+
+class PlacementProblem:
+    ...
+
+    def objective_terms(self, x: np.ndarray) -> Dict[str, float]:
+        m = self.compute_metrics(x)
+        return {
+            "hpwl": m["hpwl"],
+            "bbox_aspect": m["bbox_aspect"],
+            "bbox_area": m["bbox_area"],
+        }
+
+    def constraint_terms(self, x: np.ndarray) -> Dict[str, float]:
+        m = self.compute_metrics(x)
+        return {
+            "overlap_max_ratio": m["overlap_max_ratio"],
+            "spacing_x_violation": m["spacing_x_violation"],
+            "spacing_y_violation": m["spacing_y_violation"],
+            "bbox_ar_violation": m["bbox_ar_violation"],
+            "boundary_violation": m["boundary_violation"],
+        }
+
+    def total_violation_scalar(self, x: np.ndarray) -> float:
+        """
+        Generic scalar V(x) >= 0 for lexicographic:
+        Works for future added constraints if you include them in constraint_terms().
+        """
+        c = self.constraint_terms(x)
+        return (
+            c["overlap_max_ratio"]**2
+            + c["spacing_x_violation"]**2
+            + c["spacing_y_violation"]**2
+            + c["bbox_ar_violation"]**2
+            + c["boundary_violation"]**2
+        )
+
+    def inequality_slacks_g(self, x: np.ndarray, smooth_k: float = 10.0) -> List[Tuple[str, float]]:
+        """
+        Returns list of (name, g_value) where g_value > 0 implies feasible.
+        This is what enables:
+          - barrier formulations
+          - SciPy constrained solvers
+
+        Note: no-overlap and spacing are disjunctive; we provide a smooth approximation:
+            g_ij = (1/k) log(exp(k*g_x) + exp(k*g_y))
+        which approximates max(g_x, g_y).
+        """
+        centres = self.decode_centres(x)
+        cons = self.constraints_cfg
+        min_dx = float(cons.get("min_spacing", {}).get("min_dx", 0.0))
+        min_dy = float(cons.get("min_spacing", {}).get("min_dy", 0.0))
+
+        # edges
+        edges = []
+        for (cx, cy), r in zip(centres, self.rectangles):
+            half_w = r.width/2.0
+            half_h = r.height/2.0
+            edges.append((cx-half_w, cx+half_w, cy-half_h, cy+half_h, r.width, r.height))
+
+        gs: List[Tuple[str, float]] = []
+
+        # Boundary as strict inequalities
+        for i, ((cx, cy), r) in enumerate(zip(centres, self.rectangles)):
+            half_w = r.width/2.0
+            half_h = r.height/2.0
+            gs.append((f"bound_left[{i}]",  (cx - half_w) - 0.0))
+            gs.append((f"bound_right[{i}]", self.canvas_width - (cx + half_w)))
+            gs.append((f"bound_bottom[{i}]", (cy - half_h) - 0.0))
+            gs.append((f"bound_top[{i}]",   self.canvas_height - (cy + half_h)))
+
+        # Pairwise separation (smooth disjunction)
+        n = self.n_rects
+        k = float(smooth_k)
+        for i in range(n):
+            li, ri, bi, ti, wi, hi = edges[i]
+            for j in range(i+1, n):
+                lj, rj, bj, tj, wj, hj = edges[j]
+
+                # gaps in x and y
+                if ri <= lj:
+                    gap_x = lj - ri
+                elif rj <= li:
+                    gap_x = li - rj
+                else:
+                    gap_x = 0.0
+
+                if ti <= bj:
+                    gap_y = bj - ti
+                elif tj <= bi:
+                    gap_y = bi - tj
+                else:
+                    gap_y = 0.0
+
+                g_x = gap_x - min_dx
+                g_y = gap_y - min_dy
+
+                # smooth max(g_x, g_y)
+                g = (1.0/k) * math.log(math.exp(k*g_x) + math.exp(k*g_y) + 1e-12)
+                gs.append((f"sep[{i},{j}]", g))
+
+        # bbox aspect constraint (if enabled)
+        cfg = cons.get("bbox_aspect_ratio", {})
+        if cfg.get("enabled", False):
+            m = self.compute_metrics(x)
+            ar = m["bbox_aspect"]
+            thr = float(cfg.get("threshold", 1.0))
+            typ = cfg.get("type", "less_than")
+            if typ == "less_than":
+                gs.append(("bbox_ar", thr - ar))    # ar <= thr  => thr-ar >=0
+            else:
+                gs.append(("bbox_ar", ar - thr))    # ar >= thr  => ar-thr >=0
+
+        return gs
+
+
+This is the single most important “future-proof” hook: new constraints only need to add:
+
+their violation term into constraint_terms()
+
+and a g_k(x)>0 into inequality_slacks_g() if you want barrier / constrained solvers to use them as “hard”.
+
+3) New Formulation Engine and strategies (options 0–9)
+
+Add a new class (outside PlacementProblem) that:
+
+knows what the current formulation is,
+
+knows if it transforms variables (reduced-space / discrete),
+
+returns scalar objective for continuous optimizers,
+
+or calls solver for MILP/CP-SAT.
+
+FormulationConfig: collect UI selection
+@dataclass
+class FormulationConfig:
+    name: str
+    params: Dict[str, Any]
+
+Barrier functions (at least 5)
+def barrier_phi(g: float, kind: str, mu: float, p: float = 2.0, k: float = 10.0, eps: float = 1e-12) -> float:
+    """
+    Barrier term contribution for a single inequality slack g(x) > 0.
+    All return +inf if g <= 0 (outside feasible region).
+    """
+    if g <= 0.0:
+        return float("inf")
+
+    if kind == "log":
+        return -mu * math.log(max(g, eps))
+    if kind == "reciprocal":
+        return mu * (1.0 / max(g, eps))
+    if kind == "reciprocal_square":
+        return mu * (1.0 / max(g, eps)**2)
+    if kind == "power":
+        return mu * (1.0 / max(g, eps)**p)
+    if kind == "exponential":
+        # exp barrier that grows fast as g->0+ (since exp(k*(1/g)) is too extreme)
+        return mu * math.exp(-k * g) / max(g, eps)
+    raise ValueError(f"Unknown barrier kind: {kind}")
+
+Reduced-space mapping: boundary feasibility by construction
+def map_to_bounds(z: np.ndarray, bounds: List[Tuple[float, float]], kind: str = "sigmoid") -> np.ndarray:
+    """
+    Map unconstrained z in R^d to bounded x in [lo, hi] elementwise.
+    This enforces boundary constraints exactly (reduced/manifold style).
+    """
+    z = np.asarray(z, dtype=float)
+    x = np.empty_like(z)
+    for i, (lo, hi) in enumerate(bounds):
+        if kind == "sigmoid":
+            s = 1.0 / (1.0 + np.exp(-z[i]))
+            x[i] = lo + (hi - lo) * s
+        elif kind == "tanh":
+            s = 0.5 * (np.tanh(z[i]) + 1.0)
+            x[i] = lo + (hi - lo) * s
+        else:
+            raise ValueError(kind)
+    return x
+
+Sequence Pair decoding (rigorous VLSI packing)
+
+This is the “real” floorplanning decoder that guarantees non-overlap by construction.
+
+def decode_sequence_pair(
+    widths: np.ndarray,
+    heights: np.ndarray,
+    pi_plus: List[int],
+    pi_minus: List[int],
+    min_dx: float = 0.0,
+    min_dy: float = 0.0,
+) -> np.ndarray:
+    """
+    Rigorous sequence-pair decoding using constraint graphs and longest paths.
+    Returns centre coordinates vector x = [cx0, cy0, cx1, cy1, ...].
+    """
+    n = len(widths)
+    pos_minus = {r: i for i, r in enumerate(pi_minus)}
+
+    # Build horizontal and vertical precedence sets
+    # If i precedes j in both => i left of j (horizontal edge i->j)
+    # If i precedes j in pi_plus and follows in pi_minus => i above j (vertical edge i->j)
+    H_edges = [[] for _ in range(n)]
+    V_edges = [[] for _ in range(n)]
+
+    for a_idx in range(n):
+        i = pi_plus[a_idx]
+        for b_idx in range(a_idx + 1, n):
+            j = pi_plus[b_idx]
+            if pos_minus[i] < pos_minus[j]:
+                H_edges[i].append(j)
+            else:
+                V_edges[i].append(j)
+
+    # Longest path DP in topological order pi_plus
+    x_left = np.zeros(n, dtype=float)
+    y_bottom = np.zeros(n, dtype=float)
+
+    # Horizontal: x_left[j] = max_i (x_left[i] + w_i + min_dx) over i->j
+    for i in pi_plus:
+        base = x_left[i] + widths[i] + min_dx
+        for j in H_edges[i]:
+            if base > x_left[j]:
+                x_left[j] = base
+
+    # Vertical: y_bottom[j] = max_i (y_bottom[i] + h_i + min_dy) over i->j
+    for i in pi_plus:
+        base = y_bottom[i] + heights[i] + min_dy
+        for j in V_edges[i]:
+            if base > y_bottom[j]:
+                y_bottom[j] = base
+
+    # Convert left/bottom to centres
+    cx = x_left + widths / 2.0
+    cy = y_bottom + heights / 2.0
+
+    out = np.zeros(2 * n, dtype=float)
+    out[0::2] = cx
+    out[1::2] = cy
+    return out
+
+
+For options 6 (B*-tree) and 7 (slicing tree) you should follow the same pattern: encode → decode → compute objective.
+I’m not pasting full decoders here because they’re long, but the integration hook below supports them identically. If you want, I’ll paste the full B*-tree contour packing + slicing-tree Polish decode in the next turn.
+
+4) FormulationEngine: one hook that all optimizers call
+class FormulationEngine:
+    def __init__(self, problem: PlacementProblem, cfg: FormulationConfig, manager_ref):
+        self.problem = problem
+        self.cfg = cfg
+        self.manager = manager_ref  # to call register_step / access stop/pause
+
+    # --- decision space API (allows reduced-space & discrete encodings) ---
+    def decision_dim(self) -> int:
+        name = self.cfg.name
+        if name.startswith("4. Reduced"):
+            return self.problem.num_variables()  # z has same dim as x, but unbounded
+        if name.startswith("5. Discrete encoding: Sequence Pair"):
+            return 2 * self.problem.n_rects  # random keys for pi+ and pi-
+        # TODO: B*-tree / slicing: may need more params; keep 2n initially
+        return self.problem.num_variables()
+
+    def decision_bounds(self) -> Optional[List[Tuple[float, float]]]:
+        name = self.cfg.name
+        if name.startswith("4. Reduced"):
+            return None  # unconstrained (mapped to bounds internally)
+        if name.startswith("5. Discrete") or name.startswith("6. Discrete") or name.startswith("7. Discrete"):
+            r = float(self.cfg.params.get("key_range", 1.0))
+            return [(-r, r)] * self.decision_dim()
+        return self.problem.bounds()
+
+    def decision_init(self) -> np.ndarray:
+        name = self.cfg.name
+        if name.startswith("4. Reduced"):
+            # start at 0 => maps to centre of bounds
+            return np.zeros(self.problem.num_variables(), dtype=float)
+        if name.startswith("5. Discrete") or name.startswith("6. Discrete") or name.startswith("7. Discrete"):
+            # random keys
+            return np.random.uniform(-1.0, 1.0, size=self.decision_dim()).astype(float)
+        return self.problem.initial_vector()
+
+    # --- decode decision vector -> coordinate vector x (for metrics/plots) ---
+    def decode_to_x(self, z: np.ndarray) -> np.ndarray:
+        name = self.cfg.name
+
+        if name.startswith("4. Reduced"):
+            kind = self.cfg.params.get("map", "sigmoid")
+            return map_to_bounds(z, self.problem.bounds(), kind=kind)
+
+        if name.startswith("5. Discrete encoding: Sequence Pair"):
+            n = self.problem.n_rects
+            keys_plus = z[:n]
+            keys_minus = z[n:2*n]
+            pi_plus = list(np.argsort(keys_plus))
+            pi_minus = list(np.argsort(keys_minus))
+            cons = self.problem.constraints_cfg
+            min_dx = float(cons.get("min_spacing", {}).get("min_dx", 0.0))
+            min_dy = float(cons.get("min_spacing", {}).get("min_dy", 0.0))
+            scale = float(self.cfg.params.get("decode_spacing", 1.0))
+            widths = np.array([r.width for r in self.problem.rectangles], dtype=float)
+            heights = np.array([r.height for r in self.problem.rectangles], dtype=float)
+            return decode_sequence_pair(widths, heights, pi_plus, pi_minus, min_dx*scale, min_dy*scale)
+
+        # TODO 6/7: decode B*-tree / slicing tree (same pattern)
+        return np.asarray(z, dtype=float)
+
+    # --- scalar objective used by SciPy/GA/DE/etc ---
+    def evaluate_scalar(self, z: np.ndarray) -> float:
+        x = self.decode_to_x(z)
+
+        # Base objective terms
+        ot = self.problem.objective_terms(x)
+        f = (
+            self.problem.weight_hpwl * ot["hpwl"]
+            + self.problem.weight_bbox_aspect * ot["bbox_aspect"]
+            + self.problem.weight_bbox_area * ot["bbox_area"]
+        )
+
+        name = self.cfg.name
+
+        # 0) soft penalty (current)
+        if name.startswith("0. Soft penalty"):
+            m = self.problem.compute_metrics(x)
+            return m["objective_augmented"]
+
+        # 1) barrier constraints (interior point)
+        if name.startswith("1. Barrier"):
+            mu = float(self.cfg.params.get("mu", 1.0))
+            kind = self.cfg.params.get("barrier_type", "log")
+            p = float(self.cfg.params.get("p", 2.0))
+            k = float(self.cfg.params.get("k", 10.0))
+            eps = float(self.cfg.params.get("feas_eps", 1e-12))
+
+            # slacks g_k(x) > 0
+            gs = self.problem.inequality_slacks_g(x, smooth_k=10.0)
+
+            B = 0.0
+            for _, g in gs:
+                Bk = barrier_phi(g - eps, kind=kind, mu=mu, p=p, k=k)
+                if not math.isfinite(Bk):
+                    return float("inf")
+                B += Bk
+
+            # optionally keep soft penalties for "soft constraints"
+            # (future constraints can choose barrier vs penalty; keep simple here)
+            return f + B
+
+        # 2/3 use solver-based “constrained” runs; scalar only used in fallback
+        if name.startswith("2. Lexicographic") or name.startswith("3. Feasible"):
+            # fallback scalar if a non-constrained optimizer is used:
+            V = self.problem.total_violation_scalar(x)
+            # BIG dominance to enforce lexicographic priority in fallback mode:
+            return 1e6 * V + f
+
+        # 4 reduced-space already handled in decode; now just evaluate soft penalty or pure f
+        if name.startswith("4. Reduced"):
+            # boundary feasibility already ensured by mapping; keep penalties for others
+            m = self.problem.compute_metrics(x)
+            return m["objective_augmented"]
+
+        # 5/6/7 discrete encodings -> objective in decoded x + boundary penalty if overflow
+        if name.startswith("5. Discrete") or name.startswith("6. Discrete") or name.startswith("7. Discrete"):
+            m = self.problem.compute_metrics(x)
+            return m["objective_augmented"]
+
+        # 8/9 solved directly via solver in a separate path (not scalar evaluation)
+        if name.startswith("8. MIP") or name.startswith("9. CP"):
+            return float("inf")
+
+        return f
+
+5) Where to call it from (minimal changes)
+A) In on_run_click, create the formulation config and pass into manager
+
+Add:
+
+def _collect_formulation_params() -> Dict[str, Any]:
+    name = formulation_select.value
+    params = {}
+    for w in FORM_PARAM_WIDGETS.get(name, []):
+        params[w.name] = w.value
+    return params
+
+
+Then in on_run_click:
+
+form_cfg = FormulationConfig(
+    name=formulation_select.value,
+    params=_collect_formulation_params()
+)
+manager.set_formulation(form_cfg)   # NEW method you add to manager
+
+B) Add to OptimizationManager.__init__:
+self.formulation_cfg: Optional[FormulationConfig] = None
+self.formulation: Optional[FormulationEngine] = None
+
+C) Add to OptimizationManager:
+def set_formulation(self, cfg: FormulationConfig):
+    self.formulation_cfg = cfg
+    if self.problem is not None:
+        self.formulation = FormulationEngine(self.problem, cfg, self)
+
+D) Replace objective calls everywhere
+
+Replace your existing:
+
+def _objective_augmented_np(self, x):
+    return self.problem.compute_metrics(x)["objective_augmented"]
+
+
+with:
+
+def _objective_augmented_np(self, z: np.ndarray) -> float:
+    return self.formulation.evaluate_scalar(z)
+
+
+And similarly _objective_augmented_np_checked(...).
+
+E) Update start vectors and bounds (so discrete/reduced formulations work)
+
+In start_run(...) replace:
+
+x0 = self.problem.initial_vector() with z0 = self.formulation.decision_init()
+
+bounds = self.problem.bounds() with bounds = self.formulation.decision_bounds()
+
+and pass z0 everywhere the optimizers expect an initial vector.
+
+F) Ensure plots/logs still show real coordinates
+
+Modify register_step signature to accept decoded x:
+
+def register_step(self, algo_name: str, z: np.ndarray, target_obj: float = 0.0, decoded_x: Optional[np.ndarray] = None):
+    x = decoded_x if decoded_x is not None else z
+    metrics = self.problem.compute_metrics(x)
+    ...
+    rec["x_vector"] = x.tolist()           # keep x_vector as coordinates for plotting
+    rec["decision_vector"] = z.tolist()    # NEW: for resume/debug
+
+
+Then in each optimizer callback, do:
+
+x = self.formulation.decode_to_x(z)
+self.register_step(algo_name, z, target_obj, decoded_x=x)
+
+
+For continuous formulations where z==x, you can just call register_step(algo, z, ...) unchanged.
+
+6) Solver-based formulations (2,3,8,9): don’t fake them—run the right solver
+Option 2: Lexicographic (two-stage) — rigorous
+
+Add a new worker path in _run_optimizer_worker:
+
+if self.formulation_cfg.name.startswith("2. Lexicographic"):
+    self._run_lexicographic(params, z0, target_obj)
+    return
+
+
+Implement:
+
+from scipy.optimize import NonlinearConstraint
+
+def _run_lexicographic(self, opt_params, z0, target_obj):
+    eps = float(self.formulation_cfg.params.get("eps", 1e-4))
+    phase1_maxiter = int(self.formulation_cfg.params.get("phase1_maxiter", 200))
+    phase2_solver = self.formulation_cfg.params.get("phase2_solver", "SLSQP")
+
+    # Phase 1: minimize V(x)
+    def V_of_z(z):
+        x = self.formulation.decode_to_x(z)
+        if self._stop_requested(): raise StopRequested()
+        return self.problem.total_violation_scalar(x)
+
+    # Run Phase1 with selected optimizer (or force DE/DA); simplest: use scipy minimize
+    res1 = minimize(V_of_z, z0, method="Powell", options={"maxiter": phase1_maxiter})
+    z_feas = np.array(res1.x, dtype=float)
+    Vmin = V_of_z(z_feas)
+
+    # Phase 2: minimize f(x) subject to V(x) <= Vmin + eps
+    def f_of_z(z):
+        if self._stop_requested(): raise StopRequested()
+        return self.formulation.evaluate_scalar(z)  # uses chosen formulation's scalar; for lex we want pure objective
+    # Better: use pure objective only:
+    def pure_f(z):
+        x = self.formulation.decode_to_x(z)
+        ot = self.problem.objective_terms(x)
+        return (self.problem.weight_hpwl*ot["hpwl"]
+                + self.problem.weight_bbox_aspect*ot["bbox_aspect"]
+                + self.problem.weight_bbox_area*ot["bbox_area"])
+
+    def V_constraint(z):
+        return (Vmin + eps) - self.problem.total_violation_scalar(self.formulation.decode_to_x(z))
+
+    cons = [{"type": "ineq", "fun": V_constraint}]
+
+    method = "SLSQP" if phase2_solver == "SLSQP" else "trust-constr"
+    res2 = minimize(pure_f, z_feas, method=method, constraints=cons, options={"maxiter": opt_params.get("maxiter", 200)})
+
+    z_best = np.array(res2.x, dtype=float)
+    x_best = self.formulation.decode_to_x(z_best)
+    self.register_step("Lexicographic (final)", z_best, target_obj, decoded_x=x_best)
+
+
+This is true lexicographic: first minimize violation, then constrain violation and optimize objective.
+
+Option 3: Feasible direction / active-set (SQP-style) — use SLSQP
+
+Again, don’t reduce this to a scalar penalty. Use SciPy’s SQP solver.
+
+In _run_optimizer_worker, if formulation starts with option 3, force a constrained solver:
+
+if self.formulation_cfg.name.startswith("3. Feasible"):
+    self._run_sqp_feasible(params, z0, target_obj)
+    return
+
+
+Implement:
+
+def _run_sqp_feasible(self, params, z0, target_obj):
+    method = self.formulation_cfg.params.get("phase2_solver", "SLSQP")
+
+    # Build inequality constraints g_k(z) >= 0
+    def make_gk_fun(idx):
+        def gk(z):
+            if self._stop_requested(): raise StopRequested()
+            x = self.formulation.decode_to_x(z)
+            gs = self.problem.inequality_slacks_g(x, smooth_k=10.0)
+            return gs[idx][1]
+        return gk
+
+    # pick a manageable subset or all constraints:
+    # WARNING: all pairwise sep constraints is O(n^2) – for many rects it’s huge.
+    # For chip floorplanning, consider only "critical" constraints or use discrete encodings / CP-SAT.
+    gs0 = self.problem.inequality_slacks_g(self.formulation.decode_to_x(z0), smooth_k=10.0)
+    constraints = [{"type": "ineq", "fun": make_gk_fun(i)} for i in range(len(gs0))]
+
+    def pure_f(z):
+        x = self.formulation.decode_to_x(z)
+        ot = self.problem.objective_terms(x)
+        return (self.problem.weight_hpwl*ot["hpwl"]
+                + self.problem.weight_bbox_aspect*ot["bbox_aspect"]
+                + self.problem.weight_bbox_area*ot["bbox_area"])
+
+    def callback(z):
+        x = self.formulation.decode_to_x(z)
+        self.register_step("SLSQP (feasible)", np.array(z), target_obj, decoded_x=x)
+        return self._check_pause_and_stop()
+
+    minimize(
+        pure_f, z0, method="SLSQP" if method=="SLSQP" else "trust-constr",
+        constraints=constraints,
+        callback=callback,
+        options={"maxiter": int(params.get("maxiter", 200))}
+    )
+
+
+That’s a feasible-direction / active-set style approach without you implementing SQP yourself.
+
+Option 8: MILP (MIP/MILP) — use a solver (OR-Tools MIP)
+
+This is a solver path, not a scalar objective path.
+
+Add:
+
+if self.formulation_cfg.name.startswith("8. MIP"):
+    self._run_milp(params, target_obj)
+    return
+
+
+Implementation note (important):
+
+HPWL and bbox bounds are linearizable.
+
+BBox area is bilinear; MILP needs approximation or MIQP/SCIP/Gurobi.
+So option 8 should either:
+
+(A) drop bbox_area for MILP, or
+
+(B) piecewise-linear approximation, or
+
+(C) require SCIP/Gurobi.
+
+I recommend: MILP uses linear objective terms only, CP-SAT handles the full nonlinear area via multiplication (option 9).
+
+Option 9: CP-SAT packing — OR-Tools NoOverlap2D + multiplication
+
+This is the best “chip floorplanning” style for hard packing constraints.
+
+Add:
+
+if self.formulation_cfg.name.startswith("9. CP"):
+    self._run_cpsat(params, target_obj)
+    return
+
+
+Key idea:
+
+integer centers and sizes with scale factor int_scale
+
+AddNoOverlap2D or AddNoOverlap2D([interval_x],[interval_y])
+
+objective terms via:
+
+x_min/x_max/y_min/y_max (linear)
+
+hpwl = (x_max - x_min) + (y_max - y_min) (linear)
+
+area = W*H using AddMultiplicationEquality(area, [W, H]) (exact)
+
+aspect ratio constraint: W <= thr*H if threshold rational (linear)
+
+Also: CP-SAT can stream solutions via a callback → live updates.
+
+7) Compatibility reality (so you don’t paint yourself into a corner)
+
+0 Soft penalty: works with all optimizers (current)
+
+1 Barrier: works with continuous optimizers; best with Adam + line search / trust-constr
+
+2 Lexicographic: implemented as two-phase solver run (rigorous); phase 2 should use SLSQP/trust-constr
+
+3 Active-set/SQP: should use SLSQP/trust-constr (rigorous)
+
+4 Reduced-space: works with all continuous optimizers (you’re just changing parameterization)
+
+5/6/7 Discrete encodings: work best with GA/DE/annealing; continuous optimizers can run on “random keys” but are non-smooth
+
+8 MILP: is its own solver path
+
+9 CP-SAT: is its own solver path (best for exact packing)
+
+This still keeps your UI structure: formulation dropdown chooses how the optimization problem is defined, and the backend either:
+
+produces a scalar objective for existing optimizers, or
+
+routes to a dedicated solver run for MILP/CP-SAT (because that’s what “full rigour” means).
+
+8) What you must change in one place to make everything future-proof
+
+All future constraints/objectives should be added in only two places:
+
+PlacementProblem.objective_terms(x) / constraint_terms(x) (for plotting, logs, lexicographic V(x))
+
+PlacementProblem.inequality_slacks_g(x) (only if you want that constraint to be “hard” under barriers / SQP / CP-SAT)
+
+That’s the smallest change that keeps your system extensible.
+
+If you want, I can paste the full B*-tree contour packing decoder and full slicing-tree Polish-expression decoder next (they’re longer but they fit into the same decode_to_x() hook exactly like sequence pair).
