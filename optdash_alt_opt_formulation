@@ -783,3 +783,649 @@ PlacementProblem.inequality_slacks_g(x) (only if you want that constraint to be 
 That’s the smallest change that keeps your system extensible.
 
 If you want, I can paste the full B*-tree contour packing decoder and full slicing-tree Polish-expression decoder next (they’re longer but they fit into the same decode_to_x() hook exactly like sequence pair).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Below are drop-in, fully-implemented decoders for:
+
+B*-tree + contour packing (option 6)
+
+Slicing tree via NPE (Normalized Polish Expression) + deterministic packing (option 7)
+
+…and the smallest integration edits needed inside your existing FormulationEngine.decode_to_x().
+
+I’m also listing other discrete floorplanning encodings in the same sub-domain (besides B*-tree and slicing trees).
+
+A) Code: B*-tree contour packing decoder (full)
+1) B*-tree generation from random keys (deterministic)
+
+This gives you a valid binary tree for any key vector, so GA/DE/SA can optimize the keys.
+
+import math
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+@dataclass
+class BStarTree:
+    """Binary tree arrays describing a B*-tree."""
+    root: int
+    left: np.ndarray   # left[i]  = left child index or -1
+    right: np.ndarray  # right[i] = right child index or -1
+
+def _sigmoid01(x: float) -> float:
+    # stable sigmoid into (0,1)
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    else:
+        z = math.exp(x)
+        return z / (1.0 + z)
+
+def random_keys_to_bstar_tree(keys_order: np.ndarray, keys_attach: np.ndarray) -> BStarTree:
+    """
+    Deterministically maps (keys_order, keys_attach) -> a valid B*-tree.
+
+    - keys_order: decides insertion order of blocks
+    - keys_attach: decides parent selection and whether attach as left-child or right-child
+
+    This is designed for metaheuristics (GA/DE/SA): they mutate real keys; we decode to a tree.
+    """
+    n = len(keys_order)
+    assert len(keys_attach) == n, "keys_attach must have length n"
+
+    # Insertion order (root is first)
+    order = list(np.argsort(keys_order))  # permutation of 0..n-1
+
+    left = -np.ones(n, dtype=int)
+    right = -np.ones(n, dtype=int)
+
+    root = order[0]
+    placed = [root]  # list of already-in-tree nodes (in insertion order)
+
+    # Helper to find an available slot deterministically
+    def attach_to_parent(child: int, parent: int, prefer_left: bool) -> bool:
+        """Try attach child to parent; return True if attached else False."""
+        if prefer_left:
+            if left[parent] == -1:
+                left[parent] = child
+                return True
+            if right[parent] == -1:
+                right[parent] = child
+                return True
+        else:
+            if right[parent] == -1:
+                right[parent] = child
+                return True
+            if left[parent] == -1:
+                left[parent] = child
+                return True
+        return False
+
+    for k in range(1, n):
+        child = order[k]
+        a = float(keys_attach[child])
+
+        # parent selection among already placed nodes
+        # map attach-key -> index in [0, len(placed)-1]
+        u = _sigmoid01(a)  # (0,1)
+        p_idx = int(u * len(placed))
+        if p_idx >= len(placed):
+            p_idx = len(placed) - 1
+        parent0 = placed[p_idx]
+
+        prefer_left = (a >= 0.0)
+
+        # If chosen parent is full, linearly probe other parents (deterministic)
+        attached = False
+        for t in range(len(placed)):
+            parent = placed[(p_idx + t) % len(placed)]
+            if attach_to_parent(child, parent, prefer_left):
+                attached = True
+                break
+
+        # As a last resort (should be extremely rare), attach to last placed node
+        if not attached:
+            parent = placed[-1]
+            if left[parent] == -1:
+                left[parent] = child
+            elif right[parent] == -1:
+                right[parent] = child
+            else:
+                # If even that fails, force rewire: attach as left of root (tree remains connected)
+                # (This is defensive; usually never triggers)
+                if left[root] == -1:
+                    left[root] = child
+                else:
+                    right[root] = child
+
+        placed.append(child)
+
+    return BStarTree(root=root, left=left, right=right)
+
+2) Contour data structure + packing
+
+This is the classic contour packing used for B*-trees.
+
+# -------------------- Contour utilities (B*-tree packing) --------------------
+
+# Contour is a sorted list of segments: (x0, x1, height), non-overlapping, adjacent may merge.
+Contour = List[Tuple[float, float, float]]
+
+def contour_init(xmax: float = 1e9) -> Contour:
+    # Start with flat skyline at y=0 from x=0..xmax
+    return [(0.0, float(xmax), 0.0)]
+
+def contour_query_max(contour: Contour, x0: float, x1: float) -> float:
+    """Return max height over interval [x0, x1] on the contour."""
+    if x1 <= x0:
+        return 0.0
+    m = 0.0
+    for a, b, h in contour:
+        if b <= x0:
+            continue
+        if a >= x1:
+            break
+        # overlap exists
+        if h > m:
+            m = h
+    return m
+
+def contour_update(contour: Contour, x0: float, x1: float, new_h: float) -> Contour:
+    """
+    Set contour height over [x0, x1] to new_h, leaving rest unchanged.
+    Returns a new merged contour.
+    """
+    if x1 <= x0:
+        return contour
+
+    out: Contour = []
+    for a, b, h in contour:
+        if b <= x0 or a >= x1:
+            # no overlap with [x0,x1]
+            out.append((a, b, h))
+            continue
+
+        # left remainder
+        if a < x0:
+            out.append((a, x0, h))
+
+        # middle replaced
+        mid_a = max(a, x0)
+        mid_b = min(b, x1)
+        out.append((mid_a, mid_b, new_h))
+
+        # right remainder
+        if b > x1:
+            out.append((x1, b, h))
+
+    # sort and merge adjacent equal heights
+    out.sort(key=lambda t: t[0])
+    merged: Contour = []
+    for seg in out:
+        if not merged:
+            merged.append(seg)
+            continue
+        a, b, h = seg
+        pa, pb, ph = merged[-1]
+        if abs(ph - h) < 1e-12 and abs(pb - a) < 1e-12:
+            merged[-1] = (pa, b, ph)
+        else:
+            merged.append(seg)
+
+    # Also merge any accidental overlaps by trimming (defensive)
+    cleaned: Contour = []
+    last_end = None
+    for a, b, h in merged:
+        if last_end is None:
+            cleaned.append((a, b, h))
+            last_end = b
+            continue
+        if a < last_end:
+            a = last_end
+        if b > a:
+            cleaned.append((a, b, h))
+            last_end = b
+    return cleaned
+
+3) Full B*-tree decode to coordinates (with min spacing via inflation + canvas-centering)
+def decode_bstar_tree_contour(
+    widths: np.ndarray,
+    heights: np.ndarray,
+    tree: BStarTree,
+    min_dx: float = 0.0,
+    min_dy: float = 0.0,
+    canvas_w: Optional[float] = None,
+    canvas_h: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Decode B*-tree into non-overlapping placement using contour packing.
+
+    IMPORTANT spacing handling:
+    - We "inflate" each block to (w+min_dx, h+min_dy) for packing.
+      If inflated blocks do not overlap, original blocks satisfy min spacing in x and y.
+
+    Returns:
+      x vector of centres: [cx0, cy0, cx1, cy1, ...]
+    """
+    n = len(widths)
+    assert len(heights) == n
+    left = tree.left
+    right = tree.right
+    root = int(tree.root)
+
+    # Inflated dims for spacing-by-construction
+    infl_w = widths + float(min_dx)
+    infl_h = heights + float(min_dy)
+
+    # Arrays store inflated bottom-left positions
+    x_bl = np.zeros(n, dtype=float)
+    y_bl = np.zeros(n, dtype=float)
+
+    # parent-driven x rules (B*-tree semantics):
+    # left-child => place to the RIGHT of parent
+    # right-child => align x with parent (then y comes from contour)
+    parent = -np.ones(n, dtype=int)
+
+    # Build parent pointers with DFS
+    stack = [root]
+    while stack:
+        u = stack.pop()
+        lc = int(left[u])
+        rc = int(right[u])
+        if lc != -1:
+            parent[lc] = u
+            stack.append(lc)
+        if rc != -1:
+            parent[rc] = u
+            stack.append(rc)
+
+    # Traverse in a stable BFS/DFS order from root to ensure parents placed before children
+    order: List[int] = []
+    q = [root]
+    while q:
+        u = q.pop(0)
+        order.append(u)
+        lc = int(left[u]); rc = int(right[u])
+        if lc != -1: q.append(lc)
+        if rc != -1: q.append(rc)
+
+    # Contour over inflated blocks
+    contour = contour_init(xmax=1e9)
+
+    # Place root at x=0; y from contour => 0
+    x_bl[root] = 0.0
+    y_bl[root] = contour_query_max(contour, x_bl[root], x_bl[root] + infl_w[root])
+    contour = contour_update(contour, x_bl[root], x_bl[root] + infl_w[root], y_bl[root] + infl_h[root])
+
+    # Place remaining blocks
+    for u in order[1:]:
+        p = int(parent[u])
+        if p < 0:
+            # disconnected defensive fallback: place at far right
+            x0 = float(np.max(x_bl + infl_w) + 1.0)
+        else:
+            # Determine if u is left-child or right-child of p
+            if int(left[p]) == u:
+                x0 = x_bl[p] + infl_w[p]   # to the right of parent
+            else:
+                x0 = x_bl[p]               # aligned with parent
+
+        x_bl[u] = x0
+        y_bl[u] = contour_query_max(contour, x0, x0 + infl_w[u])
+        contour = contour_update(contour, x0, x0 + infl_w[u], y_bl[u] + infl_h[u])
+
+    # Convert inflated bottom-left to ORIGINAL centres by removing half-inflation margin
+    cx = x_bl + (min_dx / 2.0) + (widths / 2.0)
+    cy = y_bl + (min_dy / 2.0) + (heights / 2.0)
+
+    # Optional: translate to center inside canvas if it fits
+    if canvas_w is not None and canvas_h is not None:
+        xmin = float(np.min(cx - widths/2.0))
+        xmax = float(np.max(cx + widths/2.0))
+        ymin = float(np.min(cy - heights/2.0))
+        ymax = float(np.max(cy + heights/2.0))
+        bw = xmax - xmin
+        bh = ymax - ymin
+
+        if bw <= canvas_w:
+            dx = (canvas_w - bw) * 0.5 - xmin
+        else:
+            dx = -xmin  # just shift to start at 0; still violates boundary if too large
+
+        if bh <= canvas_h:
+            dy = (canvas_h - bh) * 0.5 - ymin
+        else:
+            dy = -ymin
+
+        cx = cx + dx
+        cy = cy + dy
+
+    out = np.zeros(2*n, dtype=float)
+    out[0::2] = cx
+    out[1::2] = cy
+    return out
+
+B) Code: Full slicing-tree decoder (NPE) + packing
+
+This uses Normalized Polish Expression (NPE): a list of length 2n-1 containing:
+
+n operands (module ids)
+
+n-1 operators in { 'H', 'V' }
+
+The decoding is deterministic and guarantees a slicing structure.
+
+1) Generate a valid NPE from keys (deterministic)
+def random_keys_to_npe(keys_ops: np.ndarray, keys_ctrl: np.ndarray) -> List:
+    """
+    Deterministically builds a valid NPE for n modules.
+
+    keys_ops: defines module permutation (operands order)
+    keys_ctrl: controls when to emit operators and operator types
+
+    Returns an NPE list like: [3, 1, 'V', 0, 'H', 2, 'V', ...]
+    """
+    n = len(keys_ops)
+    assert len(keys_ctrl) == n, "keys_ctrl must have length n"
+
+    operands = list(np.argsort(keys_ops))  # permutation of [0..n-1]
+
+    # operator types for the n-1 operators
+    # use the first (n-1) ctrl keys for operator types
+    op_types = [('H' if keys_ctrl[i] >= 0.0 else 'V') for i in range(n-1)]
+
+    # We must satisfy the NPE ballot property:
+    # in any prefix: #operands >= #operators + 1
+    # and at end: operands=n, operators=n-1.
+    expr: List = []
+    n_opnd = 0
+    n_oper = 0
+
+    # Use remaining keys to decide "emit operator now?" as a threshold schedule
+    # Larger key => emit operators earlier (more compact tree)
+    # We'll map ctrl keys into [0,1] and compare against stack depth.
+    ctrl01 = [_sigmoid01(float(keys_ctrl[i])) for i in range(n)]
+    t_idx = 0
+
+    for i, m in enumerate(operands):
+        expr.append(int(m))
+        n_opnd += 1
+
+        # after adding an operand, we may be able to add operators
+        # allowed if we have at least 2 items on the implicit stack: n_opnd - n_oper >= 2
+        while (n_oper < n-1) and ((n_opnd - n_oper) >= 2):
+            # decide whether to emit an operator now
+            # heuristic: if ctrl indicates "compact", emit; else delay
+            depth = n_opnd - n_oper
+            # threshold increases with depth; deeper => more willing to emit
+            prob_emit = min(1.0, 0.25 + 0.15 * (depth - 2))
+            key = ctrl01[(t_idx + i) % n]
+            t_idx += 1
+            if key < prob_emit:
+                op = op_types[n_oper]
+                expr.append(op)
+                n_oper += 1
+            else:
+                break
+
+    # Emit remaining operators
+    while n_oper < n-1:
+        expr.append(op_types[n_oper])
+        n_oper += 1
+
+    # Defensive validity check; if somehow invalid, fix by a standard repair:
+    if not _is_valid_npe(expr, n):
+        expr = _repair_npe(expr, n)
+
+    return expr
+
+def _is_valid_npe(expr: List, n: int) -> bool:
+    n_opnd = 0
+    n_oper = 0
+    for tok in expr:
+        if isinstance(tok, int):
+            n_opnd += 1
+        else:
+            n_oper += 1
+        if n_opnd < n_oper + 1:
+            return False
+    return (n_opnd == n) and (n_oper == n-1) and (len(expr) == 2*n - 1)
+
+def _repair_npe(expr: List, n: int) -> List:
+    """
+    Simple repair: rebuild from operands order in expr and reuse operator types,
+    then force a canonical valid NPE: operands in order, then operators interleaved.
+    """
+    ops = [t for t in expr if isinstance(t, int)]
+    if len(ops) != n:
+        ops = list(range(n))
+
+    oper_types = [t for t in expr if not isinstance(t, int)]
+    if len(oper_types) != n-1:
+        oper_types = ['V']*(n-1)
+
+    # Canonical valid NPE: push first two operands, operator, then next operand, operator, ...
+    out: List = [ops[0], ops[1], oper_types[0]]
+    k = 2
+    for j in range(1, n-1):
+        out.append(ops[k]); k += 1
+        out.append(oper_types[j])
+    return out
+
+2) Decode NPE to module coordinates (full)
+@dataclass
+class _SubFloorplan:
+    """A composite floorplan piece produced during NPE decoding."""
+    w: float
+    h: float
+    # module -> (x_bl, y_bl) bottom-left in composite coordinates
+    pos: Dict[int, Tuple[float, float]]
+
+def decode_slicing_npe(
+    widths: np.ndarray,
+    heights: np.ndarray,
+    npe: List,
+    min_dx: float = 0.0,
+    min_dy: float = 0.0,
+    canvas_w: Optional[float] = None,
+    canvas_h: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Decode a slicing floorplan from an NPE.
+
+    Spacing:
+    - Inflate each module to (w+min_dx, h+min_dy) during packing.
+    - Then convert inflated bottom-left to original centre coords.
+
+    Operators:
+    - 'H': stack pop B, pop A => place B above A
+    - 'V': stack pop B, pop A => place B right of A
+    """
+    n = len(widths)
+    infl_w = widths + float(min_dx)
+    infl_h = heights + float(min_dy)
+
+    stack: List[_SubFloorplan] = []
+
+    for tok in npe:
+        if isinstance(tok, int):
+            i = int(tok)
+            fp = _SubFloorplan(
+                w=float(infl_w[i]),
+                h=float(infl_h[i]),
+                pos={i: (0.0, 0.0)}
+            )
+            stack.append(fp)
+        else:
+            op = tok
+            if len(stack) < 2:
+                # invalid expression; bail to a trivial packing
+                return _fallback_line_pack(widths, heights, min_dx, min_dy, canvas_w, canvas_h)
+
+            B = stack.pop()
+            A = stack.pop()
+
+            if op == 'H':
+                # B above A
+                w = max(A.w, B.w)
+                h = A.h + B.h
+
+                pos: Dict[int, Tuple[float, float]] = {}
+                # A stays at (0,0)
+                for k, (x, y) in A.pos.items():
+                    pos[k] = (x, y)
+                # B shifted by (0, A.h)
+                for k, (x, y) in B.pos.items():
+                    pos[k] = (x, y + A.h)
+
+                stack.append(_SubFloorplan(w=w, h=h, pos=pos))
+
+            elif op == 'V':
+                # B right of A
+                w = A.w + B.w
+                h = max(A.h, B.h)
+
+                pos = {}
+                for k, (x, y) in A.pos.items():
+                    pos[k] = (x, y)
+                for k, (x, y) in B.pos.items():
+                    pos[k] = (x + A.w, y)
+
+                stack.append(_SubFloorplan(w=w, h=h, pos=pos))
+            else:
+                # unknown operator
+                return _fallback_line_pack(widths, heights, min_dx, min_dy, canvas_w, canvas_h)
+
+    if len(stack) != 1:
+        return _fallback_line_pack(widths, heights, min_dx, min_dy, canvas_w, canvas_h)
+
+    fp = stack[0]
+    # fp.pos contains inflated bottom-lefts
+    cx = np.zeros(n, dtype=float)
+    cy = np.zeros(n, dtype=float)
+
+    for i in range(n):
+        x_bl, y_bl = fp.pos.get(i, (0.0, 0.0))
+        # inflated bottom-left -> original centre
+        cx[i] = x_bl + (min_dx / 2.0) + (widths[i] / 2.0)
+        cy[i] = y_bl + (min_dy / 2.0) + (heights[i] / 2.0)
+
+    # Optional translate to center inside canvas if possible
+    if canvas_w is not None and canvas_h is not None:
+        xmin = float(np.min(cx - widths/2.0))
+        xmax = float(np.max(cx + widths/2.0))
+        ymin = float(np.min(cy - heights/2.0))
+        ymax = float(np.max(cy + heights/2.0))
+        bw = xmax - xmin
+        bh = ymax - ymin
+
+        dx = ((canvas_w - bw) * 0.5 - xmin) if (bw <= canvas_w) else (-xmin)
+        dy = ((canvas_h - bh) * 0.5 - ymin) if (bh <= canvas_h) else (-ymin)
+
+        cx += dx
+        cy += dy
+
+    out = np.zeros(2*n, dtype=float)
+    out[0::2] = cx
+    out[1::2] = cy
+    return out
+
+def _fallback_line_pack(
+    widths: np.ndarray,
+    heights: np.ndarray,
+    min_dx: float,
+    min_dy: float,
+    canvas_w: Optional[float],
+    canvas_h: Optional[float],
+) -> np.ndarray:
+    """
+    Defensive fallback: place modules in a single row left-to-right.
+    Always returns something.
+    """
+    n = len(widths)
+    x = 0.0
+    cx = np.zeros(n, dtype=float)
+    cy = np.zeros(n, dtype=float)
+    y0 = 0.0
+
+    for i in range(n):
+        cx[i] = x + (min_dx/2.0) + widths[i]/2.0
+        cy[i] = y0 + (min_dy/2.0) + heights[i]/2.0
+        x += widths[i] + min_dx
+
+    if canvas_w is not None and canvas_h is not None:
+        # shift into canvas if possible
+        xmin = float(np.min(cx - widths/2.0))
+        ymin = float(np.min(cy - heights/2.0))
+        cx += -xmin
+        cy += -ymin
+
+    out = np.zeros(2*n, dtype=float)
+    out[0::2] = cx
+    out[1::2] = cy
+    return out
+
+C) Minimal integration: update FormulationEngine.decode_to_x()
+
+Inside your existing FormulationEngine.decode_to_x(self, z) add/replace the TODO parts:
+
+# inside FormulationEngine.decode_to_x(self, z):
+
+if name.startswith("6. Discrete encoding: B*-tree"):
+    n = self.problem.n_rects
+    keys_order = z[:n]
+    keys_attach = z[n:2*n]
+    tree = random_keys_to_bstar_tree(keys_order, keys_attach)
+
+    cons = self.problem.constraints_cfg
+    min_dx = float(cons.get("min_spacing", {}).get("min_dx", 0.0))
+    min_dy = float(cons.get("min_spacing", {}).get("min_dy", 0.0))
+
+    widths = np.array([r.width for r in self.problem.rectangles], dtype=float)
+    heights = np.array([r.height for r in self.problem.rectangles], dtype=float)
+
+    scale = float(self.cfg.params.get("decode_spacing", 1.0))
+    return decode_bstar_tree_contour(
+        widths, heights, tree,
+        min_dx=min_dx*scale,
+        min_dy=min_dy*scale,
+        canvas_w=self.problem.canvas_width,
+        canvas_h=self.problem.canvas_height,
+    )
+
+if name.startswith("7. Discrete encoding: Slicing tree"):
+    n = self.problem.n_rects
+    keys_ops = z[:n]
+    keys_ctrl = z[n:2*n]
+    npe = random_keys_to_npe(keys_ops, keys_ctrl)
+
+    cons = self.problem.constraints_cfg
+    min_dx = float(cons.get("min_spacing", {}).get("min_dx", 0.0))
+    min_dy = float(cons.get("min_spacing", {}).get("min_dy", 0.0))
+
+    widths = np.array([r.width for r in self.problem.rectangles], dtype=float)
+    heights = np.array([r.height for r in self.problem.rectangles], dtype=float)
+
+    scale = float(self.cfg.params.get("decode_spacing", 1.0))
+    return decode_slicing_npe(
+        widths, heights, npe,
+        min_dx=min_dx*scale,
+        min_dy=min_dy*scale,
+        canvas_w=self.problem.canvas_width,
+        canvas_h=self.problem.canvas_height,
+    )
+
+
+That’s it—your existing optimizers will now be able to run on these discrete representations because they only need a scalar objective, and you already do x = decode_to_x(z) before metrics/plots.
