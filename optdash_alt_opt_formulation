@@ -1429,3 +1429,483 @@ if name.startswith("7. Discrete encoding: Slicing tree"):
 
 
 That’s it—your existing optimizers will now be able to run on these discrete representations because they only need a scalar objective, and you already do x = decode_to_x(z) before metrics/plots.
+
+
+
+
+
+
+
+
+
+
+
+
+For chip floorplanning, the three from my list that are most practical / widely used (and complement what you already have: Sequence Pair, B*-tree, Slicing) are:
+
+O-tree – compact search space + linear-time packing with a contour; strong in classic VLSI floorplanning literature for “admissible placements” and fast decoding.
+
+Corner Block List / Corner Sequence (CBL/CS) – also compact with linear-time (or near-linear) decoding; used a lot in VLSI packing/floorplanning.
+
+TCG / TCG-S family – best when you want general non-slicing floorplans and explicit horizontal/vertical precedence modeling; it’s a “graph-first” view and is a standard representation in VLSI floorplanning papers.
+
+Below is a drop-in implementation for these three, designed to match your existing pattern:
+
+random_keys -> encoding
+
+decode(encoding, widths, heights, min_dx, min_dy, canvas_w, canvas_h) -> x_vector centres
+
+You can paste this directly into your main file (near your existing Sequence Pair / B*-tree / slicing decoders), then add 3 small decode_to_x() cases at the end.
+
+1) Drop-in code: shared helpers (sigmoid, contour, centering)
+import math
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+# -------------------- Shared helpers --------------------
+
+def _sigmoid01(x: float) -> float:
+    """Stable sigmoid mapping R -> (0,1)."""
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+# Contour is a sorted list of segments: (x0, x1, height)
+Contour = List[Tuple[float, float, float]]
+
+def contour_init(xmax: float = 1e9) -> Contour:
+    """Start with flat skyline y=0 for x in [0, xmax)."""
+    return [(0.0, float(xmax), 0.0)]
+
+def contour_query_max(contour: Contour, x0: float, x1: float) -> float:
+    """Max skyline height over [x0, x1]."""
+    if x1 <= x0:
+        return 0.0
+    m = 0.0
+    for a, b, h in contour:
+        if b <= x0:
+            continue
+        if a >= x1:
+            break
+        if h > m:
+            m = h
+    return m
+
+def contour_update(contour: Contour, x0: float, x1: float, new_h: float) -> Contour:
+    """Set skyline height over [x0, x1] to new_h and merge adjacent segments."""
+    if x1 <= x0:
+        return contour
+
+    out: Contour = []
+    for a, b, h in contour:
+        if b <= x0 or a >= x1:
+            out.append((a, b, h))
+            continue
+
+        if a < x0:
+            out.append((a, x0, h))
+
+        mid_a = max(a, x0)
+        mid_b = min(b, x1)
+        out.append((mid_a, mid_b, new_h))
+
+        if b > x1:
+            out.append((x1, b, h))
+
+    out.sort(key=lambda t: t[0])
+
+    merged: Contour = []
+    for a, b, h in out:
+        if not merged:
+            merged.append((a, b, h))
+            continue
+        pa, pb, ph = merged[-1]
+        if abs(ph - h) < 1e-12 and abs(pb - a) < 1e-12:
+            merged[-1] = (pa, b, ph)
+        else:
+            merged.append((a, b, h))
+    return merged
+
+def contour_breakpoints(contour: Contour) -> List[float]:
+    """Candidate 'corner x' positions: start of each contour segment."""
+    xs = []
+    for a, _, _ in contour:
+        xs.append(float(a))
+    # unique + sorted
+    xs = sorted(set(xs))
+    return xs
+
+def _center_into_canvas(cx: np.ndarray, cy: np.ndarray,
+                        widths: np.ndarray, heights: np.ndarray,
+                        canvas_w: Optional[float], canvas_h: Optional[float]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Translate placement to roughly center it in the canvas if it fits.
+    (Does NOT scale; if it doesn't fit, it just shifts min corner to 0.)
+    """
+    if canvas_w is None or canvas_h is None:
+        return cx, cy
+
+    xmin = float(np.min(cx - widths / 2.0))
+    xmax = float(np.max(cx + widths / 2.0))
+    ymin = float(np.min(cy - heights / 2.0))
+    ymax = float(np.max(cy + heights / 2.0))
+
+    bw = xmax - xmin
+    bh = ymax - ymin
+
+    dx = ((canvas_w - bw) * 0.5 - xmin) if (bw <= canvas_w) else (-xmin)
+    dy = ((canvas_h - bh) * 0.5 - ymin) if (bh <= canvas_h) else (-ymin)
+
+    return cx + dx, cy + dy
+
+2) O-tree: keys → O-tree → contour packing decode
+
+Idea: choose an insertion order; each new block attaches to a parent and is placed to the right of that parent; y is taken from the skyline (contour). This yields non-overlap by construction (for inflated widths/heights).
+
+# -------------------- O-tree --------------------
+
+@dataclass
+class OTree:
+    root: int
+    parent: np.ndarray  # parent[i] = parent index or -1
+
+def random_keys_to_otree(keys_order: np.ndarray, keys_parent: np.ndarray) -> OTree:
+    """
+    Decode two key vectors into an O-tree:
+      - keys_order decides insertion order (root is first)
+      - keys_parent decides parent selection among already placed nodes
+    """
+    n = len(keys_order)
+    assert len(keys_parent) == n
+
+    order = list(np.argsort(keys_order))
+    root = int(order[0])
+
+    parent = -np.ones(n, dtype=int)
+
+    placed = [root]
+    for k in range(1, n):
+        u = int(order[k])
+        t = _sigmoid01(float(keys_parent[u]))
+        p_idx = int(t * len(placed))
+        if p_idx >= len(placed):
+            p_idx = len(placed) - 1
+        p = int(placed[p_idx])
+        parent[u] = p
+        placed.append(u)
+
+    return OTree(root=root, parent=parent)
+
+def decode_otree_contour(widths: np.ndarray, heights: np.ndarray, tree: OTree,
+                         min_dx: float = 0.0, min_dy: float = 0.0,
+                         canvas_w: Optional[float] = None, canvas_h: Optional[float] = None) -> np.ndarray:
+    """
+    O-tree packing via contour:
+      - Inflate modules to enforce min spacing by construction.
+      - Place root at x=0
+      - For node i: x_bl = (x_bl[parent] + infl_w[parent]) , y_bl = skyline_max over its span
+    """
+    n = len(widths)
+    infl_w = widths + float(min_dx)
+    infl_h = heights + float(min_dy)
+
+    # Build children lists to traverse parent->child
+    children: List[List[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        p = int(tree.parent[i])
+        if p != -1:
+            children[p].append(i)
+
+    # BFS ensures parents placed before children
+    order: List[int] = []
+    q = [int(tree.root)]
+    while q:
+        u = q.pop(0)
+        order.append(u)
+        for v in children[u]:
+            q.append(v)
+
+    x_bl = np.zeros(n, dtype=float)
+    y_bl = np.zeros(n, dtype=float)
+
+    contour = contour_init()
+
+    # Root
+    r = int(tree.root)
+    x_bl[r] = 0.0
+    y_bl[r] = contour_query_max(contour, x_bl[r], x_bl[r] + infl_w[r])
+    contour = contour_update(contour, x_bl[r], x_bl[r] + infl_w[r], y_bl[r] + infl_h[r])
+
+    # Others
+    for u in order[1:]:
+        p = int(tree.parent[u])
+        if p == -1:
+            # defensive: place at end
+            x0 = float(np.max(x_bl + infl_w) + 1.0)
+        else:
+            x0 = x_bl[p] + infl_w[p]
+
+        x_bl[u] = x0
+        y_bl[u] = contour_query_max(contour, x0, x0 + infl_w[u])
+        contour = contour_update(contour, x0, x0 + infl_w[u], y_bl[u] + infl_h[u])
+
+    # inflated bottom-left -> original centres
+    cx = x_bl + (min_dx / 2.0) + (widths / 2.0)
+    cy = y_bl + (min_dy / 2.0) + (heights / 2.0)
+
+    cx, cy = _center_into_canvas(cx, cy, widths, heights, canvas_w, canvas_h)
+
+    out = np.zeros(2 * n, dtype=float)
+    out[0::2] = cx
+    out[1::2] = cy
+    return out
+
+3) Corner Block List / Corner Sequence: skyline-corner placement
+
+Idea: maintain a skyline contour. For each module (in order), choose one of the skyline “corners” (breakpoints) based on a key, place the block there (y from skyline), then update skyline. This is a practical “corner-sequence” style packing (CBL/CS flavor).
+
+# -------------------- Corner sequence (CBL/CS-style) --------------------
+
+def random_keys_to_corner_sequence(keys_order: np.ndarray, keys_corner: np.ndarray) -> Tuple[List[int], np.ndarray]:
+    """
+    Encode:
+      - placement order from keys_order
+      - corner-choice keys_corner (per-module) used during decoding
+    """
+    n = len(keys_order)
+    assert len(keys_corner) == n
+    order = list(np.argsort(keys_order))
+    return order, np.asarray(keys_corner, dtype=float)
+
+def decode_corner_sequence_contour(widths: np.ndarray, heights: np.ndarray,
+                                  order: List[int], corner_keys: np.ndarray,
+                                  min_dx: float = 0.0, min_dy: float = 0.0,
+                                  canvas_w: Optional[float] = None, canvas_h: Optional[float] = None) -> np.ndarray:
+    """
+    Skyline-corner placement:
+      - Inflate dims for spacing-by-construction.
+      - At each step, candidate x are contour breakpoints.
+      - Choose breakpoint index deterministically from corner_keys[module].
+    """
+    n = len(widths)
+    infl_w = widths + float(min_dx)
+    infl_h = heights + float(min_dy)
+
+    x_bl = np.zeros(n, dtype=float)
+    y_bl = np.zeros(n, dtype=float)
+
+    contour = contour_init()
+
+    for u in order:
+        u = int(u)
+        xs = contour_breakpoints(contour)
+        if not xs:
+            xs = [0.0]
+
+        t = _sigmoid01(float(corner_keys[u]))  # (0,1)
+        idx = int(t * len(xs))
+        if idx >= len(xs):
+            idx = len(xs) - 1
+        x0 = float(xs[idx])
+
+        x_bl[u] = x0
+        y_bl[u] = contour_query_max(contour, x0, x0 + infl_w[u])
+        contour = contour_update(contour, x0, x0 + infl_w[u], y_bl[u] + infl_h[u])
+
+    # Convert to original centres
+    cx = x_bl + (min_dx / 2.0) + (widths / 2.0)
+    cy = y_bl + (min_dy / 2.0) + (heights / 2.0)
+
+    cx, cy = _center_into_canvas(cx, cy, widths, heights, canvas_w, canvas_h)
+
+    out = np.zeros(2 * n, dtype=float)
+    out[0::2] = cx
+    out[1::2] = cy
+    return out
+
+4) TCG-style: keys → two DAGs (Ch,Cv) → longest-path decode
+
+This is a graph-based formulation: horizontal and vertical precedence DAGs; coordinates come from longest paths (classic in these representations).
+
+Note: Full “TCG-S” has additional feasibility conditions and operations; this drop-in gives you a rigorous TCG-like decode that is solver-friendly and pairs well with metaheuristics (DE/GA/SA).
+
+# -------------------- TCG-style (Ch,Cv) decode --------------------
+
+@dataclass
+class TCG:
+    pi_a: List[int]          # permutation A
+    pi_b: List[int]          # permutation B
+    H_edges: List[List[int]] # horizontal edges i -> j (i left of j)
+    V_edges: List[List[int]] # vertical edges i -> j (i below j)
+
+def random_keys_to_tcg(keys_a: np.ndarray, keys_b: np.ndarray) -> TCG:
+    """
+    Build a TCG-like pair of precedence graphs from two permutations.
+    We use a classic SP-derived rule to assign each pair to exactly one of (H or V),
+    but we store it explicitly as two DAGs.
+    """
+    n = len(keys_a)
+    assert len(keys_b) == n
+
+    pi_a = list(np.argsort(keys_a))
+    pi_b = list(np.argsort(keys_b))
+    pos_b = {v: i for i, v in enumerate(pi_b)}
+
+    H_edges = [[] for _ in range(n)]
+    V_edges = [[] for _ in range(n)]
+
+    # O(n^2) pair assignment: for each i precedes j in pi_a,
+    # decide H vs V by relative order in pi_b.
+    for ia in range(n):
+        i = pi_a[ia]
+        for jb in range(ia + 1, n):
+            j = pi_a[jb]
+            if pos_b[i] < pos_b[j]:
+                # i left of j
+                H_edges[i].append(j)
+            else:
+                # i below j  (equivalently, j above i)
+                V_edges[i].append(j)
+
+    return TCG(pi_a=pi_a, pi_b=pi_b, H_edges=H_edges, V_edges=V_edges)
+
+def decode_tcg_longest_paths(widths: np.ndarray, heights: np.ndarray, tcg: TCG,
+                            min_dx: float = 0.0, min_dy: float = 0.0,
+                            canvas_w: Optional[float] = None, canvas_h: Optional[float] = None) -> np.ndarray:
+    """
+    Longest-path decode on DAGs:
+      x_left[j] = max_{i->j in Ch} (x_left[i] + infl_w[i])
+      y_bottom[j] = max_{i->j in Cv} (y_bottom[i] + infl_h[i])
+    Topological order: we can safely use pi_a as a topo order for both graphs
+    because edges are created only from earlier->later in pi_a.
+    """
+    n = len(widths)
+    infl_w = widths + float(min_dx)
+    infl_h = heights + float(min_dy)
+
+    x_left = np.zeros(n, dtype=float)
+    y_bottom = np.zeros(n, dtype=float)
+
+    topo = tcg.pi_a
+
+    # Horizontal
+    for i in topo:
+        base = x_left[i] + infl_w[i]
+        for j in tcg.H_edges[i]:
+            if base > x_left[j]:
+                x_left[j] = base
+
+    # Vertical
+    for i in topo:
+        base = y_bottom[i] + infl_h[i]
+        for j in tcg.V_edges[i]:
+            if base > y_bottom[j]:
+                y_bottom[j] = base
+
+    # Convert to original centres
+    cx = x_left + (min_dx / 2.0) + (widths / 2.0)
+    cy = y_bottom + (min_dy / 2.0) + (heights / 2.0)
+
+    cx, cy = _center_into_canvas(cx, cy, widths, heights, canvas_w, canvas_h)
+
+    out = np.zeros(2 * n, dtype=float)
+    out[0::2] = cx
+    out[1::2] = cy
+    return out
+
+5) Minimal integration into your current app (3 new decode cases)
+Add three new UI options
+
+Add these to your FORMULATION_OPTIONS (or wherever you list discrete encodings):
+
+"10. Discrete encoding: O-tree",
+"11. Discrete encoding: Corner Sequence (CBL/CS)",
+"12. Discrete encoding: TCG (Ch/Cv)",
+
+
+(If you must keep numbering tight, rename them to 6/7/8 etc. — your choice.)
+
+Decision dimension
+
+All three use 2n keys like your other discrete encodings:
+
+O-tree: keys_order (n) + keys_parent (n)
+
+Corner sequence: keys_order (n) + keys_corner (n)
+
+TCG: keys_a (n) + keys_b (n) (two permutations)
+
+Add these cases into FormulationEngine.decode_to_x(self, z)
+
+Drop this in next to your existing discrete decode cases:
+
+if name.startswith("10. Discrete encoding: O-tree"):
+    n = self.problem.n_rects
+    keys_order = z[:n]
+    keys_parent = z[n:2*n]
+    tree = random_keys_to_otree(keys_order, keys_parent)
+
+    cons = self.problem.constraints_cfg
+    min_dx = float(cons.get("min_spacing", {}).get("min_dx", 0.0))
+    min_dy = float(cons.get("min_spacing", {}).get("min_dy", 0.0))
+
+    widths = np.array([r.width for r in self.problem.rectangles], dtype=float)
+    heights = np.array([r.height for r in self.problem.rectangles], dtype=float)
+    scale = float(self.cfg.params.get("decode_spacing", 1.0))
+
+    return decode_otree_contour(
+        widths, heights, tree,
+        min_dx=min_dx*scale, min_dy=min_dy*scale,
+        canvas_w=self.problem.canvas_width, canvas_h=self.problem.canvas_height
+    )
+
+if name.startswith("11. Discrete encoding: Corner Sequence"):
+    n = self.problem.n_rects
+    keys_order = z[:n]
+    keys_corner = z[n:2*n]
+    order, corner_keys = random_keys_to_corner_sequence(keys_order, keys_corner)
+
+    cons = self.problem.constraints_cfg
+    min_dx = float(cons.get("min_spacing", {}).get("min_dx", 0.0))
+    min_dy = float(cons.get("min_spacing", {}).get("min_dy", 0.0))
+
+    widths = np.array([r.width for r in self.problem.rectangles], dtype=float)
+    heights = np.array([r.height for r in self.problem.rectangles], dtype=float)
+    scale = float(self.cfg.params.get("decode_spacing", 1.0))
+
+    return decode_corner_sequence_contour(
+        widths, heights, order, corner_keys,
+        min_dx=min_dx*scale, min_dy=min_dy*scale,
+        canvas_w=self.problem.canvas_width, canvas_h=self.problem.canvas_height
+    )
+
+if name.startswith("12. Discrete encoding: TCG"):
+    n = self.problem.n_rects
+    keys_a = z[:n]
+    keys_b = z[n:2*n]
+    tcg = random_keys_to_tcg(keys_a, keys_b)
+
+    cons = self.problem.constraints_cfg
+    min_dx = float(cons.get("min_spacing", {}).get("min_dx", 0.0))
+    min_dy = float(cons.get("min_spacing", {}).get("min_dy", 0.0))
+
+    widths = np.array([r.width for r in self.problem.rectangles], dtype=float)
+    heights = np.array([r.height for r in self.problem.rectangles], dtype=float)
+    scale = float(self.cfg.params.get("decode_spacing", 1.0))
+
+    return decode_tcg_longest_paths(
+        widths, heights, tcg,
+        min_dx=min_dx*scale, min_dy=min_dy*scale,
+        canvas_w=self.problem.canvas_width, canvas_h=self.problem.canvas_height
+    )
+
+Notes you’ll care about (practical floorplanning)
+
+All three decoders are “packing-by-construction” using inflated dims → they enforce non-overlap + min spacing structurally (for the inflated blocks). Boundary fit is still something you can penalize or handle via canvas centering/clamping.
+
+O-tree / Corner sequence are excellent when you need very fast decoding and a smaller search space (classic SA/GA loops).
+
+TCG-style is great when you want a clear graph model (and later can add constraints as graph edges / precedence).
