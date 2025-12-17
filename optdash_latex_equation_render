@@ -1,0 +1,463 @@
+Below is a drop-in, future-extensible “Equation Renderer” for Panel that:
+
+Watches formulation dropdown, normalization/aggregation controls, and all weight widgets
+
+Builds a LaTeX optimization problem that automatically omits inactive terms (weight == 0)
+
+Adds a human-readable header stating formulation + normalization + aggregation
+
+Is designed so future formulations can be added by registering one generator function (no rewrites)
+
+You can paste this into your code (e.g., near the UI/widget section) and then place equation_view anywhere in the layout.
+
+import math
+import panel as pn
+
+# ------------------------------------------------------------
+# Equation rendering utilities (NEW)
+# ------------------------------------------------------------
+
+EPS_ACTIVE = 1e-12  # weight == 0 => term is inactive
+
+def _latex_escape(name: str) -> str:
+    """Make plain identifiers safe in LaTeX."""
+    return name.replace("_", r"\_")
+
+def _fmt_float(v: float) -> str:
+    """Compact float for LaTeX / text."""
+    if v is None:
+        return "?"
+    if abs(v) >= 1000 or (abs(v) > 0 and abs(v) < 1e-3):
+        return f"{v:.2e}"
+    return f"{v:.6g}"
+
+def _active_weight_terms(weight_widgets: dict) -> dict:
+    """
+    weight_widgets: {term_name: widget_with_value}
+    Returns {term_name: weight_value} for active terms.
+    """
+    out = {}
+    for k, w in weight_widgets.items():
+        try:
+            val = float(w.value)
+        except Exception:
+            continue
+        if abs(val) > EPS_ACTIVE:
+            out[k] = val
+    return out
+
+def _join_weighted_sum_latex(active_terms: dict, symbol_map: dict, prefix: str = "") -> str:
+    """
+    active_terms: {name: weight}
+    symbol_map: {name: latex_symbol}
+    """
+    parts = []
+    for name, w in active_terms.items():
+        sym = symbol_map.get(name, _latex_escape(name))
+        parts.append(rf"{prefix}{_fmt_float(w)}\,{sym}")
+    return " + ".join(parts) if parts else r"0"
+
+# ------------------------------------------------------------
+# Formulation registry (future-proof extension point)
+# Each formulation returns:
+#   - title_text: str
+#   - latex_block: str  (full LaTeX optimization statement)
+# ------------------------------------------------------------
+
+def eq_soft_penalty(ctx: dict) -> tuple[str, str]:
+    # ctx contains: obj_active, con_active, params, normalization_text, aggregation_text
+    obj = ctx["obj_active"]
+    con = ctx["con_active"]
+    obj_sym = ctx["obj_symbol_map"]
+    con_sym = ctx["con_symbol_map"]
+
+    f = _join_weighted_sum_latex(obj, obj_sym)
+    # generic penalty: sum_k λ_k * φ_k(v_k(x))  (you can match your code exactly if you have a specific φ)
+    # Here v_k(x) is "violation term" (>=0)
+    if con:
+        pen_terms = []
+        for name, w in con.items():
+            v = con_sym.get(name, _latex_escape(name))
+            pen_terms.append(rf"{_fmt_float(w)}\,\phi\!\left({v}(x)\right)")
+        P = " + ".join(pen_terms)
+    else:
+        P = r"0"
+
+    latex = rf"""
+\[
+\begin{{aligned}}
+\min_{{x \in \mathbb{{R}}^{{2N}}}} \quad
+F(x) &= f(x) + P(x) \\
+f(x) &= {f} \\
+P(x) &= {P}
+\end{{aligned}}
+\]
+"""
+    title = f"Formulation: Soft penalty (weighted sum) | {ctx['normalization_text']} | {ctx['aggregation_text']}"
+    return title, latex
+
+def eq_barrier(ctx: dict) -> tuple[str, str]:
+    obj = ctx["obj_active"]
+    obj_sym = ctx["obj_symbol_map"]
+    f = _join_weighted_sum_latex(obj, obj_sym)
+
+    mu = _fmt_float(ctx["params"].get("mu", 1.0))
+    btype = ctx["params"].get("barrier_type", "log")
+    eps = _fmt_float(ctx["params"].get("feas_eps", 1e-12))
+
+    # g_k(x) > 0 slacks (inequalities)
+    latex = rf"""
+\[
+\begin{{aligned}}
+\min_{{x}} \quad
+F_\mu(x) &= f(x) + \mu\,B(x) \\
+f(x) &= {f} \\
+B(x) &=
+\sum_{{k=1}}^{{K}} b\!\left(g_k(x)-{eps}\right),
+\qquad g_k(x) > 0
+\end{{aligned}}
+\]
+\[
+b(t)=
+\begin{{cases}}
+-\log(t) & \text{{if barrier = {btype}}} \\
+\text{{(other barrier options supported in code)}} & \\
+\end{{cases}}
+\]
+"""
+    title = f"Formulation: Barrier (interior-point) | barrier={btype}, μ={mu} | {ctx['normalization_text']} | {ctx['aggregation_text']}"
+    return title, latex
+
+def eq_lexicographic(ctx: dict) -> tuple[str, str]:
+    obj = ctx["obj_active"]
+    obj_sym = ctx["obj_symbol_map"]
+    f = _join_weighted_sum_latex(obj, obj_sym)
+
+    eps = _fmt_float(ctx["params"].get("eps", 1e-4))
+    latex = rf"""
+\[
+\begin{{aligned}}
+\text{{Phase 1:}} \quad &\min_x \; V(x) \\
+\text{{Phase 2:}} \quad &\min_x \; f(x)
+\;\;\text{{s.t.}}\;\; V(x) \le V_{{\min}} + {eps}
+\end{{aligned}}
+\]
+\[
+f(x) = {f}
+\qquad\qquad
+V(x)\ge 0\;\; \text{{(total constraint violation; }V(x)=0\text{{ is feasible)}}
+}
+\]
+"""
+    title = f"Formulation: Lexicographic (hierarchical) | eps={eps} | {ctx['normalization_text']} | {ctx['aggregation_text']}"
+    return title, latex
+
+def eq_feasible_sqp(ctx: dict) -> tuple[str, str]:
+    obj = ctx["obj_active"]
+    obj_sym = ctx["obj_symbol_map"]
+    f = _join_weighted_sum_latex(obj, obj_sym)
+
+    latex = rf"""
+\[
+\begin{{aligned}}
+\min_x \quad & f(x) \\
+\text{{s.t.}}\quad & g_k(x) \ge 0 \;\;\; \forall k
+\end{{aligned}}
+\]
+\[
+f(x) = {f}
+\qquad\qquad
+\text{{(Solved via feasible-direction / active-set / SQP-style constrained steps)}}
+\]
+"""
+    title = f"Formulation: Feasible direction / active-set (SQP-style) | {ctx['normalization_text']} | {ctx['aggregation_text']}"
+    return title, latex
+
+def eq_reduced_space(ctx: dict) -> tuple[str, str]:
+    obj = ctx["obj_active"]
+    con = ctx["con_active"]
+    obj_sym = ctx["obj_symbol_map"]
+    con_sym = ctx["con_symbol_map"]
+
+    f = _join_weighted_sum_latex(obj, obj_sym)
+    mapping = ctx["params"].get("map", "sigmoid")
+
+    # show penalties if enabled
+    if con:
+        pen_terms = []
+        for name, w in con.items():
+            v = con_sym.get(name, _latex_escape(name))
+            pen_terms.append(rf"{_fmt_float(w)}\,\phi\!\left({v}(T(z))\right)")
+        P = " + ".join(pen_terms)
+    else:
+        P = r"0"
+
+    latex = rf"""
+\[
+\begin{{aligned}}
+\min_{{z}} \quad & F(z) = f(T(z)) + P(T(z)) \\
+x &= T(z)\in [\ell, u] \quad \text{{(mapping: {mapping})}}
+\end{{aligned}}
+\]
+\[
+f(x) = {f}
+\qquad\qquad
+P(x) = {P}
+\]
+"""
+    title = f"Formulation: Reduced-space / manifold mapping | T={mapping} | {ctx['normalization_text']} | {ctx['aggregation_text']}"
+    return title, latex
+
+def eq_discrete_generic(ctx: dict, name: str) -> tuple[str, str]:
+    obj = ctx["obj_active"]
+    con = ctx["con_active"]
+    obj_sym = ctx["obj_symbol_map"]
+    con_sym = ctx["con_symbol_map"]
+    f = _join_weighted_sum_latex(obj, obj_sym)
+    # penalties shown generically (decode usually guarantees non-overlap, but keep future constraints)
+    if con:
+        P = " + ".join([rf"{_fmt_float(w)}\,\phi\!\left({con_sym.get(k,_latex_escape(k))}(\mathrm{{decode}}(s))\right)"
+                        for k, w in con.items()])
+    else:
+        P = "0"
+    latex = rf"""
+\[
+\begin{{aligned}}
+\min_{{s \in \mathcal{{S}}}} \quad & F(s) = f(\mathrm{{decode}}(s)) + P(\mathrm{{decode}}(s)) \\
+x &= \mathrm{{decode}}(s) \in \mathcal{{C}}
+\end{{aligned}}
+\]
+\[
+f(x) = {f}
+\qquad\qquad
+P(x) = {P}
+\]
+"""
+    title = f"Formulation: {name} | decision=s, decode(s)->x | {ctx['normalization_text']} | {ctx['aggregation_text']}"
+    return title, latex
+
+def eq_milp(ctx: dict) -> tuple[str, str]:
+    obj = ctx["obj_active"]
+    obj_sym = ctx["obj_symbol_map"]
+    f = _join_weighted_sum_latex(obj, obj_sym)
+
+    latex = rf"""
+\[
+\begin{{aligned}}
+\min \quad & f(x) \\
+\text{{s.t.}}\quad &
+\text{{(linear constraints + disjunctive non-overlap encoded with binaries)}} \\
+& x \in \mathbb{{R}}^{{2N}},\;\; z \in \{{0,1\}}^{{M}}
+\end{{aligned}}
+\]
+\[
+f(x) = {f}
+\]
+"""
+    title = f"Formulation: MIP/MILP | mixed continuous+binary variables | {ctx['normalization_text']} | {ctx['aggregation_text']}"
+    return title, latex
+
+def eq_cpsat(ctx: dict) -> tuple[str, str]:
+    obj = ctx["obj_active"]
+    obj_sym = ctx["obj_symbol_map"]
+    f = _join_weighted_sum_latex(obj, obj_sym)
+
+    latex = rf"""
+\[
+\begin{{aligned}}
+\min \quad & f(x) \\
+\text{{s.t.}}\quad &
+\text{{NoOverlap2D / packing constraints + other declarative constraints}} \\
+& x \in \mathbb{{Z}}^{{2N}} \;\; \text{{(scaled integer model)}}
+\end{{aligned}}
+\]
+\[
+f(x) = {f}
+\]
+"""
+    title = f"Formulation: CP / CP-SAT packing | constraint-based search | {ctx['normalization_text']} | {ctx['aggregation_text']}"
+    return title, latex
+
+# Registry: key is formulation_select.value
+FORMULATION_EQUATION_REGISTRY = {
+    "0. Soft penalty (weighted sum)": eq_soft_penalty,
+    "1. Barrier constraints (interior-point)": eq_barrier,
+    "2. Lexicographic (hierarchical) optimization": eq_lexicographic,
+    "3. Feasible direction / active-set (SQP-style)": eq_feasible_sqp,
+    "4. Reduced space / manifold mapping": eq_reduced_space,
+    "5. Discrete encoding: Sequence Pair": lambda ctx: eq_discrete_generic(ctx, "Discrete encoding: Sequence Pair"),
+    "6. Discrete encoding: B*-tree":      lambda ctx: eq_discrete_generic(ctx, "Discrete encoding: B*-tree"),
+    "7. Discrete encoding: Slicing tree": lambda ctx: eq_discrete_generic(ctx, "Discrete encoding: Slicing tree"),
+    "8. MIP/MILP model (mixed-integer)": eq_milp,
+    "9. CP/CP-SAT packing":              eq_cpsat,
+}
+
+# ------------------------------------------------------------
+# Builder: returns a Panel view + attaches callbacks
+# ------------------------------------------------------------
+
+def build_equation_view(
+    formulation_select_widget,
+    formulation_param_widgets_by_formulation: dict,
+    objective_weight_widgets: dict,
+    constraint_weight_widgets: dict,
+    *,
+    obj_symbol_map: dict,
+    con_symbol_map: dict,
+    # Optional UI controls (pass None if you don't have them yet)
+    normalization_select_widget=None,
+    aggregation_select_widget=None,
+    extra_text_widget=None,
+):
+    """
+    objective_weight_widgets: {term_name: widget}
+    constraint_weight_widgets: {term_name: widget}
+    formulation_param_widgets_by_formulation:
+        {formulation_name: [widgets...]}  (like your FORM_PARAM_WIDGETS)
+    """
+
+    header = pn.pane.Markdown("", sizing_mode="stretch_width")
+    latex = pn.pane.LaTeX("", sizing_mode="stretch_width")
+
+    def _collect_form_params() -> dict:
+        form = formulation_select_widget.value
+        params = {}
+        for w in formulation_param_widgets_by_formulation.get(form, []):
+            params[w.name] = w.value
+        return params
+
+    def _norm_text() -> str:
+        if normalization_select_widget is None:
+            return "normalization: (none)"
+        return f"normalization: `{normalization_select_widget.value}`"
+
+    def _agg_text() -> str:
+        if aggregation_select_widget is None:
+            return "aggregation: (default)"
+        return f"aggregation: `{aggregation_select_widget.value}`"
+
+    def _render(event=None):
+        form = formulation_select_widget.value
+        gen = FORMULATION_EQUATION_REGISTRY.get(form, None)
+
+        obj_active = _active_weight_terms(objective_weight_widgets)
+        con_active = _active_weight_terms(constraint_weight_widgets)
+
+        ctx = {
+            "formulation": form,
+            "params": _collect_form_params(),
+            "obj_active": obj_active,
+            "con_active": con_active,
+            "obj_symbol_map": obj_symbol_map,
+            "con_symbol_map": con_symbol_map,
+            "normalization_text": _norm_text(),
+            "aggregation_text": _agg_text(),
+        }
+
+        if gen is None:
+            title_text = f"Formulation: {form} (no equation generator registered) | {ctx['normalization_text']} | {ctx['aggregation_text']}"
+            latex_block = r"\[\text{No LaTeX generator registered for this formulation.}\]"
+        else:
+            title_text, latex_block = gen(ctx)
+
+        extra = ""
+        if extra_text_widget is not None and getattr(extra_text_widget, "value", ""):
+            extra = f"\n\n**Notes:** {extra_text_widget.value}"
+
+        header.object = f"**{title_text}**{extra}"
+        latex.object = latex_block
+
+    # --- Attach watchers (safe: only watch real widget params) ---
+    formulation_select_widget.param.watch(_render, "value")
+
+    # Watch all formulation parameter widgets
+    for form_name, ws in formulation_param_widgets_by_formulation.items():
+        for w in ws:
+            # Most widgets use "value"; guard just in case
+            if "value" in w.param:
+                w.param.watch(_render, "value")
+
+    # Watch all weight widgets
+    for w in list(objective_weight_widgets.values()) + list(constraint_weight_widgets.values()):
+        if "value" in w.param:
+            w.param.watch(_render, "value")
+
+    if normalization_select_widget is not None and "value" in normalization_select_widget.param:
+        normalization_select_widget.param.watch(_render, "value")
+
+    if aggregation_select_widget is not None and "value" in aggregation_select_widget.param:
+        aggregation_select_widget.param.watch(_render, "value")
+
+    if extra_text_widget is not None and "value" in extra_text_widget.param:
+        extra_text_widget.param.watch(_render, "value")
+
+    # Initial render
+    _render()
+
+    view = pn.Column(
+        header,
+        latex,
+        sizing_mode="stretch_width",
+    )
+    return view
+
+How to plug it into your existing dashboard
+1) Define symbol maps (you can extend anytime)
+
+OBJ_SYMBOL_MAP = {
+    "hpwl": r"\mathrm{HPWL}(x)",
+    "bbox_aspect": r"\mathrm{AR}_{\mathrm{bbox}}(x)",
+    "bbox_area": r"\mathrm{Area}_{\mathrm{bbox}}(x)",
+}
+
+CON_SYMBOL_MAP = {
+    "overlap_max_ratio": r"v_{\mathrm{overlap}}",
+    "spacing_x_violation": r"v_{\Delta x}",
+    "spacing_y_violation": r"v_{\Delta y}",
+    "bbox_ar_violation": r"v_{\mathrm{AR}}",
+    "boundary_violation": r"v_{\mathrm{boundary}}",
+}
+
+
+2) Call the builder with your widgets
+
+Assuming you already have:
+
+formulation_select
+
+FORM_PARAM_WIDGETS
+
+weight widgets dicts like objective_weight_widgets = {"hpwl": w_hpwl, ...} etc.
+
+
+equation_view = build_equation_view(
+    formulation_select_widget=formulation_select,
+    formulation_param_widgets_by_formulation=FORM_PARAM_WIDGETS,
+    objective_weight_widgets=objective_weight_widgets,
+    constraint_weight_widgets=constraint_weight_widgets,
+    obj_symbol_map=OBJ_SYMBOL_MAP,
+    con_symbol_map=CON_SYMBOL_MAP,
+    normalization_select_widget=normalization_select,   # pass None if you don't have it
+    aggregation_select_widget=aggregation_select,       # pass None if you don't have it
+    extra_text_widget=None,                             # optional notes
+)
+
+
+3) Place equation_view in your UI
+
+You can put it in the Parameters section (e.g., last row), or in another tab, or under Live Updates—anywhere.
+
+Adding future formulations (requirement #3)
+
+To support a new formulation later:
+
+Create a new generator function def eq_new(ctx): ...
+
+Register it:
+
+FORMULATION_EQUATION_REGISTRY["10. My New Formulation"] = eq_new
+
+
+That’s it. The renderer already passes active weights + params + normalization/aggregation context.
+
+If you share the exact names of your current weight widgets + normalization/aggregation widgets (as they exist in your code), I can give you a copy-paste integration block that matches your variable names exactly.
