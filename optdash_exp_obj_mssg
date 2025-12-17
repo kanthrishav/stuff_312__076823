@@ -1,0 +1,193 @@
+# In your existing class PlacementProblem: add this method (anywhere inside the class, e.g. after compute_metrics or make_rectangle_shapes):
+  def estimate_expected_augmented_objective(self) -> dict:
+        """
+        Estimate a 'best-case' augmented objective value to give context to the
+        objective history plot. This is NOT exact, but a reasonable lower bound.
+
+        Assumptions:
+        - All rectangles are expanded by a 'buffer' margin from the config:
+            constraints["buffer"]
+        - No overlaps.
+        - Bounding-box aspect ratio is exactly at the target threshold.
+        - Spacing constraints are ignored (as requested).
+        - Canvas boundary constraint is approximated using the expected bounding box.
+        """
+        cons_cfg = self.constraints_cfg or {}
+
+        # --- 1) Expand rectangles by buffer and sum areas ---------------------
+        buffer = float(cons_cfg.get("buffer", 0.0))
+        total_area_buffer = 0.0
+        for r in self.rectangles:
+            w_ext = max(0.0, r.width + 2.0 * buffer)
+            h_ext = max(0.0, r.height + 2.0 * buffer)
+            total_area_buffer += w_ext * h_ext
+
+        if total_area_buffer <= 0.0:
+            # Degenerate configuration – no meaningful expected value
+            return {"expected_augmented": float("nan")}
+
+        # --- 2) Target aspect ratio from constraint ---------------------------
+        bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+        ar_target = float(bbox_ar_cfg.get("threshold", 1.0))
+        if ar_target <= 0.0:
+            ar_target = 1.0  # fall back to square
+
+        # Enforce area = total_area_buffer AND aspect ratio = ar_target
+        # Solve:  width * height = total_area_buffer  and  width/height = ar_target
+        # => width = sqrt(area * ar_target), height = area / width
+        width_expected = math.sqrt(total_area_buffer * ar_target)
+        height_expected = total_area_buffer / width_expected
+
+        # --- 3) Approximate HPWL ----------------------------------------------
+        # For a tight packing spanning the whole bounding box, HPWL is ~ W + H
+        hpwl_expected = width_expected + height_expected
+
+        # --- 4) Pure objective at this 'ideal' configuration ------------------
+        pure_obj = (
+            self.weight_hpwl * hpwl_expected
+            + self.weight_bbox_aspect * ar_target
+            + self.weight_bbox_area * total_area_buffer
+        )
+
+        # --- 5) Approximate boundary violation penalty -----------------------
+        # Assume the ideal bounding box is placed on the canvas. If it does not
+        # fit, approximate how much it exceeds the canvas dimensions.
+        boundary_cfg = cons_cfg.get("canvas_boundary", {})
+        w_boundary = float(boundary_cfg.get("penalty_weight", 500.0))
+
+        violation_x = max(0.0, width_expected - self.canvas_width)
+        violation_y = max(0.0, height_expected - self.canvas_height)
+        boundary_violation = violation_x + violation_y
+        boundary_penalty = w_boundary * (boundary_violation ** 2)
+
+        expected_aug = pure_obj + boundary_penalty
+
+        return {
+            "expected_augmented": float(expected_aug),
+            "hpwl_expected": float(hpwl_expected),
+            "bbox_ar_target": float(ar_target),
+            "bbox_area_buffer": float(total_area_buffer),
+            "boundary_penalty": float(boundary_penalty),
+        }
+
+
+# In your OptimizationManager.__init__, after you create self.status_text, add:
+
+        # Below-status info panes (expected objective + elapsed time)
+        self.expected_obj_text = pn.pane.Markdown(
+            "Expected Augmented Objective (approx): -",
+            style={
+                "color": UI_TEXT_COLOUR,
+                "font-size": PARAM_PANEL_FONT_SIZE,
+                "font-family": UI_FONT_FAMILY,
+            },
+        )
+
+        self.elapsed_time_text = pn.pane.Markdown(
+            "Elapsed time: 0.00 s",
+            style={
+                "color": UI_TEXT_COLOUR,
+                "font-size": PARAM_PANEL_FONT_SIZE,
+                "font-family": UI_FONT_FAMILY,
+            },
+        )
+
+        # Timing info for the current/last optimization run
+        self.start_time: Optional[float] = None
+        self.last_run_elapsed: float = 0.0
+
+
+
+
+# Helper Methods for OptimizationManager
+    def update_expected_objective_text(self) -> None:
+        """
+        Update the text showing an approximate 'best-case' augmented objective,
+        and compare it against the current best solution (if any).
+        """
+        if self.problem is None:
+            self.expected_obj_text.object = "Expected Augmented Objective (approx): -"
+            return
+
+        try:
+            info = self.problem.estimate_expected_augmented_objective()
+            exp_val = info.get("expected_augmented", None)
+
+            # Guard against NaNs / invalids
+            if exp_val is None or not math.isfinite(exp_val):
+                self.expected_obj_text.object = "Expected Augmented Objective (approx): -"
+                return
+
+            with self._lock:
+                best_aug = (
+                    self.best_metrics["objective_augmented"]
+                    if self.best_metrics is not None
+                    else None
+                )
+
+            if best_aug is not None and math.isfinite(best_aug):
+                ratio = best_aug / exp_val if exp_val != 0 else float("inf")
+                self.expected_obj_text.object = (
+                    f"Expected Augmented Objective (approx): {exp_val:.3f}  |  "
+                    f"Best so far: {best_aug:.3f}  (ratio={ratio:.3f}×)"
+                )
+            else:
+                self.expected_obj_text.object = (
+                    f"Expected Augmented Objective (approx): {exp_val:.3f}"
+                )
+        except Exception as exc:
+            # Never let this crash the UI; just show the error in the text
+            self.expected_obj_text.object = (
+                f"Expected Augmented Objective (approx): error computing ({exc})"
+            )
+            self.log_error("expected_objective", f"{exc}", level="WARNING")
+
+    def update_elapsed_time_text(self) -> None:
+        """
+        Update the elapsed time text for the current optimization run.
+        If no run is active, show the duration of the last completed run.
+        """
+        if self.start_time is not None and self.running:
+            elapsed = time.perf_counter() - self.start_time
+        else:
+            elapsed = self.last_run_elapsed
+
+        self.elapsed_time_text.object = f"Elapsed time: {elapsed:0.2f} s"
+
+
+# In load_config_from_file and/or load_config_from_json_str, after you create self.problem = PlacementProblem(cfg) and _reset_state(), call:
+        self.update_expected_objective_text()
+        self.update_elapsed_time_text()
+
+# In your start_run method (the one that the Run button calls), right before you start the worker thread, add:
+        # Reset and start timing for this run
+        self.start_time = time.perf_counter()
+        self.last_run_elapsed = 0.0
+        self.update_elapsed_time_text()
+        # Make sure expected objective text is fresh (weights/config may have changed)
+        self.update_expected_objective_text()
+
+
+# In your _run_optimizer_worker method, in the finally: block (or at the very end of the function, just before it returns), add:
+        # Record final elapsed time when the worker exits
+        if self.start_time is not None:
+            self.last_run_elapsed = time.perf_counter() - self.start_time
+        self.update_elapsed_time_text()
+
+# In your periodic_update method (the one called by add_periodic_callback that already updates plots and canvas), at the end of the function add:
+        # Even if there were no new steps, keep these contextual numbers updated
+        self.update_expected_objective_text()
+        self.update_elapsed_time_text()
+
+
+    # Row 9: Status + expected objective + elapsed time (stacked)
+    pn.Column(
+        manager.status_text,
+        manager.expected_obj_text,
+        manager.elapsed_time_text,
+        sizing_mode="stretch_width",
+        css_classes=["param-row"],
+    ),
+
+
+
