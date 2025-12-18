@@ -1,0 +1,1419 @@
+Below is an add-on that introduces a new “Batch / Parallel Runs” tab plus a ParallelRunManager (runner class) that:
+
+Sweeps all combinations of:
+
+optimizers (list)
+
+objective weights + constraint penalty weights (lists/ranges/single)
+
+max_iter (list/range/single) → always “max iter only”
+
+per-constraint normalization list
+
+per-constraint aggregation list
+
+overlap_buffer list/range/single
+
+per-optimizer parameters (lists/ranges/single) for every parameter you already expose
+
+Runs them in parallel using concurrent.futures.ThreadPoolExecutor with a separate “max parallel runs” control (distinct from your existing “optimizer threads” control).
+
+Forces internal optimizer threads = 1 for these runs (DE workers=1; the “threads” parameter in your existing code is always set to 1 for batch runs).
+
+Tracks for each run:
+
+all inputs used
+
+best solution coordinates
+
+all objective terms + constraint terms
+
+Appends into the same JSON file after each run completes.
+
+Updates a table (one row per run) as each run completes.
+
+Has Stop All and Stop Selected Run (immediate stop) controls.
+
+Shows a canvas view below the table. When the batch is fully stopped/finished, it displays the best solution across all completed runs and prints which run won.
+
+Important constraints you gave
+
+✅ No existing classes touched (PlacementProblem, OptimizationManager, InputPlacementManager unchanged).
+
+✅ Runner is a new class; it uses existing objective/constraint computation via PlacementProblem.compute_metrics().
+
+✅ UI updates are done via a producer–consumer queue drained by the main Panel callback → avoids “Dropping a patch…” spam.
+
+1) Add these imports (near your other imports)
+import copy
+import itertools
+import queue
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+2) Add these CSS classes to your existing DASHBOARD_CSS string
+
+Append inside DASHBOARD_CSS = f""" ... """:
+
+.batch-input-section {
+  width: 100vw;
+  height: 22vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background-color: #0b1020;
+  padding: 4px;
+  box-sizing: border-box;
+}
+
+.batch-table-section {
+  width: 100vw;
+  height: 40vh;
+  overflow: hidden;
+  background-color: #050816;
+  padding: 4px;
+  box-sizing: border-box;
+}
+
+.batch-canvas-section {
+  width: 100vw;
+  height: 32vh;
+  overflow: hidden;
+  background-color: #050816;
+  padding: 4px;
+  box-sizing: border-box;
+}
+
+.batch-best-section {
+  width: 100vw;
+  height: 6vh;
+  overflow: hidden;
+  background-color: #050816;
+  padding: 4px;
+  box-sizing: border-box;
+}
+
+3) Paste this new Runner class + Batch Tab UI (do not modify existing classes)
+
+Place this after your existing managers are created (after manager = OptimizationManager() and input_manager = InputPlacementManager()), and after your figures are defined (so we can reuse style constants).
+
+# =============================================================================
+# PARALLEL / BATCH RUN MANAGER (NEW)
+# =============================================================================
+#
+# Design patterns explicitly used:
+# 1) Strategy Pattern:
+#    - OPTIMIZER_STRATEGIES maps optimizer name -> execution function.
+#    - New optimizers can be added by registering a new strategy without
+#      changing orchestration logic.
+#
+# 2) Builder Pattern:
+#    - _build_run_specs() constructs run specs from UI sweep parameters.
+#    - Future inputs can be added by extending the builder, without touching
+#      execution scheduling.
+#
+# 3) Producer–Consumer (Queue) Pattern:
+#    - Worker threads NEVER touch Panel/Bokeh UI objects directly.
+#    - Each worker produces results into a thread-safe queue.
+#    - Main thread (Panel periodic callback) consumes queue to update UI/table.
+#    - This prevents Bokeh document patch conflicts and "Dropping a patch..." spam.
+#
+# 4) Command Pattern for stop requests:
+#    - stop_all() and stop_run(run_id) are commands that set Events.
+#    - Objective wrappers check Events and abort quickly.
+#
+# =============================================================================
+
+class BatchStopRequested(Exception):
+    """Raised internally to abort a batch-run optimization quickly."""
+    pass
+
+
+def _parse_numeric_sweep(spec: str, as_int: bool = False) -> list:
+    """
+    Parse a sweep spec string into a list of numbers.
+
+    Supported forms:
+      - Single value: "10"
+      - List: "10, 20, 30"
+      - Range: "start:stop:step" e.g. "0.1:1.0:0.1"
+
+    Notes:
+      - Range is inclusive of stop if it lands exactly; otherwise stops before.
+      - Returns float list unless as_int=True (then cast to int).
+    """
+    if spec is None:
+        return []
+    s = str(spec).strip()
+    if not s:
+        return []
+
+    if ":" in s:
+        parts = [p.strip() for p in s.split(":")]
+        if len(parts) != 3:
+            raise ValueError(f"Invalid range spec '{s}'. Use start:stop:step.")
+        start = float(parts[0])
+        stop = float(parts[1])
+        step = float(parts[2])
+        if step == 0:
+            raise ValueError("Step cannot be 0 in range spec.")
+        vals = []
+        x = start
+        # robust loop for floats
+        if step > 0:
+            while x <= stop + 1e-12:
+                vals.append(x)
+                x += step
+        else:
+            while x >= stop - 1e-12:
+                vals.append(x)
+                x += step
+    else:
+        vals = [float(x.strip()) for x in s.split(",") if x.strip()]
+
+    if as_int:
+        return [int(round(v)) for v in vals]
+    return vals
+
+
+def _parse_string_sweep(spec: str) -> list:
+    """
+    Parse a sweep spec string into a list of strings.
+
+      - Single: "max"
+      - List: "max,sum,product"
+    """
+    if spec is None:
+        return []
+    s = str(spec).strip()
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+class ParallelRunManager:
+    """
+    Orchestrates many optimization runs on the same rectangles config with
+    different:
+      - optimizer choice
+      - objective weights / constraint penalty weights
+      - constraint normalization / aggregation / overlap buffer
+      - max_iter
+      - optimizer parameters
+
+    Runs are executed using ThreadPoolExecutor.
+    """
+
+    def __init__(self):
+        # -------------------- Base config --------------------
+        self.base_config: dict | None = None
+        self.base_config_name: str = "batch_config.json"
+
+        # -------------------- Execution state ----------------
+        self._executor: ThreadPoolExecutor | None = None
+        self._global_stop = threading.Event()
+        self._lock = threading.Lock()
+
+        self._result_queue: "queue.Queue[dict]" = queue.Queue()
+        self._run_specs: list[dict] = []
+        self._next_index: int = 0
+        self._active: dict[str, dict] = {}  # run_id -> {"future":..., "stop": Event, "spec":...}
+        self._completed_results: list[dict] = []
+
+        # Output file
+        self.output_file: str = "batch_runs_results.json"
+
+        # Best across all completed runs
+        self.best_run_id: str | None = None
+        self.best_run_result: dict | None = None
+
+        # -------------------- UI widgets ----------------------
+        self.batch_file_input = pn.widgets.FileInput(accept=".json", multiple=False, width=180)
+        self.batch_load_btn = pn.widgets.Button(name="Load Batch Config", button_type="primary", width=140)
+
+        self.optimizers_multi = pn.widgets.MultiChoice(
+            name="Optimizers",
+            options=[
+                "Differential Evolution",
+                "Dual Annealing (Simulated Annealing)",
+                "Basin Hopping (Simulated Annealing)",
+                "Nelder-Mead",
+                "Powell",
+                "CG",
+                "L-BFGS-B",
+                "SLSQP",
+                "Trust-Constr (Quadratic Programming-like)",
+                "Adam (PyTorch)",
+                "Genetic Algorithm (pygad)",
+            ],
+            value=["Differential Evolution"],
+            width=420,
+        )
+
+        # Max parallel runs (distinct from your existing optimizer threads control)
+        self.max_parallel_runs = pn.widgets.IntInput(name="Max Parallel Runs", value=2, step=1, width=140)
+
+        # Output file
+        self.output_file_input = pn.widgets.TextInput(name="Output JSON", value=self.output_file, width=240)
+
+        # Global max_iter sweep (applies to every optimizer)
+        self.max_iter_spec = pn.widgets.TextInput(
+            name="max_iter sweep",
+            placeholder="e.g. 200 or 100,200,300 or 50:200:50",
+            value="200",
+            width=280,
+        )
+
+        # Objective weights sweep
+        self.w_hpwl_spec = pn.widgets.TextInput(name="w_hpwl", value="1.0", width=140)
+        self.w_bbox_aspect_spec = pn.widgets.TextInput(name="w_bbox_aspect", value="0.5", width=140)
+        self.w_bbox_area_spec = pn.widgets.TextInput(name="w_bbox_area", value="0.01", width=140)
+
+        # Constraint penalty weights sweep
+        self.w_overlap_spec = pn.widgets.TextInput(name="w_overlap", value="1000", width=140)
+        self.w_spacing_spec = pn.widgets.TextInput(name="w_spacing", value="500", width=140)
+        self.w_bbox_ar_con_spec = pn.widgets.TextInput(name="w_bbox_ar_con", value="50", width=140)
+        self.w_boundary_spec = pn.widgets.TextInput(name="w_boundary", value="500", width=140)
+
+        # overlap buffer sweep (no_overlap.buffer)
+        self.overlap_buffer_spec = pn.widgets.TextInput(
+            name="overlap_buffer",
+            placeholder="e.g. 0 or 0,1,2 or 0:5:1",
+            value="0",
+            width=180,
+        )
+
+        # Constraint normalization/aggregation sweeps (dynamic from loaded config)
+        self.constraint_controls_container = pn.Column()
+        self._constraint_norm_inputs: dict[str, pn.widgets.TextInput] = {}
+        self._constraint_aggr_inputs: dict[str, pn.widgets.TextInput] = {}
+
+        # Optimizer parameter sweeps (dynamic based on selected optimizers)
+        self.optimizer_param_container = pn.Column()
+        self._optimizer_param_inputs: dict[tuple[str, str], pn.widgets.TextInput] = {}
+
+        # Planning + control
+        self.plan_btn = pn.widgets.Button(name="Build Plan", button_type="primary", width=100)
+        self.start_btn = pn.widgets.Button(name="Start Batch", button_type="success", width=100)
+        self.stop_all_btn = pn.widgets.Button(name="Stop All", button_type="danger", width=90)
+
+        self.stop_selected_btn = pn.widgets.Button(name="Stop Selected Run", button_type="warning", width=140)
+        self.running_run_select = pn.widgets.Select(name="Running Run ID", options=[], width=220)
+
+        self.plan_info = pn.pane.Markdown("Plan: -", style={"color": UI_TEXT_COLOUR})
+
+        self.status = pn.pane.Markdown("Batch Status: idle", style={"color": UI_TEXT_COLOUR})
+
+        # Results table
+        self.runs_table = pn.widgets.Tabulator(
+            pd.DataFrame(columns=[
+                "run_id", "status", "optimizer", "max_iter",
+                "w_hpwl","w_bbox_aspect","w_bbox_area",
+                "w_overlap","w_spacing","w_bbox_ar_con","w_boundary",
+                "overlap_buffer",
+                "normalizations", "aggregations",
+                "optimizer_params",
+                "best_aug_obj", "bbox_area",
+                "overlap_max_ratio", "boundary_violation",
+                "runtime_s", "message",
+            ]),
+            pagination=None,
+            theme="fast",
+            sizing_mode="stretch_both",
+        )
+
+        # Canvas view (best across all)
+        self.batch_canvas_source = ColumnDataSource(data=dict(x=[], y=[], w=[], h=[], rect_id=[], placement_id=[]))
+        self.batch_bbox_source = ColumnDataSource(data=dict(x=[], y=[], w=[], h=[]))
+        self.batch_label_source = ColumnDataSource(data=dict(x=[0.0], y=[0.0], text=["Best: -"]))
+
+        self.batch_canvas_fig = figure(
+            title="Batch Best Canvas View",
+            match_aspect=True,
+            tools="pan,wheel_zoom,reset",
+            background_fill_color=COLORS["panel_bg"],
+            border_fill_color=COLORS["panel_bg"],
+            toolbar_location="right",
+            sizing_mode="stretch_both",
+        )
+        self.batch_canvas_fig.grid.grid_line_color = COLORS["grid"]
+        self.batch_canvas_fig.title.text_color = COLORS["primary"]
+        self.batch_canvas_fig.axis.axis_label_text_color = UI_TEXT_COLOUR
+        self.batch_canvas_fig.axis.major_label_text_color = UI_TEXT_COLOUR
+
+        self.batch_canvas_fig.rect(
+            x="x", y="y", width="w", height="h",
+            source=self.batch_canvas_source,
+            fill_alpha=0.25, line_alpha=0.9,
+            fill_color=COLORS["rect_fill"], line_color=COLORS["rect_line"],
+        )
+        self.batch_canvas_fig.rect(
+            x="x", y="y", width="w", height="h",
+            source=self.batch_bbox_source,
+            fill_alpha=0.0, line_alpha=0.7, line_dash="dashed", line_width=2,
+            line_color=COLORS["bbox_line"],
+        )
+        self.batch_canvas_fig.text(
+            x="x", y="y", text="text",
+            source=self.batch_label_source,
+            text_color=COLORS["accent"],
+            text_font_size="10pt",
+        )
+
+        self.best_text = pn.pane.Markdown("Best Run: -", style={"color": UI_TEXT_COLOUR})
+
+        # Wire UI events
+        self.batch_load_btn.on_click(self._on_load_batch_config)
+        self.plan_btn.on_click(self._on_build_plan)
+        self.start_btn.on_click(self._on_start_batch)
+        self.stop_all_btn.on_click(self._on_stop_all)
+        self.stop_selected_btn.on_click(self._on_stop_selected_run)
+
+        self.optimizers_multi.param.watch(lambda e: self._rebuild_optimizer_param_controls(), "value")
+
+        # initial build
+        self._rebuild_optimizer_param_controls()
+
+    # -----------------------------------------------------------------
+    # UI BUILDERS (dynamic sections)
+    # -----------------------------------------------------------------
+
+    def _rebuild_constraint_controls(self):
+        """Build normalization/aggregation controls for each constraint key found in base_config."""
+        self._constraint_norm_inputs.clear()
+        self._constraint_aggr_inputs.clear()
+        self.constraint_controls_container.objects = []
+
+        if not self.base_config:
+            self.constraint_controls_container.objects = [
+                pn.pane.Markdown("_Load a config to edit constraint normalization/aggregation sweeps_", style={"color": UI_TEXT_COLOUR})
+            ]
+            return
+
+        cons = self.base_config.get("constraints", {})
+        rows = []
+        for cname, ccfg in cons.items():
+            # default values
+            dnorm = ccfg.get("normalization", "no norm")
+            daggr = ccfg.get("aggregation", "max")
+
+            norm_in = pn.widgets.TextInput(
+                name=f"{cname}.normalization",
+                value=str(dnorm),
+                placeholder="e.g. no norm,max,min_rect_pair",
+                width=240,
+            )
+            aggr_in = pn.widgets.TextInput(
+                name=f"{cname}.aggregation",
+                value=str(daggr),
+                placeholder="e.g. max,sum,product",
+                width=200,
+            )
+            self._constraint_norm_inputs[cname] = norm_in
+            self._constraint_aggr_inputs[cname] = aggr_in
+
+            rows.append(pn.Row(
+                pn.pane.Markdown(f"**{cname}**", style={"color": UI_TEXT_COLOUR}),
+                norm_in, aggr_in
+            ))
+
+        self.constraint_controls_container.objects = rows
+
+    def _rebuild_optimizer_param_controls(self):
+        """
+        Build per-optimizer parameter sweep inputs based on selected optimizers.
+        Each parameter accepts list/range/single using the same parsing rules.
+        """
+        self._optimizer_param_inputs.clear()
+        self.optimizer_param_container.objects = []
+
+        # Schema based on what you already expose in Tab 1
+        # (maxiter is NOT here because global max_iter sweep controls it for batch runs)
+        schema = {
+            "Differential Evolution": ["popsize", "seed"],
+            "Dual Annealing (Simulated Annealing)": ["initial_temp", "seed"],
+            "Basin Hopping (Simulated Annealing)": ["stepsize"],
+            "Nelder-Mead": [],
+            "Powell": [],
+            "CG": [],
+            "L-BFGS-B": [],
+            "SLSQP": [],
+            "Trust-Constr (Quadratic Programming-like)": [],
+            "Adam (PyTorch)": ["lr"],
+            "Genetic Algorithm (pygad)": ["sol_per_pop", "num_parents_mating", "mutation_percent_genes", "parent_selection_type"],
+        }
+
+        blocks = []
+        for opt in self.optimizers_multi.value:
+            params = schema.get(opt, [])
+            if not params:
+                blocks.append(
+                    pn.pane.Markdown(f"**{opt}**: _no extra params_", style={"color": UI_TEXT_COLOUR})
+                )
+                continue
+
+            rows = [pn.pane.Markdown(f"**{opt} params**", style={"color": UI_TEXT_COLOUR})]
+            for pname in params:
+                inp = pn.widgets.TextInput(
+                    name=f"{opt}.{pname}",
+                    value="",
+                    placeholder="single / list / range (e.g. 0.01 or 0.01,0.02 or 0.001:0.01:0.001)",
+                    width=520,
+                )
+                self._optimizer_param_inputs[(opt, pname)] = inp
+                rows.append(pn.Row(inp))
+            blocks.append(pn.Column(*rows))
+
+        self.optimizer_param_container.objects = blocks
+
+    # -----------------------------------------------------------------
+    # Config loading
+    # -----------------------------------------------------------------
+
+    def _on_load_batch_config(self, event):
+        if not self.batch_file_input.value:
+            self.status.object = "Batch Status: idle (no file selected)"
+            return
+        try:
+            raw = self.batch_file_input.value
+            json_str = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            self.base_config = json.loads(json_str)
+            self.base_config_name = "batch_config.json"
+            self.status.object = "Batch Status: idle (batch config loaded)"
+
+            # Ensure dynamic sections match config
+            self._rebuild_constraint_controls()
+
+            # Set default canvas ranges for the batch canvas figure
+            c = self.base_config.get("canvas", {})
+            cw = float(c.get("width", 1000.0))
+            ch = float(c.get("height", 800.0))
+            self.batch_canvas_fig.x_range.start = 0
+            self.batch_canvas_fig.x_range.end = cw
+            self.batch_canvas_fig.y_range.start = 0
+            self.batch_canvas_fig.y_range.end = ch
+
+        except Exception as e:
+            self.status.object = f"Batch Status: idle (load error: {e})"
+
+    # -----------------------------------------------------------------
+    # Plan building
+    # -----------------------------------------------------------------
+
+    def _collect_sweeps(self) -> dict:
+        """
+        Build sweep arrays for all global knobs.
+        For any empty spec, defaults to the current config value (single).
+        """
+        if not self.base_config:
+            raise ValueError("Load a batch config first.")
+
+        cfg = self.base_config
+
+        # Max iter sweep (int)
+        max_iters = _parse_numeric_sweep(self.max_iter_spec.value, as_int=True)
+        if not max_iters:
+            max_iters = [200]
+
+        # Objective weights
+        obj_w = cfg.get("objective", {}).get("weights", {})
+        w_hpwl = _parse_numeric_sweep(self.w_hpwl_spec.value) or [float(obj_w.get("hpwl", 1.0))]
+        w_ar = _parse_numeric_sweep(self.w_bbox_aspect_spec.value) or [float(obj_w.get("bbox_aspect", 0.5))]
+        w_area = _parse_numeric_sweep(self.w_bbox_area_spec.value) or [float(obj_w.get("bbox_area", 0.01))]
+
+        # Constraint penalty weights
+        cons = cfg.get("constraints", {})
+        w_overlap = _parse_numeric_sweep(self.w_overlap_spec.value) or [float(cons.get("no_overlap", {}).get("penalty_weight", 1000.0))]
+        w_spacing = _parse_numeric_sweep(self.w_spacing_spec.value) or [float(cons.get("min_spacing", {}).get("penalty_weight", 500.0))]
+        w_bbox_ar_con = _parse_numeric_sweep(self.w_bbox_ar_con_spec.value) or [float(cons.get("bbox_aspect_ratio", {}).get("penalty_weight", 50.0))]
+        w_boundary = _parse_numeric_sweep(self.w_boundary_spec.value) or [float(cons.get("canvas_boundary", {}).get("penalty_weight", 500.0))]
+
+        # overlap buffer
+        ov_buf = _parse_numeric_sweep(self.overlap_buffer_spec.value) or [float(cons.get("no_overlap", {}).get("buffer", 0.0))]
+
+        # Constraint normalization/aggregation sweeps per constraint
+        norm_sweeps = {}
+        aggr_sweeps = {}
+        for cname, ccfg in cons.items():
+            n_inp = self._constraint_norm_inputs.get(cname)
+            a_inp = self._constraint_aggr_inputs.get(cname)
+
+            norm_vals = _parse_string_sweep(n_inp.value if n_inp else "") or [str(ccfg.get("normalization", "no norm"))]
+            aggr_vals = _parse_string_sweep(a_inp.value if a_inp else "") or [str(ccfg.get("aggregation", "max"))]
+            norm_sweeps[cname] = norm_vals
+            aggr_sweeps[cname] = aggr_vals
+
+        # Optimizer params sweeps
+        opt_param_sweeps = {}
+        for (opt, pname), inp in self._optimizer_param_inputs.items():
+            spec = (inp.value or "").strip()
+            if not spec:
+                continue
+            # numeric vs string param
+            if pname in {"parent_selection_type"}:
+                opt_param_sweeps[(opt, pname)] = _parse_string_sweep(spec)
+            else:
+                # popsize, seed etc might be int; we cast later where needed
+                opt_param_sweeps[(opt, pname)] = _parse_numeric_sweep(spec, as_int=False)
+
+        return {
+            "optimizers": list(self.optimizers_multi.value),
+            "max_iters": max_iters,
+            "w_hpwl": w_hpwl,
+            "w_bbox_aspect": w_ar,
+            "w_bbox_area": w_area,
+            "w_overlap": w_overlap,
+            "w_spacing": w_spacing,
+            "w_bbox_ar_con": w_bbox_ar_con,
+            "w_boundary": w_boundary,
+            "overlap_buffer": ov_buf,
+            "norm_sweeps": norm_sweeps,
+            "aggr_sweeps": aggr_sweeps,
+            "opt_param_sweeps": opt_param_sweeps,
+        }
+
+    def _build_run_specs(self) -> list[dict]:
+        """
+        Builder Pattern:
+        - All run combinations are built here.
+        - Extendable: new sweep dimensions can be added without changing
+          scheduling/execution logic.
+        """
+        sweeps = self._collect_sweeps()
+
+        optimizers = sweeps["optimizers"]
+        max_iters = sweeps["max_iters"]
+
+        # global sweeps for weights
+        obj_triplets = list(itertools.product(
+            sweeps["w_hpwl"], sweeps["w_bbox_aspect"], sweeps["w_bbox_area"]
+        ))
+        con_quads = list(itertools.product(
+            sweeps["w_overlap"], sweeps["w_spacing"], sweeps["w_bbox_ar_con"], sweeps["w_boundary"]
+        ))
+
+        ov_buffers = sweeps["overlap_buffer"]
+
+        # constraint norm/aggr combinations
+        cons_names = list(sweeps["norm_sweeps"].keys())
+        norm_lists = [sweeps["norm_sweeps"][k] for k in cons_names]
+        aggr_lists = [sweeps["aggr_sweeps"][k] for k in cons_names]
+
+        norm_products = list(itertools.product(*norm_lists)) if cons_names else [()]
+        aggr_products = list(itertools.product(*aggr_lists)) if cons_names else [()]
+
+        # optimizer param sweeps: for each optimizer create param grid
+        def _opt_param_grid(opt: str) -> list[dict]:
+            # gather params for this optimizer
+            items = []
+            for (o, pname), vals in sweeps["opt_param_sweeps"].items():
+                if o == opt:
+                    items.append((pname, vals))
+            if not items:
+                return [{}]
+            keys = [k for k, _ in items]
+            vals_list = [v for _, v in items]
+            out = []
+            for comb in itertools.product(*vals_list):
+                out.append({k: comb[i] for i, k in enumerate(keys)})
+            return out
+
+        specs = []
+        for opt in optimizers:
+            opt_param_grid = _opt_param_grid(opt)
+            for max_iter in max_iters:
+                for (w_hpwl, w_ar, w_area) in obj_triplets:
+                    for (w_ov, w_sp, w_arcon, w_bnd) in con_quads:
+                        for buf in ov_buffers:
+                            for norm_vals in norm_products:
+                                for aggr_vals in aggr_products:
+                                    for opt_params in opt_param_grid:
+                                        run_id = f"run_{uuid.uuid4().hex[:8]}"
+                                        specs.append({
+                                            "run_id": run_id,
+                                            "optimizer": opt,
+                                            "max_iter": int(max_iter),
+                                            "weights": {
+                                                "hpwl": float(w_hpwl),
+                                                "bbox_aspect": float(w_ar),
+                                                "bbox_area": float(w_area),
+                                            },
+                                            "penalty_weights": {
+                                                "no_overlap": float(w_ov),
+                                                "min_spacing": float(w_sp),
+                                                "bbox_aspect_ratio": float(w_arcon),
+                                                "canvas_boundary": float(w_bnd),
+                                            },
+                                            "overlap_buffer": float(buf),
+                                            "normalization": {cons_names[i]: norm_vals[i] for i in range(len(cons_names))},
+                                            "aggregation": {cons_names[i]: aggr_vals[i] for i in range(len(cons_names))},
+                                            "optimizer_params": opt_params,
+                                        })
+        return specs
+
+    def _on_build_plan(self, event):
+        try:
+            specs = self._build_run_specs()
+            self.plan_info.object = f"Plan: {len(specs)} total runs"
+        except Exception as e:
+            self.plan_info.object = f"Plan error: {e}"
+
+    # -----------------------------------------------------------------
+    # Batch start/stop
+    # -----------------------------------------------------------------
+
+    def _reset_batch_state(self):
+        with self._lock:
+            self._global_stop.clear()
+            self._run_specs = []
+            self._next_index = 0
+            self._active.clear()
+            self._completed_results = []
+            self.best_run_id = None
+            self.best_run_result = None
+            self.runs_table.value = self.runs_table.value.iloc[0:0].copy()
+            self.running_run_select.options = []
+            self.best_text.object = "Best Run: -"
+            self.batch_canvas_source.data = dict(x=[], y=[], w=[], h=[], rect_id=[], placement_id=[])
+            self.batch_bbox_source.data = dict(x=[], y=[], w=[], h=[])
+            self.batch_label_source.data = dict(x=[0.0], y=[0.0], text=["Best: -"])
+
+    def _init_output_file(self):
+        self.output_file = self.output_file_input.value or "batch_runs_results.json"
+        payload = {
+            "meta": {
+                "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "base_config_name": self.base_config_name,
+            },
+            "runs": []
+        }
+        with open(self.output_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    def _append_result_to_output_file(self, result: dict):
+        """
+        Always keep a valid JSON file after every completed run:
+        - read -> append -> write
+        This is safe and simple. (If you later need huge scale, switch to NDJSON.)
+        """
+        try:
+            with open(self.output_file, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            payload["runs"].append(result)
+            with open(self.output_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            # We do not throw; we report in the UI table message
+            pass
+
+    def _on_start_batch(self, event):
+        if not self.base_config:
+            self.status.object = "Batch Status: idle (load batch config first)"
+            return
+
+        self._reset_batch_state()
+        self._init_output_file()
+
+        try:
+            self._run_specs = self._build_run_specs()
+            self.plan_info.object = f"Plan: {len(self._run_specs)} total runs"
+        except Exception as e:
+            self.status.object = f"Batch Status: idle (plan error: {e})"
+            return
+
+        if not self._run_specs:
+            self.status.object = "Batch Status: idle (no runs to execute)"
+            return
+
+        max_workers = max(1, int(self.max_parallel_runs.value or 1))
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.status.object = "Batch Status: running"
+
+        # submit initial
+        self._submit_more()
+
+    def _on_stop_all(self, event):
+        self.stop_all()
+
+    def _on_stop_selected_run(self, event):
+        # Stop by table selection if available, else dropdown
+        df = self.runs_table.value
+        sel = self.runs_table.selection or []
+        if sel and len(df) > 0 and sel[0] < len(df):
+            rid = str(df.iloc[sel[0]]["run_id"])
+        else:
+            rid = self.running_run_select.value
+        if rid:
+            self.stop_run(rid)
+
+    def stop_all(self):
+        """Stop ALL runs immediately (pending canceled, running signaled)."""
+        self._global_stop.set()
+        with self._lock:
+            # Cancel not-yet-started futures and stop active ones
+            for rid, info in list(self._active.items()):
+                info["stop"].set()
+                fut = info["future"]
+                fut.cancel()
+        self.status.object = "Batch Status: stopping..."
+
+    def stop_run(self, run_id: str):
+        """Stop a specific run."""
+        with self._lock:
+            info = self._active.get(run_id)
+            if info:
+                info["stop"].set()
+                info["future"].cancel()
+
+    # -----------------------------------------------------------------
+    # Scheduling
+    # -----------------------------------------------------------------
+
+    def _submit_more(self):
+        """Submit more jobs up to max_workers."""
+        if not self._executor:
+            return
+        if self._global_stop.is_set():
+            return
+
+        max_workers = max(1, int(self.max_parallel_runs.value or 1))
+
+        with self._lock:
+            while len(self._active) < max_workers and self._next_index < len(self._run_specs):
+                spec = self._run_specs[self._next_index]
+                self._next_index += 1
+
+                run_id = spec["run_id"]
+                stop_evt = threading.Event()
+
+                fut = self._executor.submit(self._run_one_spec, spec, stop_evt, self._global_stop)
+
+                # done callback pushes into queue (worker thread) => consumer updates UI
+                def _done_callback(f, rid=run_id):
+                    try:
+                        res = f.result()
+                    except Exception as e:
+                        res = {
+                            "run_id": rid, "status": "error",
+                            "message": f"{type(e).__name__}: {e}"
+                        }
+                    self._result_queue.put(res)
+
+                fut.add_done_callback(_done_callback)
+                self._active[run_id] = {"future": fut, "stop": stop_evt, "spec": spec}
+
+        # update running options
+        self._refresh_running_dropdown()
+
+    def _refresh_running_dropdown(self):
+        with self._lock:
+            running_ids = list(self._active.keys())
+        self.running_run_select.options = running_ids
+        if running_ids and self.running_run_select.value not in running_ids:
+            self.running_run_select.value = running_ids[0]
+
+    # -----------------------------------------------------------------
+    # Optimizer strategies (execution)
+    # -----------------------------------------------------------------
+
+    def _objective_with_best_tracking(self, problem: PlacementProblem, best_box: dict,
+                                      local_stop: threading.Event, global_stop: threading.Event):
+        """
+        Creates an objective function closure that:
+          - checks stop events
+          - computes metrics
+          - tracks best solution seen so far
+
+        best_box = {"best_obj": inf, "best_x": None, "best_metrics": None}
+        """
+        def f(x: np.ndarray) -> float:
+            if global_stop.is_set() or local_stop.is_set():
+                raise BatchStopRequested()
+            metrics = problem.compute_metrics(x)
+            obj = float(metrics["objective_augmented"])
+            if obj < best_box["best_obj"]:
+                best_box["best_obj"] = obj
+                best_box["best_x"] = np.array(x, dtype=float)
+                best_box["best_metrics"] = metrics
+            return obj
+        return f
+
+    def _run_one_spec(self, spec: dict, local_stop: threading.Event, global_stop: threading.Event) -> dict:
+        """
+        Executes a single run spec.
+
+        IMPORTANT:
+        - This does NOT use your global OptimizationManager to avoid UI coupling.
+        - Uses PlacementProblem.compute_metrics() (your canonical objective/constraints).
+        - Uses SciPy/pygad/torch modules (no algorithm re-implementation except Adam fallback).
+
+        Internal optimizer threads are forced to 1 for batch runs.
+        """
+        t0 = time.time()
+        run_id = spec["run_id"]
+        opt = spec["optimizer"]
+        max_iter = int(spec["max_iter"])
+        message = ""
+
+        # Build per-run config copy
+        cfg = copy.deepcopy(self.base_config)
+
+        # Apply canvas/rectangles unchanged; apply weights/constraints overrides
+        cfg.setdefault("objective", {}).setdefault("weights", {})
+        cfg["objective"]["weights"].update(spec["weights"])
+
+        cons = cfg.setdefault("constraints", {})
+        cons.setdefault("no_overlap", {}).update({
+            "penalty_weight": spec["penalty_weights"]["no_overlap"],
+            "buffer": spec["overlap_buffer"],  # <-- YOUR NEW KEY
+        })
+        cons.setdefault("min_spacing", {}).update({
+            "penalty_weight": spec["penalty_weights"]["min_spacing"],
+        })
+        cons.setdefault("bbox_aspect_ratio", {}).update({
+            "penalty_weight": spec["penalty_weights"]["bbox_aspect_ratio"],
+        })
+        cons.setdefault("canvas_boundary", {}).update({
+            "penalty_weight": spec["penalty_weights"]["canvas_boundary"],
+        })
+
+        # Apply per-constraint normalization/aggregation (YOUR NEW KEYS)
+        for cname, nval in spec["normalization"].items():
+            cons.setdefault(cname, {})["normalization"] = nval
+        for cname, aval in spec["aggregation"].items():
+            cons.setdefault(cname, {})["aggregation"] = aval
+
+        # Instantiate your existing problem class
+        problem = PlacementProblem(cfg)
+        x0 = problem.initial_vector()
+        bounds = problem.bounds()
+
+        # Best tracking container
+        best_box = {"best_obj": float("inf"), "best_x": None, "best_metrics": None}
+        obj_fun = self._objective_with_best_tracking(problem, best_box, local_stop, global_stop)
+
+        # Helper to map optimizer-specific params
+        opt_params = dict(spec.get("optimizer_params", {}) or {})
+
+        # Force "threads" inside optimizers to 1 for batch runs
+        # (Your existing "threads_input" in Tab 1 must NOT be used here)
+        internal_workers = 1
+
+        try:
+            if opt == "Differential Evolution":
+                popsize = int(round(float(opt_params.get("popsize", 15) or 15)))
+                seed = int(round(float(opt_params.get("seed", 42) or 42)))
+
+                def cb(xk, convergence):
+                    # stop check
+                    return global_stop.is_set() or local_stop.is_set()
+
+                differential_evolution(
+                    obj_fun,
+                    bounds=bounds,
+                    maxiter=max_iter,
+                    popsize=popsize,
+                    seed=seed,
+                    workers=internal_workers,
+                    updating="deferred",
+                    callback=cb,
+                )
+
+            elif opt == "Dual Annealing (Simulated Annealing)":
+                initial_temp = float(opt_params.get("initial_temp", 5230.0) or 5230.0)
+                seed = int(round(float(opt_params.get("seed", 42) or 42)))
+
+                def cb(x, f, context):
+                    return global_stop.is_set() or local_stop.is_set()
+
+                dual_annealing(
+                    obj_fun,
+                    bounds=bounds,
+                    maxiter=max_iter,
+                    initial_temp=initial_temp,
+                    seed=seed,
+                    callback=cb,
+                )
+
+            elif opt == "Basin Hopping (Simulated Annealing)":
+                stepsize = float(opt_params.get("stepsize", 10.0) or 10.0)
+                minimizer_kwargs = {"method": "L-BFGS-B", "bounds": bounds}
+
+                def cb(x, f, accept):
+                    return global_stop.is_set() or local_stop.is_set()
+
+                basinhopping(
+                    obj_fun,
+                    x0,
+                    niter=max_iter,
+                    stepsize=stepsize,
+                    minimizer_kwargs=minimizer_kwargs,
+                    callback=cb,
+                )
+
+            elif opt in {"Nelder-Mead","Powell","CG","L-BFGS-B","SLSQP","Trust-Constr (Quadratic Programming-like)"}:
+                method_map = {
+                    "Nelder-Mead": "Nelder-Mead",
+                    "Powell": "Powell",
+                    "CG": "CG",
+                    "L-BFGS-B": "L-BFGS-B",
+                    "SLSQP": "SLSQP",
+                    "Trust-Constr (Quadratic Programming-like)": "trust-constr",
+                }
+                method = method_map[opt]
+                options = {"maxiter": max_iter}
+
+                def cb(xk):
+                    # callback must not touch UI; best tracking already in objective
+                    return global_stop.is_set() or local_stop.is_set()
+
+                minimize(
+                    obj_fun,
+                    x0,
+                    method=method,
+                    bounds=bounds if method != "trust-constr" else None,
+                    callback=cb,
+                    options=options,
+                )
+
+            elif opt == "Adam (PyTorch)":
+                lr = float(opt_params.get("lr", 0.01) or 0.01)
+                # Use torch Adam if torch exists; fallback to pure python Adam
+                if torch is not None:
+                    x_t = torch.tensor(x0, dtype=torch.float32, requires_grad=True)
+                    optimizer = torch.optim.Adam([x_t], lr=lr)
+
+                    widths = torch.tensor([r.width for r in problem.rectangles], dtype=torch.float32)
+                    heights = torch.tensor([r.height for r in problem.rectangles], dtype=torch.float32)
+
+                    def torch_obj():
+                        # Minimal torch objective: call numpy metrics for correctness (slower but consistent)
+                        # If you already have a torch-native objective in your local code, replace this
+                        # with that function call.
+                        x_np = x_t.detach().cpu().numpy()
+                        return torch.tensor(problem.compute_metrics(x_np)["objective_augmented"], dtype=torch.float32)
+
+                    for _ in range(max_iter):
+                        if global_stop.is_set() or local_stop.is_set():
+                            raise BatchStopRequested()
+                        optimizer.zero_grad()
+                        loss = torch_obj()
+                        loss.backward()
+                        optimizer.step()
+
+                        # clamp to bounds
+                        with torch.no_grad():
+                            for i, (lo, hi) in enumerate(bounds):
+                                x_t[i].clamp_(float(lo), float(hi))
+
+                        # track best using numpy objective
+                        obj_fun(x_t.detach().cpu().numpy())
+                else:
+                    # Pure python adam with finite differences
+                    beta1, beta2, eps = 0.9, 0.999, 1e-8
+                    x = x0.copy()
+                    m = np.zeros_like(x)
+                    v = np.zeros_like(x)
+
+                    def grad_fd(x_vec):
+                        fx = obj_fun(x_vec)
+                        g = np.zeros_like(x_vec)
+                        h = 1e-3
+                        for i in range(len(x_vec)):
+                            if global_stop.is_set() or local_stop.is_set():
+                                raise BatchStopRequested()
+                            x2 = x_vec.copy()
+                            x2[i] += h
+                            g[i] = (obj_fun(x2) - fx) / h
+                        return g
+
+                    for t in range(1, max_iter + 1):
+                        if global_stop.is_set() or local_stop.is_set():
+                            raise BatchStopRequested()
+                        g = grad_fd(x)
+                        m = beta1 * m + (1 - beta1) * g
+                        v = beta2 * v + (1 - beta2) * (g ** 2)
+                        m_hat = m / (1 - beta1 ** t)
+                        v_hat = v / (1 - beta2 ** t)
+                        x = x - lr * m_hat / (np.sqrt(v_hat) + eps)
+
+                        # clamp
+                        for i, (lo, hi) in enumerate(bounds):
+                            x[i] = np.clip(x[i], lo, hi)
+                        obj_fun(x)
+
+            elif opt == "Genetic Algorithm (pygad)":
+                try:
+                    import pygad
+                except Exception:
+                    message = "pygad not installed"
+                    raise RuntimeError(message)
+
+                sol_per_pop = int(round(float(opt_params.get("sol_per_pop", 20) or 20)))
+                num_parents_mating = int(round(float(opt_params.get("num_parents_mating", 10) or 10)))
+                mutation_percent_genes = int(round(float(opt_params.get("mutation_percent_genes", 10) or 10)))
+                parent_selection_type = str(opt_params.get("parent_selection_type", "sss") or "sss")
+
+                gene_space = [{"low": lo, "high": hi} for (lo, hi) in bounds]
+                num_genes = problem.num_variables()
+
+                def fitness_func(ga_instance, solution, sol_idx):
+                    if global_stop.is_set() or local_stop.is_set():
+                        raise BatchStopRequested()
+                    x = np.array(solution, dtype=float)
+                    return -obj_fun(x)
+
+                def on_generation(ga_instance):
+                    if global_stop.is_set() or local_stop.is_set():
+                        return "stop"
+                    best_solution, best_fitness, _ = ga_instance.best_solution()
+                    obj_fun(np.array(best_solution, dtype=float))
+                    return None
+
+                ga = pygad.GA(
+                    num_generations=max_iter,
+                    sol_per_pop=sol_per_pop,
+                    num_parents_mating=num_parents_mating,
+                    num_genes=num_genes,
+                    gene_space=gene_space,
+                    mutation_percent_genes=mutation_percent_genes,
+                    parent_selection_type=parent_selection_type,
+                    fitness_func=fitness_func,
+                    on_generation=on_generation,
+                )
+                ga.run()
+
+            else:
+                raise ValueError(f"Unknown optimizer '{opt}'")
+
+            status = "completed"
+
+        except BatchStopRequested:
+            status = "stopped"
+            message = message or "stopped by user"
+
+        except Exception as e:
+            status = "error"
+            message = message or f"{type(e).__name__}: {e}"
+
+        runtime_s = time.time() - t0
+
+        best_x = best_box["best_x"]
+        best_metrics = best_box["best_metrics"]
+
+        # If nothing evaluated (rare), evaluate x0
+        if best_x is None:
+            try:
+                best_metrics = problem.compute_metrics(x0)
+                best_x = x0.copy()
+            except Exception:
+                best_metrics = {}
+                best_x = x0.copy()
+
+        # Build run output record (dumped into JSON file)
+        centres = problem.decode_centres(best_x)
+        rect_coords = {problem.rectangles[i].rect_id: {"cx": centres[i][0], "cy": centres[i][1]} for i in range(problem.n_rects)}
+
+        result = {
+            "run_id": run_id,
+            "status": status,
+            "optimizer": opt,
+            "max_iter": max_iter,
+            "inputs": {
+                "weights": spec["weights"],
+                "penalty_weights": spec["penalty_weights"],
+                "normalization": spec["normalization"],
+                "aggregation": spec["aggregation"],
+                "overlap_buffer": spec["overlap_buffer"],
+                "optimizer_params": spec.get("optimizer_params", {}),
+                "internal_optimizer_threads": 1,
+            },
+            "best": {
+                "metrics": best_metrics,
+                "rect_centres": rect_coords,
+                "x_vector": best_x.tolist(),
+            },
+            "runtime_s": runtime_s,
+            "message": message,
+            "canvas": {
+                "width": problem.canvas_width,
+                "height": problem.canvas_height,
+            }
+        }
+        return result
+
+    # -----------------------------------------------------------------
+    # Main-thread consumer update (call periodically)
+    # -----------------------------------------------------------------
+
+    def periodic_update(self):
+        """
+        Called from the main Panel periodic callback.
+        - Consumes result queue
+        - Updates table, writes JSON, tracks global best
+        - Schedules more work until done
+        """
+        # 1) Drain results
+        changed = False
+        while True:
+            try:
+                res = self._result_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            run_id = res.get("run_id", "?")
+
+            # Remove from active
+            with self._lock:
+                if run_id in self._active:
+                    del self._active[run_id]
+            self._refresh_running_dropdown()
+
+            # Append & persist
+            self._completed_results.append(res)
+            self._append_result_to_output_file(res)
+
+            # Update table (append one row)
+            row = self._result_to_table_row(res)
+            df = self.runs_table.value
+            df2 = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            self.runs_table.value = df2
+            self.runs_table.selection = [len(df2) - 1]  # auto focus newest
+
+            # Track best across completed (only consider completed, not error)
+            best_metrics = ((res.get("best") or {}).get("metrics") or {})
+            obj = best_metrics.get("objective_augmented", None)
+            if obj is not None and res.get("status") in {"completed", "stopped"}:
+                if self.best_run_result is None:
+                    self.best_run_id = run_id
+                    self.best_run_result = res
+                else:
+                    prev_obj = (self.best_run_result["best"]["metrics"] or {}).get("objective_augmented", float("inf"))
+                    if float(obj) < float(prev_obj):
+                        self.best_run_id = run_id
+                        self.best_run_result = res
+
+            changed = True
+
+        # 2) Keep scheduling until done
+        if self._executor and not self._global_stop.is_set():
+            self._submit_more()
+
+        # 3) If stopping and no active left -> finalize best canvas
+        with self._lock:
+            active_left = len(self._active)
+
+        if self._executor and (self._global_stop.is_set() and active_left == 0):
+            self.status.object = "Batch Status: stopped"
+            self._finalize_best_canvas()
+            self._shutdown_executor()
+        elif self._executor and (not self._global_stop.is_set() and active_left == 0 and self._next_index >= len(self._run_specs)):
+            self.status.object = "Batch Status: completed"
+            self._finalize_best_canvas()
+            self._shutdown_executor()
+        else:
+            if self._executor:
+                self.status.object = f"Batch Status: running (active={active_left}, done={len(self._completed_results)})"
+
+        if changed:
+            # update best text live (even before finalize)
+            if self.best_run_result:
+                self.best_text.object = f"Best Run So Far: **{self.best_run_id}** (obj={self.best_run_result['best']['metrics'].get('objective_augmented','-')})"
+
+    def _shutdown_executor(self):
+        if self._executor:
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        self._executor = None
+
+    def _result_to_table_row(self, res: dict) -> dict:
+        m = ((res.get("best") or {}).get("metrics") or {})
+        inp = (res.get("inputs") or {})
+        weights = inp.get("weights", {})
+        pw = inp.get("penalty_weights", {})
+        norms = inp.get("normalization", {})
+        aggrs = inp.get("aggregation", {})
+        optp = inp.get("optimizer_params", {})
+
+        return {
+            "run_id": res.get("run_id"),
+            "status": res.get("status"),
+            "optimizer": res.get("optimizer"),
+            "max_iter": res.get("max_iter"),
+            "w_hpwl": weights.get("hpwl"),
+            "w_bbox_aspect": weights.get("bbox_aspect"),
+            "w_bbox_area": weights.get("bbox_area"),
+            "w_overlap": pw.get("no_overlap"),
+            "w_spacing": pw.get("min_spacing"),
+            "w_bbox_ar_con": pw.get("bbox_aspect_ratio"),
+            "w_boundary": pw.get("canvas_boundary"),
+            "overlap_buffer": inp.get("overlap_buffer"),
+            "normalizations": json.dumps(norms),
+            "aggregations": json.dumps(aggrs),
+            "optimizer_params": json.dumps(optp),
+            "best_aug_obj": m.get("objective_augmented"),
+            "bbox_area": m.get("bbox_area"),
+            "overlap_max_ratio": m.get("overlap_max_ratio"),
+            "boundary_violation": m.get("boundary_violation"),
+            "runtime_s": res.get("runtime_s"),
+            "message": res.get("message"),
+        }
+
+    def _finalize_best_canvas(self):
+        """Show best placement across all completed runs on the batch canvas."""
+        if not self.best_run_result:
+            self.batch_label_source.data = dict(x=[0.0], y=[0.0], text=["Best: -"])
+            self.best_text.object = "Best Run: -"
+            return
+
+        res = self.best_run_result
+        cfg = copy.deepcopy(self.base_config)
+        # reconstruct problem for drawing (uses same widths/heights)
+        problem = PlacementProblem(cfg)
+        x = np.array(res["best"]["x_vector"], dtype=float)
+        rects, bbox = problem.make_rectangle_shapes(x)
+
+        self.batch_canvas_source.data = dict(
+            x=[r["x"] for r in rects],
+            y=[r["y"] for r in rects],
+            w=[r["w"] for r in rects],
+            h=[r["h"] for r in rects],
+            rect_id=[r["rect_id"] for r in rects],
+            placement_id=[res["run_id"]] * len(rects),
+        )
+        self.batch_bbox_source.data = dict(
+            x=[bbox["x"]], y=[bbox["y"]], w=[bbox["w"]], h=[bbox["h"]],
+        )
+        self.batch_label_source.data = dict(
+            x=[bbox["x"]],
+            y=[bbox["y"] + bbox["h"] * 0.6],
+            text=[f"Best: {res['run_id']}"],
+        )
+
+        self.best_text.object = (
+            f"Best Run: **{res['run_id']}**  |  Optimizer: **{res['optimizer']}**  |  "
+            f"Obj(aug): **{res['best']['metrics'].get('objective_augmented','-')}**"
+        )
+
+    # -----------------------------------------------------------------
+    # Tab layout for insertion into pn.Tabs
+    # -----------------------------------------------------------------
+
+    def panel(self) -> pn.Column:
+        # ensure constraint controls reflect latest loaded config
+        if not self._constraint_norm_inputs and self.base_config:
+            self._rebuild_constraint_controls()
+
+        input_section = pn.Column(
+            pn.Row(self.batch_file_input, self.batch_load_btn, self.output_file_input),
+            pn.Row(self.optimizers_multi, self.max_parallel_runs, self.max_iter_spec),
+            pn.Row(self.w_hpwl_spec, self.w_bbox_aspect_spec, self.w_bbox_area_spec),
+            pn.Row(self.w_overlap_spec, self.w_spacing_spec, self.w_bbox_ar_con_spec, self.w_boundary_spec),
+            pn.Row(self.overlap_buffer_spec),
+            pn.pane.Markdown("**Constraint normalization / aggregation sweeps**", style={"color": UI_TEXT_COLOUR}),
+            self.constraint_controls_container,
+            pn.pane.Markdown("**Optimizer parameter sweeps**", style={"color": UI_TEXT_COLOUR}),
+            self.optimizer_param_container,
+            pn.Row(self.plan_btn, self.start_btn, self.stop_all_btn, self.running_run_select, self.stop_selected_btn),
+            pn.Row(self.plan_info, self.status),
+            css_classes=["batch-input-section"],
+            sizing_mode="stretch_width",
+        )
+
+        table_section = pn.Column(
+            self.runs_table,
+            css_classes=["batch-table-section"],
+            sizing_mode="stretch_width",
+        )
+
+        canvas_section = pn.Column(
+            self.batch_canvas_fig,
+            css_classes=["batch-canvas-section"],
+            sizing_mode="stretch_width",
+        )
+
+        best_section = pn.Column(
+            self.best_text,
+            css_classes=["batch-best-section"],
+            sizing_mode="stretch_width",
+        )
+
+        return pn.Column(input_section, table_section, canvas_section, best_section, sizing_mode="stretch_both")
+
+
+# Instantiate the batch manager (NEW)
+batch_manager = ParallelRunManager()
+
+# If your main config is loaded in Tab 1, you can optionally share it:
+# batch_manager.base_config = manager.config
+# batch_manager._rebuild_constraint_controls()
+
+4) Add the new tab into your existing dashboard = pn.Tabs(...)
+
+Where you currently build dashboard = pn.Tabs(...), insert the batch tab before Logs:
+
+batch_tab = batch_manager.panel()
+
+dashboard = pn.Tabs(
+    ("1. Controls & Live Updates", first_tab),
+    ("2. Input Placement", input_tab),
+    ("3. Batch / Parallel Runs", batch_tab),
+    ("4. Logs", logs_tab),
+    ("5. Errors & Warnings", errors_tab),
+)
+dashboard.servable()
+
+5) Make sure your periodic callback calls the batch manager consumer
+
+In your existing _tick() (the one you already call via pn.state.add_periodic_callback), add:
+
+def _tick():
+    # existing live-update for Tab 1
+    try:
+        target = float(target_objective_input.value or 0.0)
+    except Exception:
+        target = 0.0
+    if stop_strategy_radio.value == "max iter only":
+        t_local = 0.0
+    else:
+        t_local = target
+    manager.periodic_update(t_local, canvas_fig)
+
+    # NEW: batch consumer update (safe; only drains queue + updates table/canvas)
+    batch_manager.periodic_update()
+
+
+That’s it—no other wiring is needed.
+
+How you use it
+
+Go to “3. Batch / Parallel Runs”
+
+Load the rectangles config JSON using Load Batch Config
+
+Choose optimizers (MultiChoice)
+
+Enter sweeps:
+
+numeric: "1,2,3" or "0.1:1.0:0.1" or "10"
+
+categorical: "max,sum,product"
+
+Click Build Plan to see total run count
+
+Click Start Batch
+
+Use:
+
+Stop All to kill everything
+
+Stop Selected Run (select a row in table or pick run id from dropdown)
+
+When batch stops/completes:
+
+Canvas shows best overall placement
+
+Text tells which run won
+
+Output JSON contains every run appended as it completes
