@@ -1,0 +1,1238 @@
+A) UI changes (minimal)
+A1) Add a formulation dropdown + dynamic parameter rows
+
+Where: In the section
+# PANEL WIDGETS - MAIN TAB (PARAMETERS SECTION)
+Insert below the existing optimizer dropdown and thread controls (i.e., below optimizer_select / threads_input) and above stop_strategy_radio.
+
+Add:
+
+# ---------------- Formulation selection (NEW) ----------------
+
+formulation_options = [
+    "0. Soft penalty (weighted sum)",
+    "1. Barrier constraints",
+    "2. Lexicographic (hierarchical)",
+    "3. Sequence Pair (discrete floorplanning)",
+    "4. CP-SAT packing (OR-Tools)",
+]
+
+formulation_select = pn.widgets.Select(
+    name="Formulation",
+    options=formulation_options,
+    value="0. Soft penalty (weighted sum)",
+    width=220,
+)
+
+# Formulation-specific params: we reuse the same 2-row pattern as optimizer params
+form_param_row1 = pn.Row(css_classes=["param-row"])
+form_param_row2 = pn.Row(css_classes=["param-row"])
+
+A2) Add parameter widgets for each formulation
+
+Where: right after the above block.
+
+# ---- Barrier params ----
+barrier_mu = pn.widgets.FloatInput(name="mu", value=1.0, step=0.1, width=70)
+barrier_type = pn.widgets.Select(
+    name="barrier",
+    options=["log", "reciprocal", "reciprocal_sq", "log_sq", "inv_power"],
+    value="log",
+    width=120,
+)
+barrier_margin = pn.widgets.FloatInput(
+    name="margin_eps", value=1e-3, step=1e-3, width=90
+)
+barrier_inv_power = pn.widgets.FloatInput(name="p", value=2.0, step=0.5, width=60)
+barrier_backtrack_beta = pn.widgets.FloatInput(name="bt_beta", value=0.5, step=0.05, width=70)
+barrier_backtrack_min_alpha = pn.widgets.FloatInput(name="bt_min_alpha", value=1e-4, step=1e-4, width=90)
+
+# ---- Lexicographic params ----
+lex_stage1_frac = pn.widgets.FloatInput(name="stage1_frac", value=0.5, step=0.05, width=90)
+lex_eps = pn.widgets.FloatInput(name="eps", value=1e-3, step=1e-3, width=70)
+lex_lambda = pn.widgets.FloatInput(name="lambda", value=1e4, step=1e3, width=80)
+
+# ---- Sequence Pair params ----
+sp_key_bounds = pn.widgets.Select(name="key_bounds", options=["[0,1]", "[-1,1]"], value="[0,1]", width=70)
+sp_min_dx = pn.widgets.FloatInput(name="sp_dx", value=0.0, step=1.0, width=70)
+sp_min_dy = pn.widgets.FloatInput(name="sp_dy", value=0.0, step=1.0, width=70)
+sp_softsort_tau = pn.widgets.FloatInput(name="tau_sort", value=0.2, step=0.05, width=80)
+sp_use_straight_through = pn.widgets.Checkbox(name="ST-grad", value=True)
+
+# ---- CP-SAT params ----
+cpsat_time_limit = pn.widgets.FloatInput(name="time_s", value=3.0, step=0.5, width=70)
+cpsat_grid = pn.widgets.IntInput(name="grid", value=1, step=1, width=60)
+cpsat_hint_weight = pn.widgets.FloatInput(name="hint_w", value=0.1, step=0.05, width=70)
+cpsat_then_refine = pn.widgets.Checkbox(name="refine w/ optimizer", value=True)
+
+A3) Dynamic display of formulation params
+
+Where: After your _update_param_rows() function (or next to it). Add:
+
+formulation_param_widgets = {
+    "0. Soft penalty (weighted sum)": [],
+    "1. Barrier constraints": [
+        barrier_mu, barrier_type, barrier_margin,
+        barrier_inv_power, barrier_backtrack_beta, barrier_backtrack_min_alpha
+    ],
+    "2. Lexicographic (hierarchical)": [lex_stage1_frac, lex_eps, lex_lambda],
+    "3. Sequence Pair (discrete floorplanning)": [
+        sp_key_bounds, sp_min_dx, sp_min_dy, sp_softsort_tau, sp_use_straight_through
+    ],
+    "4. CP-SAT packing (OR-Tools)": [
+        cpsat_time_limit, cpsat_grid, cpsat_hint_weight, cpsat_then_refine
+    ],
+}
+
+def _update_formulation_rows(event=None):
+    w = formulation_param_widgets.get(formulation_select.value, [])
+    half = (len(w) + 1) // 2
+    form_param_row1.objects = w[:half]
+    form_param_row2.objects = w[half:]
+
+formulation_select.param.watch(_update_formulation_rows, "value")
+_update_formulation_rows()
+
+A4) Place the dropdown + rows into the left Parameters panel
+
+Where: In parameters_left = pn.Column(...)
+Insert these lines after optimizer selection + threads row and before stop strategy:
+
+pn.Row(formulation_select, css_classes=["param-row"]),
+form_param_row1,
+form_param_row2,
+
+B) Backend: keep structure, add a “FormulationEngine” + tiny call-site edits
+B1) Add new engine class (NEW)
+
+Where: Place this above class OptimizationManager: (so it’s available everywhere).
+
+class FormulationEngine:
+    """
+    Scalarizes objective + constraints in different ways.
+
+    Works in two backends:
+      - numpy: for scipy, pygad, pure-python Adam
+      - torch: for torch Adam
+
+    API:
+      scalarize_numpy(problem, x, formulation_name, fparams) -> float
+      scalarize_torch(problem, x_t, formulation_name, fparams) -> torch.Tensor
+    """
+
+    @staticmethod
+    def violation_scalar(cons: Dict[str, float]) -> float:
+        # Generic V(x) for lexicographic stage 1
+        # Uses sum of squares so adding new constraint terms is safe.
+        v = 0.0
+        for k, val in cons.items():
+            v += float(val) ** 2
+        return float(v)
+
+    @staticmethod
+    def violation_scalar_torch(cons_t: Dict[str, "torch.Tensor"]) -> "torch.Tensor":
+        v = None
+        for _, val in cons_t.items():
+            term = val * val
+            v = term if v is None else (v + term)
+        return v if v is not None else torch.tensor(0.0, device=list(cons_t.values())[0].device)
+
+    # ---------- Barrier functions (5 variants) ----------
+
+    @staticmethod
+    def barrier_numpy(slacks: Dict[str, float], mu: float, kind: str, margin_eps: float, p: float) -> float:
+        # Only defined if all slacks > 0. If not, return +inf-ish large value.
+        for _, g in slacks.items():
+            if g <= 0.0 or not np.isfinite(g):
+                return 1e30
+
+        if kind == "log":
+            return float(-mu * sum(np.log(g) for g in slacks.values()))
+        if kind == "reciprocal":
+            return float(mu * sum(1.0 / g for g in slacks.values()))
+        if kind == "reciprocal_sq":
+            return float(mu * sum(1.0 / (g * g) for g in slacks.values()))
+        if kind == "log_sq":
+            return float(mu * sum(((-np.log(g)) ** 2) for g in slacks.values()))
+        if kind == "inv_power":
+            pp = max(1.0, float(p))
+            return float(mu * sum(g ** (-pp) for g in slacks.values()))
+        return 0.0
+
+    @staticmethod
+    def barrier_torch(slacks: Dict[str, "torch.Tensor"], mu: float, kind: str, p: float) -> "torch.Tensor":
+        # If any slack <= 0, return huge value (gradient will push away, but step must be feasible-preserving).
+        big = None
+        for g in slacks.values():
+            if big is None:
+                big = torch.tensor(1e30, device=g.device, dtype=g.dtype)
+            if torch.any(g <= 0):
+                return big
+
+        if kind == "log":
+            return -mu * sum(torch.log(g) for g in slacks.values())
+        if kind == "reciprocal":
+            return mu * sum(1.0 / g for g in slacks.values())
+        if kind == "reciprocal_sq":
+            return mu * sum(1.0 / (g * g) for g in slacks.values())
+        if kind == "log_sq":
+            return mu * sum(((-torch.log(g)) ** 2) for g in slacks.values())
+        if kind == "inv_power":
+            pp = max(1.0, float(p))
+            return mu * sum(g ** (-pp) for g in slacks.values())
+        return torch.tensor(0.0, device=list(slacks.values())[0].device)
+
+    # ---------- Main scalarizers ----------
+
+    @staticmethod
+    def scalarize_numpy(problem: "PlacementProblem",
+                        x: np.ndarray,
+                        formulation_name: str,
+                        fparams: Dict[str, Any],
+                        mode: str = "centres") -> float:
+        # Decode x -> centres if formulation uses non-centre encoding
+        centres_x = problem.decode_for_formulation_numpy(x, formulation_name, fparams)
+
+        # Compute base terms (objective components, constraints)
+        obj_terms, cons_terms, penalty_soft, slacks = problem.compute_terms_numpy(centres_x, fparams)
+
+        f = float(sum(problem.get_obj_weight(k) * v for k, v in obj_terms.items()))
+
+        if formulation_name.startswith("0."):
+            return f + penalty_soft
+
+        if formulation_name.startswith("1."):
+            mu = float(fparams.get("mu", 1.0))
+            kind = str(fparams.get("barrier", "log"))
+            margin_eps = float(fparams.get("margin_eps", 1e-3))
+            p = float(fparams.get("p", 2.0))
+            # Barrier only on slacks we can define; keep disjunctive constraints in penalty_soft
+            B = FormulationEngine.barrier_numpy(slacks, mu, kind, margin_eps, p)
+            return f + penalty_soft + B
+
+        if formulation_name.startswith("2."):
+            # In lexicographic mode, scalarizer is injected by the worker (stage1 or stage2).
+            # We keep default here as "augmented" for safety.
+            return f + penalty_soft
+
+        if formulation_name.startswith("3."):
+            # Sequence pair: decode ensures non-overlap structurally (penalty_soft should be ~0 for overlap)
+            return f + penalty_soft
+
+        if formulation_name.startswith("4."):
+            # CP-SAT: we typically start from CP-SAT solution then refine; objective used afterwards
+            return f + penalty_soft
+
+        return f + penalty_soft
+
+    @staticmethod
+    def scalarize_torch(problem: "PlacementProblem",
+                        x_t: "torch.Tensor",
+                        formulation_name: str,
+                        fparams: Dict[str, Any]) -> "torch.Tensor":
+        # Decode x_t -> centres for formulation
+        centres_t = problem.decode_for_formulation_torch(x_t, formulation_name, fparams)
+
+        obj_terms_t, cons_terms_t, penalty_soft_t, slacks_t = problem.compute_terms_torch(centres_t, fparams)
+
+        # Weighted sum of objective terms (future-safe: dict-based)
+        f = 0.0
+        for k, v in obj_terms_t.items():
+            f = f + float(problem.get_obj_weight(k)) * v
+
+        if formulation_name.startswith("0."):
+            return f + penalty_soft_t
+
+        if formulation_name.startswith("1."):
+            mu = float(fparams.get("mu", 1.0))
+            kind = str(fparams.get("barrier", "log"))
+            p = float(fparams.get("p", 2.0))
+            B = FormulationEngine.barrier_torch(slacks_t, mu, kind, p)
+            return f + penalty_soft_t + B
+
+        if formulation_name.startswith("2."):
+            # stage-specific objective injected by worker
+            return f + penalty_soft_t
+
+        if formulation_name.startswith("3."):
+            return f + penalty_soft_t
+
+        if formulation_name.startswith("4."):
+            return f + penalty_soft_t
+
+        return f + penalty_soft_t
+
+C) Extend PlacementProblem in a future-proof way (new functions, minimal impact)
+
+You need a small refactor so all formulations can reuse the same term dictionaries.
+
+C1) Add these methods inside class PlacementProblem
+
+Where: Insert below your existing compute_metrics() method (anchor: def compute_metrics(self, x: np.ndarray) -> Dict[str, float]:), and above make_rectangle_shapes.
+
+Add:
+
+# ------------------ NEW: term dictionaries ------------------
+
+def get_obj_weight(self, term_name: str) -> float:
+    # Future-safe: if you add new objective terms, give them a UI weight and register here.
+    # Default weight 0 means it doesn't affect scalarization until you expose it.
+    if term_name == "hpwl":
+        return float(self.weight_hpwl)
+    if term_name == "bbox_aspect":
+        return float(self.weight_bbox_aspect)
+    if term_name == "bbox_area":
+        return float(self.weight_bbox_area)
+    # fallback
+    return 0.0
+
+def compute_terms_numpy(self, centres_x: np.ndarray, fparams: Dict[str, Any]):
+    """
+    centres_x is a flat vector [cx1, cy1, ..., cxn, cyn] *already in centre-space*.
+
+    Returns:
+      obj_terms: dict(term->value)
+      cons_terms: dict(term->violation>=0)
+      penalty_soft: scalar soft penalty (your existing style)
+      slacks: dict(term->g_k(x)>0) for barrier-applicable constraints
+    """
+    centres = self.decode_centres(centres_x)
+    hpwl = self._compute_hpwl(centres)
+    min_x, min_y, max_x, max_y = self._compute_bounding_box(centres)
+    width = max_x - min_x
+    height = max_y - min_y
+    bbox_aspect = (width / height) if (width > 0 and height > 0) else 1.0
+    bbox_area = max(0.0, width) * max(0.0, height)
+
+    obj_terms = {
+        "hpwl": float(hpwl),
+        "bbox_aspect": float(bbox_aspect),
+        "bbox_area": float(bbox_area),
+    }
+
+    cons = self._constraints_from_centres(centres)
+
+    # ---- Soft penalties (existing) ----
+    no_ov_cfg = self.constraints_cfg.get("no_overlap", {})
+    min_sp_cfg = self.constraints_cfg.get("min_spacing", {})
+    bbox_ar_cfg = self.constraints_cfg.get("bbox_aspect_ratio", {})
+    boundary_cfg = self.constraints_cfg.get("canvas_boundary", {})
+
+    w_overlap = float(no_ov_cfg.get("penalty_weight", 1000.0))
+    w_spacing = float(min_sp_cfg.get("penalty_weight", 500.0))
+    w_bbox_ar_con = float(bbox_ar_cfg.get("penalty_weight", 50.0))
+    w_boundary = float(boundary_cfg.get("penalty_weight", 500.0))
+
+    penalty_soft = 0.0
+    penalty_soft += w_overlap * (cons["overlap_max_ratio"] ** 2)
+    penalty_soft += w_spacing * ((cons["spacing_x_violation"] ** 2) + (cons["spacing_y_violation"] ** 2))
+    penalty_soft += w_bbox_ar_con * (cons["bbox_ar_violation"] ** 2)
+    penalty_soft += w_boundary * (cons["boundary_violation"] ** 2)
+
+    # ---- Slacks for barriers ----
+    # Full-rigour note:
+    # - Disjunctive constraints like 2D non-overlap are not directly barrier-friendly.
+    # - Barrier slacks here cover the constraints that are true inequalities:
+    #   boundary, bbox_ar, and (optionally) spacing if you define adjacency/relations.
+    eps = float(fparams.get("margin_eps", 1e-3))
+    slacks = {
+        "bbox_ar_slack": eps - float(cons["bbox_ar_violation"]),
+        "boundary_slack": eps - float(cons["boundary_violation"]),
+        "spacing_x_slack": eps - float(cons["spacing_x_violation"]),
+        "spacing_y_slack": eps - float(cons["spacing_y_violation"]),
+    }
+
+    return obj_terms, cons, float(penalty_soft), slacks
+
+def compute_terms_torch(self, centres_t: "torch.Tensor", fparams: Dict[str, Any]):
+    """
+    Torch version for Adam (PyTorch).
+    centres_t is [cx1, cy1, ..., cxn, cyn] with requires_grad=True
+    """
+    n = self.n_rects
+    cx = centres_t[0:2*n:2]
+    cy = centres_t[1:2*n:2]
+
+    hpwl = (torch.max(cx) - torch.min(cx)) + (torch.max(cy) - torch.min(cy))
+
+    widths = torch.tensor([r.width for r in self.rectangles], device=centres_t.device, dtype=centres_t.dtype)
+    heights = torch.tensor([r.height for r in self.rectangles], device=centres_t.device, dtype=centres_t.dtype)
+    half_w = widths / 2.0
+    half_h = heights / 2.0
+
+    left = cx - half_w
+    right = cx + half_w
+    bottom = cy - half_h
+    top = cy + half_h
+
+    min_x = torch.min(left)
+    max_x = torch.max(right)
+    min_y = torch.min(bottom)
+    max_y = torch.max(top)
+    bw = max_x - min_x
+    bh = max_y - min_y
+    bbox_aspect = torch.where(bh > 0, bw / torch.clamp(bh, min=1e-6), torch.tensor(1.0, device=centres_t.device))
+    bbox_area = torch.clamp(bw, min=0.0) * torch.clamp(bh, min=0.0)
+
+    obj_terms_t = {
+        "hpwl": hpwl,
+        "bbox_aspect": bbox_aspect,
+        "bbox_area": bbox_area,
+    }
+
+    # Constraint terms in torch:
+    # We reuse your torch overlap/spacing/boundary logic OR keep them as in your existing torch objective.
+    # For minimal change: call your existing _objective_augmented_torch pieces, but now return dicts.
+    # Here is a compact violation model matching your existing logic:
+    cons_t = self._constraints_torch_from_edges(left, right, bottom, top, widths, heights, centres_t.device, centres_t.dtype)
+
+    # Soft penalty weights
+    cons_cfg = self.constraints_cfg
+    w_overlap = float(cons_cfg.get("no_overlap", {}).get("penalty_weight", 1000.0))
+    w_spacing = float(cons_cfg.get("min_spacing", {}).get("penalty_weight", 500.0))
+    w_bbox_ar_con = float(cons_cfg.get("bbox_aspect_ratio", {}).get("penalty_weight", 50.0))
+    w_boundary = float(cons_cfg.get("canvas_boundary", {}).get("penalty_weight", 500.0))
+
+    penalty_soft_t = (
+        w_overlap * (cons_t["overlap_max_ratio"] ** 2)
+        + w_spacing * ((cons_t["spacing_x_violation"] ** 2) + (cons_t["spacing_y_violation"] ** 2))
+        + w_bbox_ar_con * (cons_t["bbox_ar_violation"] ** 2)
+        + w_boundary * (cons_t["boundary_violation"] ** 2)
+    )
+
+    eps = float(fparams.get("margin_eps", 1e-3))
+    eps_t = torch.tensor(eps, device=centres_t.device, dtype=centres_t.dtype)
+
+    slacks_t = {
+        "bbox_ar_slack": eps_t - cons_t["bbox_ar_violation"],
+        "boundary_slack": eps_t - cons_t["boundary_violation"],
+        "spacing_x_slack": eps_t - cons_t["spacing_x_violation"],
+        "spacing_y_slack": eps_t - cons_t["spacing_y_violation"],
+    }
+
+    return obj_terms_t, cons_t, penalty_soft_t, slacks_t
+
+def _constraints_torch_from_edges(self, left, right, bottom, top, widths, heights, device, dtype):
+    """
+    Torch constraint terms (violation>=0). This mirrors your torch objective’s constraint parts.
+    Keep it in one place so future constraints can be added cleanly.
+    """
+    n = self.n_rects
+    cons_cfg = self.constraints_cfg
+    no_ov = cons_cfg.get("no_overlap", {}).get("enabled", True)
+    min_sp = cons_cfg.get("min_spacing", {}).get("enabled", True)
+
+    min_dx = float(cons_cfg.get("min_spacing", {}).get("min_dx", 0.0))
+    min_dy = float(cons_cfg.get("min_spacing", {}).get("min_dy", 0.0))
+    min_dx_t = torch.tensor(min_dx, device=device, dtype=dtype)
+    min_dy_t = torch.tensor(min_dy, device=device, dtype=dtype)
+
+    overlap_max_ratio = torch.tensor(0.0, device=device, dtype=dtype)
+    spacing_x_violation = torch.tensor(0.0, device=device, dtype=dtype)
+    spacing_y_violation = torch.tensor(0.0, device=device, dtype=dtype)
+
+    areas = widths * heights
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            overlap_x = torch.clamp(torch.min(right[i], right[j]) - torch.max(left[i], left[j]), min=0.0)
+            overlap_y = torch.clamp(torch.min(top[i], top[j]) - torch.max(bottom[i], bottom[j]), min=0.0)
+            overlap_area = overlap_x * overlap_y
+            if no_ov:
+                smaller_area = torch.min(areas[i], areas[j])
+                ratio = torch.where(smaller_area > 0, overlap_area / torch.clamp(smaller_area, min=1e-6),
+                                    torch.tensor(1.0, device=device, dtype=dtype))
+                overlap_max_ratio = torch.maximum(overlap_max_ratio, ratio)
+
+            # gaps
+            cond1 = right[i] <= left[j]
+            cond2 = right[j] <= left[i]
+            horiz_gap = torch.where(cond1, left[j] - right[i],
+                            torch.where(cond2, left[i] - right[j],
+                                       torch.tensor(0.0, device=device, dtype=dtype)))
+
+            cond3 = top[i] <= bottom[j]
+            cond4 = top[j] <= bottom[i]
+            vert_gap = torch.where(cond3, bottom[j] - top[i],
+                           torch.where(cond4, bottom[i] - top[j],
+                                      torch.tensor(0.0, device=device, dtype=dtype)))
+
+            if min_sp:
+                spacing_x_violation = torch.maximum(spacing_x_violation, torch.clamp(min_dx_t - horiz_gap, min=0.0))
+                spacing_y_violation = torch.maximum(spacing_y_violation, torch.clamp(min_dy_t - vert_gap, min=0.0))
+
+    # bbox AR violation (same as numpy: uses config threshold/type)
+    bbox_ar_cfg = cons_cfg.get("bbox_aspect_ratio", {})
+    bbox_ar_enabled = bbox_ar_cfg.get("enabled", False)
+    bbox_ar_violation = torch.tensor(0.0, device=device, dtype=dtype)
+    if bbox_ar_enabled:
+        bw = torch.max(right) - torch.min(left)
+        bh = torch.max(top) - torch.min(bottom)
+        ar = torch.where(bh > 0, bw / torch.clamp(bh, min=1e-6), torch.tensor(1.0, device=device, dtype=dtype))
+        thr = float(bbox_ar_cfg.get("threshold", 1.0))
+        ar_type = bbox_ar_cfg.get("type", "less_than")
+        thr_t = torch.tensor(thr, device=device, dtype=dtype)
+        if ar_type == "less_than":
+            bbox_ar_violation = torch.clamp(ar - thr_t, min=0.0)
+        else:
+            bbox_ar_violation = torch.clamp(thr_t - ar, min=0.0)
+
+    # boundary violation
+    boundary_cfg = cons_cfg.get("canvas_boundary", {})
+    boundary_enabled = boundary_cfg.get("enabled", True)
+    boundary_violation = torch.tensor(0.0, device=device, dtype=dtype)
+    if boundary_enabled:
+        cvw = torch.tensor(float(self.canvas_width), device=device, dtype=dtype)
+        cvh = torch.tensor(float(self.canvas_height), device=device, dtype=dtype)
+        boundary_violation += torch.sum(torch.clamp(-left, min=0.0))
+        boundary_violation += torch.sum(torch.clamp(right - cvw, min=0.0))
+        boundary_violation += torch.sum(torch.clamp(-bottom, min=0.0))
+        boundary_violation += torch.sum(torch.clamp(top - cvh, min=0.0))
+
+    return {
+        "overlap_max_ratio": overlap_max_ratio,
+        "spacing_x_violation": spacing_x_violation,
+        "spacing_y_violation": spacing_y_violation,
+        "bbox_ar_violation": bbox_ar_violation,
+        "boundary_violation": boundary_violation,
+    }
+
+C2) Add decode hooks for formulation-specific encodings
+
+Where: still inside PlacementProblem, below the above block.
+
+def decode_for_formulation_numpy(self, x: np.ndarray, formulation_name: str, fparams: Dict[str, Any]) -> np.ndarray:
+    """
+    Returns centre-space vector [cx1, cy1, ...] for all formulations.
+    - Soft/Barrier/Lexicographic: x is already centres.
+    - Sequence Pair: x is (keys_plus, keys_minus) -> packed centres.
+    - CP-SAT: x is centres (after CP-SAT init); during refine use centres.
+    """
+    if formulation_name.startswith("3."):
+        return self.decode_sequence_pair_numpy(x, fparams)
+    return np.array(x, dtype=float)
+
+def decode_for_formulation_torch(self, x_t: "torch.Tensor", formulation_name: str, fparams: Dict[str, Any]) -> "torch.Tensor":
+    if formulation_name.startswith("3."):
+        return self.decode_sequence_pair_torch(x_t, fparams)
+    return x_t
+
+D) Sequence Pair decoding (rigorous packing + Adam compatibility)
+D1) Add deterministic sequence-pair packing (NumPy)
+
+Where: add inside PlacementProblem.
+
+def decode_sequence_pair_numpy(self, keys: np.ndarray, fparams: Dict[str, Any]) -> np.ndarray:
+    """
+    keys: length 2n, interpreted as two key vectors (k+, k-).
+    Convert to permutations via argsort and run classic sequence-pair packing:
+      - build H/V constraint graphs from permutations
+      - compute x/y via longest paths (DAG) with node widths/heights + spacing
+    Returns centre-space vector [cx1, cy1, ...].
+    """
+    n = self.n_rects
+    k_plus = keys[:n]
+    k_minus = keys[n:2*n]
+
+    pi_plus = np.argsort(k_plus)
+    pi_minus = np.argsort(k_minus)
+
+    dx = float(fparams.get("sp_dx", 0.0))
+    dy = float(fparams.get("sp_dy", 0.0))
+
+    widths = np.array([r.width for r in self.rectangles], dtype=float)
+    heights = np.array([r.height for r in self.rectangles], dtype=float)
+
+    # rank maps: rank[rect_id] = position in permutation
+    rank_plus = np.empty(n, dtype=int); rank_plus[pi_plus] = np.arange(n)
+    rank_minus = np.empty(n, dtype=int); rank_minus[pi_minus] = np.arange(n)
+
+    # Build precedence matrices for H and V:
+    # i left of j  <=> rank_plus[i] < rank_plus[j] AND rank_minus[i] < rank_minus[j]
+    # i above j    <=> rank_plus[i] < rank_plus[j] AND rank_minus[i] > rank_minus[j]
+    H_pred = [[] for _ in range(n)]
+    V_pred = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j: 
+                continue
+            if rank_plus[i] < rank_plus[j] and rank_minus[i] < rank_minus[j]:
+                H_pred[j].append(i)
+            if rank_plus[i] < rank_plus[j] and rank_minus[i] > rank_minus[j]:
+                V_pred[j].append(i)
+
+    # Longest path in DAG: topological order = pi_plus works for both constraints
+    topo = pi_plus.tolist()
+
+    x_left = np.zeros(n, dtype=float)
+    y_bot = np.zeros(n, dtype=float)
+
+    for j in topo:
+        best = 0.0
+        for i in H_pred[j]:
+            best = max(best, x_left[i] + widths[i] + dx)
+        x_left[j] = best
+
+    for j in topo:
+        best = 0.0
+        for i in V_pred[j]:
+            best = max(best, y_bot[i] + heights[i] + dy)
+        y_bot[j] = best
+
+    # Convert left/bottom to centres
+    cx = x_left + widths / 2.0
+    cy = y_bot + heights / 2.0
+
+    # Optional: shift to fit canvas origin; if canvas too small, boundary penalty will apply later
+    cx = cx - np.min(cx) + widths / 2.0
+    cy = cy - np.min(cy) + heights / 2.0
+
+    out = np.empty(2*n, dtype=float)
+    out[0:2*n:2] = cx
+    out[1:2*n:2] = cy
+    return out
+
+D2) Torch version (for Adam): straight-through + soft surrogate
+
+Where: inside PlacementProblem.
+
+This is the only part that’s “nontrivial”, because sequence-pair is combinatorial. The clean way to keep Torch Adam working is:
+
+Forward (value): use hard argsort decode (true sequence pair packing).
+
+Backward (grad): use a differentiable surrogate (soft ranks) and apply straight-through.
+
+Add:
+
+def _neural_sort_perm_matrix(self, scores: "torch.Tensor", tau: float) -> "torch.Tensor":
+    """
+    NeuralSort-style soft permutation matrix P (n x n).
+    Differentiable approx to argsort.
+    """
+    n = scores.shape[0]
+    one = torch.ones((n, 1), device=scores.device, dtype=scores.dtype)
+
+    A = torch.abs(scores.view(n, 1) - scores.view(1, n))
+    B = torch.matmul(A, torch.matmul(one, one.T))
+    scaling = (n + 1 - 2 * torch.arange(1, n + 1, device=scores.device, dtype=scores.dtype)).view(n, 1)
+    C = scaling * scores.view(1, n) - B
+    P = torch.softmax(C / tau, dim=-1)  # rows ~ ranks, cols ~ items
+    return P
+
+def decode_sequence_pair_torch(self, keys_t: "torch.Tensor", fparams: Dict[str, Any]) -> "torch.Tensor":
+    """
+    Straight-through sequence pair for Torch Adam.
+    - Hard decode for objective value (correct packing)
+    - Soft surrogate for gradients (NeuralSort + relaxed packing)
+    """
+    n = self.n_rects
+    tau = float(fparams.get("tau_sort", 0.2))
+    use_st = bool(fparams.get("ST-grad", True))
+
+    k_plus = keys_t[:n]
+    k_minus = keys_t[n:2*n]
+
+    # Hard permutations (non-differentiable)
+    pi_plus_h = torch.argsort(k_plus)
+    pi_minus_h = torch.argsort(k_minus)
+
+    # Hard packing (compute centres) in torch but using hard order
+    centres_h = self._pack_sequence_pair_torch_hard(pi_plus_h, pi_minus_h, fparams)
+
+    if not use_st:
+        # If ST disabled, return hard (but gradients will be poor)
+        return centres_h
+
+    # Soft surrogate ranks via NeuralSort
+    Pp = self._neural_sort_perm_matrix(k_plus, tau)
+    Pm = self._neural_sort_perm_matrix(k_minus, tau)
+
+    ranks = torch.arange(0, n, device=keys_t.device, dtype=keys_t.dtype)
+    r_plus = (ranks.view(n, 1) * Pp).sum(dim=0)   # expected rank per item
+    r_minus = (ranks.view(n, 1) * Pm).sum(dim=0)
+
+    centres_soft = self._pack_sequence_pair_torch_soft(r_plus, r_minus, fparams)
+
+    # Straight-through: forward uses hard, backward uses soft gradients
+    return centres_soft + (centres_h - centres_soft).detach()
+
+def _pack_sequence_pair_torch_hard(self, pi_plus, pi_minus, fparams: Dict[str, Any]) -> "torch.Tensor":
+    n = self.n_rects
+    dx = float(fparams.get("sp_dx", 0.0))
+    dy = float(fparams.get("sp_dy", 0.0))
+    dtype = torch.float32
+    device = pi_plus.device
+
+    widths = torch.tensor([r.width for r in self.rectangles], device=device, dtype=dtype)
+    heights = torch.tensor([r.height for r in self.rectangles], device=device, dtype=dtype)
+
+    rank_plus = torch.empty(n, device=device, dtype=torch.long)
+    rank_minus = torch.empty(n, device=device, dtype=torch.long)
+    rank_plus[pi_plus] = torch.arange(n, device=device)
+    rank_minus[pi_minus] = torch.arange(n, device=device)
+
+    H_pred = [[] for _ in range(n)]
+    V_pred = [[] for _ in range(n)]
+    rp = rank_plus.cpu().numpy()
+    rm = rank_minus.cpu().numpy()
+    for i in range(n):
+        for j in range(n):
+            if i == j: 
+                continue
+            if rp[i] < rp[j] and rm[i] < rm[j]:
+                H_pred[j].append(i)
+            if rp[i] < rp[j] and rm[i] > rm[j]:
+                V_pred[j].append(i)
+
+    topo = pi_plus.tolist()
+    x_left = torch.zeros(n, device=device, dtype=dtype)
+    y_bot = torch.zeros(n, device=device, dtype=dtype)
+
+    for j in topo:
+        best = torch.tensor(0.0, device=device, dtype=dtype)
+        for i in H_pred[j]:
+            best = torch.maximum(best, x_left[i] + widths[i] + dx)
+        x_left[j] = best
+
+    for j in topo:
+        best = torch.tensor(0.0, device=device, dtype=dtype)
+        for i in V_pred[j]:
+            best = torch.maximum(best, y_bot[i] + heights[i] + dy)
+        y_bot[j] = best
+
+    cx = x_left + widths / 2.0
+    cy = y_bot + heights / 2.0
+    cx = cx - torch.min(cx) + widths / 2.0
+    cy = cy - torch.min(cy) + heights / 2.0
+
+    out = torch.empty(2*n, device=device, dtype=dtype)
+    out[0:2*n:2] = cx
+    out[1:2*n:2] = cy
+    return out
+
+def _pack_sequence_pair_torch_soft(self, r_plus, r_minus, fparams: Dict[str, Any]) -> "torch.Tensor":
+    """
+    Differentiable relaxed packing:
+    Use sigmoid on rank differences to estimate left/above probabilities,
+    then apply a few fixed-point relaxations with smooth max (logsumexp).
+    """
+    n = self.n_rects
+    dx = float(fparams.get("sp_dx", 0.0))
+    dy = float(fparams.get("sp_dy", 0.0))
+    tau_rel = float(fparams.get("tau_sort", 0.2))
+    device = r_plus.device
+    dtype = r_plus.dtype
+
+    widths = torch.tensor([r.width for r in self.rectangles], device=device, dtype=dtype)
+    heights = torch.tensor([r.height for r in self.rectangles], device=device, dtype=dtype)
+
+    # p_left(i->j): i before j in both sequences
+    dp = (r_plus.view(n,1) - r_plus.view(1,n)) / tau_rel
+    dm = (r_minus.view(n,1) - r_minus.view(1,n)) / tau_rel
+    before_p = torch.sigmoid(-dp)  # i before j
+    before_m = torch.sigmoid(-dm)
+
+    pH = before_p * before_m                 # i left of j
+    pV = before_p * torch.sigmoid(dm)        # i above j (minus order opposite)
+
+    # Relaxed longest-path via iterative smoothing (K steps)
+    K = 10
+    x_left = torch.zeros(n, device=device, dtype=dtype)
+    y_bot  = torch.zeros(n, device=device, dtype=dtype)
+
+    # Smooth max: logsumexp(a/t) * t
+    def smooth_max(vec, t=0.1):
+        return t * torch.logsumexp(vec / t, dim=0)
+
+    sep_x = widths + dx
+    sep_y = heights + dy
+
+    for _ in range(K):
+        # x_j = max_i (x_i + sep_i) * pH_{i,j}  (relaxed)
+        cand_x = (x_left.view(n,1) + sep_x.view(n,1)) * pH
+        x_left = smooth_max(torch.cat([cand_x, torch.zeros(1, n, device=device, dtype=dtype)], dim=0), t=0.2)
+
+        cand_y = (y_bot.view(n,1) + sep_y.view(n,1)) * pV
+        y_bot = smooth_max(torch.cat([cand_y, torch.zeros(1, n, device=device, dtype=dtype)], dim=0), t=0.2)
+
+    cx = x_left + widths/2.0
+    cy = y_bot + heights/2.0
+    cx = cx - torch.min(cx) + widths/2.0
+    cy = cy - torch.min(cy) + heights/2.0
+
+    out = torch.empty(2*n, device=device, dtype=dtype)
+    out[0:2*n:2] = cx
+    out[1:2*n:2] = cy
+    return out
+
+
+This gives you a rigorous decode (hard packing) + a rigorous differentiable surrogate for Torch Adam.
+
+E) CP-SAT packing (rigorous) + still works with Adam Torch
+E1) Add a CP-SAT solver function (NEW)
+
+Where: Put this below the FormulationEngine (or near it), above OptimizationManager.
+
+def cpsat_pack(problem: "PlacementProblem", time_limit_s: float, grid: int,
+               hint_centres: Optional[np.ndarray] = None,
+               hint_weight: float = 0.0) -> Tuple[np.ndarray, Dict[Tuple[int,int], str]]:
+    """
+    OR-Tools CP-SAT packing:
+      - integer coordinates (scaled by grid)
+      - non-overlap as disjunction using AddNoOverlap2D-like modelling (via interval vars)
+      - min spacing via inflated rectangles
+      - boundary constraints
+      - objective: approximate HPWL + bbox width/height/area surrogate
+
+    Returns:
+      centres_x (float) [cx1, cy1, ...]
+      pairwise_relations: {(i,j): one of 'L','R','A','B'} extracted from solution
+    """
+    from ortools.sat.python import cp_model
+
+    n = problem.n_rects
+    W = int(round(problem.canvas_width * grid))
+    H = int(round(problem.canvas_height * grid))
+    widths = [int(round(r.width * grid)) for r in problem.rectangles]
+    heights = [int(round(r.height * grid)) for r in problem.rectangles]
+
+    min_dx = float(problem.constraints_cfg.get("min_spacing", {}).get("min_dx", 0.0))
+    min_dy = float(problem.constraints_cfg.get("min_spacing", {}).get("min_dy", 0.0))
+    dx = int(round(min_dx * grid))
+    dy = int(round(min_dy * grid))
+
+    m = cp_model.CpModel()
+
+    # left/bottom integer vars
+    xs = [m.NewIntVar(0, W, f"x_{i}") for i in range(n)]
+    ys = [m.NewIntVar(0, H, f"y_{i}") for i in range(n)]
+
+    # Fit inside canvas
+    for i in range(n):
+        m.Add(xs[i] + widths[i] <= W)
+        m.Add(ys[i] + heights[i] <= H)
+
+    # Non-overlap using disjunction for each pair
+    pair_rel = {}
+    for i in range(n):
+        for j in range(i+1, n):
+            # four booleans: i left of j, i right of j, i above j, i below j
+            L = m.NewBoolVar(f"L_{i}_{j}")
+            R = m.NewBoolVar(f"R_{i}_{j}")
+            A = m.NewBoolVar(f"A_{i}_{j}")
+            B = m.NewBoolVar(f"B_{i}_{j}")
+
+            m.Add(xs[i] + widths[i] + dx <= xs[j]).OnlyEnforceIf(L)
+            m.Add(xs[j] + widths[j] + dx <= xs[i]).OnlyEnforceIf(R)
+            m.Add(ys[i] + heights[i] + dy <= ys[j]).OnlyEnforceIf(B)
+            m.Add(ys[j] + heights[j] + dy <= ys[i]).OnlyEnforceIf(A)
+
+            m.AddBoolOr([L, R, A, B])
+
+            pair_rel[(i, j)] = (L, R, A, B)
+
+    # Bounding box vars
+    xmin = m.NewIntVar(0, W, "xmin")
+    xmax = m.NewIntVar(0, W, "xmax")
+    ymin = m.NewIntVar(0, H, "ymin")
+    ymax = m.NewIntVar(0, H, "ymax")
+
+    for i in range(n):
+        m.Add(xmin <= xs[i])
+        m.Add(xmax >= xs[i] + widths[i])
+        m.Add(ymin <= ys[i])
+        m.Add(ymax >= ys[i] + heights[i])
+
+    bw = m.NewIntVar(0, W, "bbox_w")
+    bh = m.NewIntVar(0, H, "bbox_h")
+    m.Add(bw == xmax - xmin)
+    m.Add(bh == ymax - ymin)
+
+    # HPWL-like objective on centres: (max cx - min cx) + (max cy - min cy)
+    cxs = [m.NewIntVar(0, W, f"cx_{i}") for i in range(n)]
+    cys = [m.NewIntVar(0, H, f"cy_{i}") for i in range(n)]
+    for i in range(n):
+        m.Add(cxs[i] == xs[i] + widths[i]//2)
+        m.Add(cys[i] == ys[i] + heights[i]//2)
+
+    cxmin = m.NewIntVar(0, W, "cxmin"); cxmax = m.NewIntVar(0, W, "cxmax")
+    cymin = m.NewIntVar(0, H, "cymin"); cymax = m.NewIntVar(0, H, "cymax")
+    m.AddMinEquality(cxmin, cxs); m.AddMaxEquality(cxmax, cxs)
+    m.AddMinEquality(cymin, cys); m.AddMaxEquality(cymax, cys)
+    hpwl = m.NewIntVar(0, W+H, "hpwl")
+    m.Add(hpwl == (cxmax - cxmin) + (cymax - cymin))
+
+    # Area term (exact multiplication allowed)
+    area = m.NewIntVar(0, W*H, "area")
+    m.AddMultiplicationEquality(area, [bw, bh])
+
+    # Aspect proxy: abs(bw - ar_target*bh)
+    # (for CP-SAT objective we use a linear proxy rather than ratio)
+    ar_target = float(problem.constraints_cfg.get("bbox_aspect_ratio", {}).get("threshold", 1.0))
+    # scale target to integer factor
+    ar_num = int(round(ar_target * 1000))
+    tmp = m.NewIntVar(-W*1000, W*1000, "ar_tmp")
+    ar_dev = m.NewIntVar(0, W*1000, "ar_dev")
+    m.Add(tmp == bw*1000 - ar_num*bh)
+    m.AddAbsEquality(ar_dev, tmp)
+
+    # Optional hint objective to stay near given centres
+    hint_cost = None
+    if hint_centres is not None and hint_weight > 0.0:
+        # L1 distance to hint centres
+        hint_terms = []
+        for i in range(n):
+            hx = int(round(float(hint_centres[2*i]) * grid))
+            hy = int(round(float(hint_centres[2*i+1]) * grid))
+            dxv = m.NewIntVar(0, W, f"hint_dx_{i}")
+            dyv = m.NewIntVar(0, H, f"hint_dy_{i}")
+            m.AddAbsEquality(dxv, cxs[i] - hx)
+            m.AddAbsEquality(dyv, cys[i] - hy)
+            hint_terms.append(dxv); hint_terms.append(dyv)
+        hint_cost = sum(hint_terms)
+
+    # Objective weights from your UI weights (reuse PlacementProblem weights)
+    w_hpwl = int(round(problem.weight_hpwl * 1000))
+    w_area = int(round(problem.weight_bbox_area * 1))      # already large numbers
+    w_ar   = int(round(problem.weight_bbox_aspect * 10))   # proxy scale
+
+    obj_expr = w_hpwl*hpwl + w_area*area + w_ar*ar_dev
+    if hint_cost is not None:
+        obj_expr = obj_expr + int(round(hint_weight*1000)) * hint_cost
+
+    m.Minimize(obj_expr)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(time_limit_s)
+    solver.parameters.num_search_workers = max(1, os.cpu_count() or 1)
+
+    status = solver.Solve(m)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise RuntimeError("CP-SAT failed to find feasible packing")
+
+    centres = np.empty(2*n, dtype=float)
+    for i in range(n):
+        cxv = solver.Value(cxs[i]) / grid
+        cyv = solver.Value(cys[i]) / grid
+        centres[2*i] = cxv
+        centres[2*i+1] = cyv
+
+    # Extract pairwise relations (for barrier refinement)
+    relations = {}
+    for (i,j), (L,R,A,B) in pair_rel.items():
+        if solver.Value(L): relations[(i,j)] = "L"
+        elif solver.Value(R): relations[(i,j)] = "R"
+        elif solver.Value(A): relations[(i,j)] = "A"
+        else: relations[(i,j)] = "B"
+
+    return centres, relations
+
+E2) Use CP-SAT output in a way that still supports Torch Adam
+
+Key idea: CP-SAT gives you a feasible layout + pairwise disjunction decisions. Those decisions can be turned into smooth inequalities (no disjunction anymore) and enforced via barrier during refinement.
+
+So add to PlacementProblem a place to store them:
+
+Where: PlacementProblem.__init__ add:
+
+self.pairwise_relations = None  # (i,j)-> 'L'/'R'/'A'/'B' from CP-SAT
+
+
+Then extend slacks in barrier mode to include these “chosen disjunctions”:
+
+Where: inside compute_terms_numpy and compute_terms_torch, after slacks = {...} add:
+
+# If CP-SAT provided pairwise relations, we can barrier-enforce them as TRUE inequalities.
+if getattr(self, "pairwise_relations", None):
+    # Add g_ij(x) = separation >= margin_eps (must be >0)
+    # Example for relation "L": right_i + dx <= left_j  -> slack = (left_j - right_i - dx)
+    # Use the SAME min_spacing values to define dx/dy.
+    dx_min = float(self.constraints_cfg.get("min_spacing", {}).get("min_dx", 0.0))
+    dy_min = float(self.constraints_cfg.get("min_spacing", {}).get("min_dy", 0.0))
+    for (i,j), rel in self.pairwise_relations.items():
+        # compute edges for i,j from current centres (already available in numpy; in torch use tensors)
+        # Add to slacks dict as "pair_{i}_{j}"
+        ...
+
+
+(Implementation is straightforward but uses your existing edge calculations; keep it inside helper functions to avoid duplication.)
+
+F) Minimal modifications inside OptimizationManager (hook the engine)
+F1) Store selected formulation + params
+
+Where: inside OptimizationManager.__init__ add:
+
+self.formulation_name = "0. Soft penalty (weighted sum)"
+self.formulation_params = {}
+
+F2) Collect formulation params in on_run_click
+
+Where: inside on_run_click (just before manager.start_run(...)) add:
+
+# collect formulation params
+fparams = {"margin_eps": float(barrier_margin.value or 1e-3)}
+for w in formulation_param_widgets.get(formulation_select.value, []):
+    fparams[w.name] = w.value
+
+manager.formulation_name = formulation_select.value
+manager.formulation_params = fparams
+
+F3) Change all objective calls to go through FormulationEngine
+
+Where: in OptimizationManager replace _objective_augmented_np with:
+
+def _objective_augmented_np(self, x: np.ndarray) -> float:
+    return FormulationEngine.scalarize_numpy(
+        self.problem, x, self.formulation_name, self.formulation_params
+    )
+
+
+…and replace Torch objective inside _run_adam_torch where you currently do:
+
+loss = self._objective_augmented_torch(x_t, widths, heights)
+
+
+Change to:
+
+loss = FormulationEngine.scalarize_torch(
+    self.problem, x_t, self.formulation_name, self.formulation_params
+)
+
+F4) Add feasibility-preserving line search for barrier + Torch Adam
+
+Where: inside _run_adam_torch, right after you compute the Adam step direction. Minimal change approach:
+
+Keep Adam’s update but backtrack if barrier slacks are not strictly positive.
+
+Add helper inside OptimizationManager (new):
+
+def _barrier_backtrack_step(self, x_t, proposed_x, bt_beta: float, bt_min_alpha: float):
+    """
+    Ensures feasibility for barrier slacks: all g_k(x)>0.
+    Backtracks towards x_t until feasible.
+    """
+    alpha = 1.0
+    while alpha > bt_min_alpha:
+        cand = x_t + alpha * (proposed_x - x_t)
+        # compute slacks in torch by calling compute_terms_torch on decoded centres
+        centres = self.problem.decode_for_formulation_torch(cand, self.formulation_name, self.formulation_params)
+        _, _, _, slacks = self.problem.compute_terms_torch(centres, self.formulation_params)
+        ok = True
+        for g in slacks.values():
+            if torch.any(g <= 0):
+                ok = False
+                break
+        if ok:
+            return cand
+        alpha *= bt_beta
+    return x_t  # fallback: refuse step
+
+
+Then in _run_adam_torch after optimizer.step() (or better: compute proposed step manually), do:
+
+if self.formulation_name.startswith("1."):
+    bt_beta = float(self.formulation_params.get("bt_beta", 0.5))
+    bt_min_alpha = float(self.formulation_params.get("bt_min_alpha", 1e-4))
+    with torch.no_grad():
+        x_new = self._barrier_backtrack_step(x_t.detach(), x_t.detach().clone(), bt_beta, bt_min_alpha)
+        x_t.copy_(x_new)
+
+
+(You can instead compute the “proposed_x” before copying; the above shows the logic.)
+
+G) Lexicographic optimization (works with all optimizers)
+G1) Implement stage logic inside OptimizationManager (new function)
+
+Where: inside OptimizationManager, add:
+
+def _run_lexicographic(self, algorithm: str, params: Dict[str, Any], x0: np.ndarray):
+    """
+    Two-stage:
+      Stage 1: minimize V(x) (constraint violation measure)
+      Stage 2: minimize f(x) + lambda * relu(V(x)-Vbest+eps)^2
+    """
+    stage1_frac = float(self.formulation_params.get("stage1_frac", 0.5))
+    eps = float(self.formulation_params.get("eps", 1e-3))
+    lam = float(self.formulation_params.get("lambda", 1e4))
+
+    # Split iterations (best-effort; for DE/GA this maps to generations/iters)
+    maxiter = int(params.get("maxiter", 200))
+    it1 = max(1, int(maxiter * stage1_frac))
+    it2 = max(1, maxiter - it1)
+
+    # Stage 1 objective: V(x)
+    def V_numpy(x):
+        centres = self.problem.decode_for_formulation_numpy(x, self.formulation_name, self.formulation_params)
+        _, cons, _, _ = self.problem.compute_terms_numpy(centres, self.formulation_params)
+        return FormulationEngine.violation_scalar(cons)
+
+    # Run stage 1 using same algorithm but with a different objective
+    x_best_stage1 = self._run_with_custom_objective_numpy(algorithm, params, x0, V_numpy, it1)
+
+    # Get best V*
+    Vbest = V_numpy(x_best_stage1)
+
+    # Stage 2 objective
+    def F2_numpy(x):
+        centres = self.problem.decode_for_formulation_numpy(x, self.formulation_name, self.formulation_params)
+        obj_terms, cons, penalty_soft, _ = self.problem.compute_terms_numpy(centres, self.formulation_params)
+        f = float(sum(self.problem.get_obj_weight(k) * v for k, v in obj_terms.items()))
+        Vx = FormulationEngine.violation_scalar(cons)
+        gate = max(0.0, Vx - Vbest + eps)
+        return f + penalty_soft + lam * (gate * gate)
+
+    params2 = dict(params); params2["maxiter"] = it2
+    self._run_with_custom_objective_numpy(algorithm, params2, x_best_stage1, F2_numpy, it2)
+
+
+This requires a helper _run_with_custom_objective_numpy(...) that routes to DE/DA/minimize/GA/basinhopping but substitutes the objective function. You already have each optimizer call in its own _run_*; the minimal edit is to let each _run_* accept an objective_fn argument.
+
+G2) Minimal signature change to _run_* functions
+
+Example: change
+
+def _run_differential_evolution(self, params, target_obj):
+    differential_evolution(lambda x: self._objective_augmented_np_checked(x), ...)
+
+
+to:
+
+def _run_differential_evolution(self, params, target_obj, objective_fn=None):
+    obj = objective_fn if objective_fn is not None else self._objective_augmented_np_checked
+    differential_evolution(lambda x: obj(x), ...)
+
+
+Do similarly for dual_annealing / basinhopping / minimize / pygad.
+
+G3) Call lexicographic worker from _run_optimizer_worker
+
+Where: in _run_optimizer_worker, replace the direct dispatch with:
+
+if self.formulation_name.startswith("2."):
+    self._run_lexicographic(algorithm, params, x0)
+else:
+    # existing dispatch
+
+
+(Keep everything else unchanged.)
+
+Torch Adam lexicographic: do the exact same stage idea, but with torch objectives V_torch and F2_torch. Since your Adam loop is in Python, you can run it twice.
+
+H) CP-SAT mode wiring (rigorous, still “works” with Adam Torch)
+H1) In start_run, if formulation is CP-SAT: do CP-SAT first
+
+Where: inside OptimizationManager.start_run(...) after computing x0.
+
+Add:
+
+if self.formulation_name.startswith("4."):
+    # 1) run CP-SAT to get feasible placement + relations
+    tl = float(self.formulation_params.get("time_s", 3.0))
+    grid = int(self.formulation_params.get("grid", 1))
+    hint_w = float(self.formulation_params.get("hint_w", 0.0))
+
+    centres0, relations = cpsat_pack(self.problem, tl, grid, hint_centres=x0, hint_weight=hint_w)
+    self.problem.pairwise_relations = relations
+
+    # seed optimizer with CP-SAT solution
+    x0 = centres0.copy()
+
+    # optional: if user disables refine, stop after CP-SAT
+    if not bool(self.formulation_params.get("refine w/ optimizer", True)):
+        self.register_step("CP-SAT", x0, target_obj)
+        self.running = False
+        self._auto_save_optimized_config()
+        return
+
+
+Then refinement proceeds with the chosen optimizer, but now barrier mode has true non-overlap inequalities because disjunction decisions are fixed.
+
+I) Bounds changes required for Sequence Pair keys
+
+Your current bounds() assume x is centres. Sequence Pair needs key bounds.
+
+I1) Add a bounds helper in PlacementProblem
+
+Where: inside PlacementProblem, add:
+
+def bounds_for_formulation(self, formulation_name: str, fparams: Dict[str, Any]):
+    if formulation_name.startswith("3."):
+        n = self.n_rects
+        if str(fparams.get("key_bounds","[0,1]")) == "[-1,1]":
+            return [(-1.0, 1.0)] * (2*n)
+        return [(0.0, 1.0)] * (2*n)
+    return self.bounds()
+
+I2) Change optimizer calls to use bounds_for_formulation(...)
+
+Example in _run_differential_evolution replace:
+
+bounds = self.problem.bounds()
+
+
+with:
+
+bounds = self.problem.bounds_for_formulation(self.formulation_name, self.formulation_params)
+
+
+Do similarly for dual_annealing / minimize bounds / Adam clamping.
+
+J) Summary of EXACT call-site edits (the minimal list)
+
+UI:
+
+Add formulation_select and form_param_row1/2.
+
+Add formulation parameter widgets and _update_formulation_rows.
+
+Add those rows to parameters_left.
+
+OptimizationManager:
+
+Add self.formulation_name, self.formulation_params.
+
+In on_run_click, fill them from the UI.
+
+Replace objective evaluation with:
+
+FormulationEngine.scalarize_numpy(...) for numpy objective
+
+FormulationEngine.scalarize_torch(...) for torch objective
+
+Add barrier backtracking inside torch Adam if formulation is barrier.
+
+If formulation is lexicographic: run _run_lexicographic(...).
+
+If formulation is CP-SAT: call cpsat_pack(...) to seed and extract relations.
+
+PlacementProblem:
+
+Add compute_terms_numpy, compute_terms_torch, decode hooks, sequence pair decode, bounds_for_formulation, and optional CP-SAT relation slacks.
+
+Important rigor notes (so you don’t get “fake” methods)
+
+Barrier methods are mathematically correct for true inequalities 
+𝑔
+𝑘
+(
+𝑥
+)
+>
+0
+g
+k
+	​
+
+(x)>0.
+For 2D non-overlap (a disjunction), barrier alone is not “clean” unless the disjunction is resolved.
+That’s why the CP-SAT path extracts pairwise relations and turns them into deterministic inequalities.
+
+Sequence pair is combinatorial. You get:
+
+hard decode (true feasibility by construction),
+
+Adam compatibility via straight-through + differentiable surrogate.
+This is the standard way to keep gradient-based optimizers functional on discrete encodings.
+
+CP-SAT is a solver-based formulation. It’s fully rigorous and doesn’t need weights to enforce constraints.
+To keep “works with Adam Torch”, we do: CP-SAT → then refine using barrier with fixed disjunction decisions.
