@@ -1,0 +1,271 @@
+1) Confirming whether the optimized JSON already saves the best-so-far (not last iter)
+
+Yes — your current code already writes the best-so-far placement (minimum augmented objective), not the last iteration:
+
+In OptimizationManager.register_step() you update self.best_x / self.best_metrics whenever a lower objective_augmented is found.
+
+In OptimizationManager._auto_save_optimized_config() you write the output JSON using self.best_x:
+
+centres = self.problem.decode_centres(self.best_x)
+...
+rcfg["initial_center"] = [float(cx), float(cy)]
+
+
+So the saved centers in <original>_optimized.json are already the best-so-far.
+
+However: the optimized JSON currently does not include the per-term objective + constraint values you asked for (it only updates centers). So if you want those terms stored inside the JSON, you do need a small addition (below).
+
+2) Changes needed (exact locations + what to insert)
+A) Track the “best record” (iteration/placement_id + metrics + vector) cleanly
+Where
+
+Class: OptimizationManager
+Function: __init__
+Place: Immediately below the block where you define:
+
+self.best_x: Optional[np.ndarray] = None
+self.best_metrics: Optional[Dict[str, float]] = None
+
+Add
+
+Add a “best record” container + a UI flag to force final display:
+
+self.best_record: Optional[Dict[str, Any]] = None  # full record for best-so-far
+self._needs_final_best_display: bool = False        # trigger canvas update to best at end
+
+B) Reset those fields on new runs
+Where
+
+Class: OptimizationManager
+Function: _reset_state
+Place: Inside the with self._lock: block, right after resetting best_x/best_metrics.
+
+You already have:
+
+self.best_x = None
+self.best_metrics = None
+
+Add immediately below
+self.best_record = None
+self._needs_final_best_display = False
+
+C) Ensure best_record stores the best placement (not last), and is updated when best improves
+Where
+
+Class: OptimizationManager
+Function: register_step
+
+What to change
+
+Right after:
+
+metrics = self.problem.compute_metrics(x)
+
+
+insert:
+
+is_new_best = (
+    self.best_metrics is None
+    or metrics["objective_augmented"] < self.best_metrics["objective_augmented"]
+)
+
+
+Then later, after you build rec = {...}, you currently append it to history and pending.
+
+Place this block immediately after you create rec (i.e. right after the rec = { ... } dict is complete, and before/after you append; either is fine):
+
+if is_new_best:
+    self.best_x = np.array(x, dtype=float)
+    self.best_metrics = metrics
+    self.best_record = rec
+
+
+✅ This guarantees:
+
+best-so-far is tracked even if last step is worse
+
+you have the exact iteration, placement_id, metrics, and x_vector for the best solution
+
+3) Make the Canvas View show the best solution at the end (not last iteration)
+D) Add a helper to apply any solution vector to canvas sources (used for “final best display”)
+Where
+
+Class: OptimizationManager
+Place: Add a new method right below periodic_update(...) (recommended), i.e. below:
+
+def periodic_update(self, target_obj: float, canvas_fig):
+    ...
+
+Add method
+
+(Add exactly once in the class)
+
+def apply_solution_to_canvas(self, x_vec: np.ndarray, canvas_fig, title_suffix: str = ""):
+    """Update canvas sources + title using a given solution vector (best or last)."""
+    if self.problem is None or x_vec is None:
+        return
+    rects, bbox = self.problem.make_rectangle_shapes(np.array(x_vec, dtype=float))
+    self.canvas_source.data = dict(
+        x=[r["x"] for r in rects],
+        y=[r["y"] for r in rects],
+        w=[r["w"] for r in rects],
+        h=[r["h"] for r in rects],
+        rect_id=[r["rect_id"] for r in rects],
+        placement_id=[(self.best_record or {}).get("placement_id", -1)] * len(rects),
+    )
+    self.bbox_source.data = dict(x=[bbox["x"]], y=[bbox["y"]], w=[bbox["w"]], h=[bbox["h"]])
+    best_pid = (self.best_record or {}).get("placement_id", "-")
+    self.placement_label_source.data = dict(
+        x=[bbox["x"]],
+        y=[bbox["y"] + bbox["h"] * 0.6],
+        text=[f"Best Placement: {best_pid}"],
+    )
+    canvas_fig.title.text = f"Canvas View (Best){title_suffix}"
+
+E) Trigger “show best at end” safely from the UI thread
+
+You should not directly update Bokeh sources from the optimizer worker thread. So:
+
+Where
+
+Class: OptimizationManager
+Function: _auto_save_optimized_config
+
+At the very end of the function (after writing the JSON and status update), set a flag:
+
+Place: Just before the final:
+
+self._update_status("optimization over")
+
+
+(or just after writing the output file)
+
+Add
+with self._lock:
+    self._needs_final_best_display = True
+
+F) In _tick(), if optimization is over, update canvas to best once
+Where
+
+Function: _tick() (module-level function)
+
+You currently have:
+
+manager.periodic_update(t_local, canvas_fig)
+
+
+Immediately below that line, add:
+
+# If optimizer finished, force canvas to show BEST solution (not last) once
+if (not manager.running) and getattr(manager, "_needs_final_best_display", False):
+    if manager.best_x is not None:
+        manager.apply_solution_to_canvas(manager.best_x, canvas_fig)
+    manager._needs_final_best_display = False
+
+
+✅ Result: live view remains “last iteration” during the run, but switches to BEST once the run ends.
+
+4) “State saved should reflect best solution” (not last)
+G) Save the best record explicitly in state JSON (so resuming/loading uses best)
+Where
+
+Class: OptimizationManager
+Function: save_state_to_file
+
+You currently build:
+
+state = {
+    ...
+    "best_x": ...
+    "best_metrics": ...
+    "history_records": ...
+}
+
+
+Add these keys right below best_metrics:
+
+"best_record": self.best_record,
+"saved_solution_x": self.best_x.tolist() if self.best_x is not None else None,
+"saved_solution_metrics": self.best_metrics,
+"saved_solution_iteration": (self.best_record or {}).get("iteration"),
+"saved_solution_placement_id": (self.best_record or {}).get("placement_id"),
+
+
+This makes it unambiguous that “the saved solution” is the best-so-far.
+
+H) When loading state, show the best solution on canvas (not last record)
+Where
+
+Class: OptimizationManager
+Function: _refresh_from_history_locked
+
+Right now, at the end you do “Last placement for canvas view”:
+
+last = self._history_records[-1]
+x_vec = np.array(last["x_vector"])
+...
+
+
+Replace that selection logic so it uses best if available:
+
+Keep history plots as-is
+
+But choose the vector for canvas like:
+
+Change this:
+
+last = self._history_records[-1]
+x_vec = np.array(last["x_vector"])
+
+
+To:
+
+# Use BEST solution for canvas display if available, else fall back to last
+if self.best_record is not None:
+    x_vec = np.array(self.best_record["x_vector"])
+    display_pid = self.best_record["placement_id"]
+else:
+    last = self._history_records[-1]
+    x_vec = np.array(last["x_vector"])
+    display_pid = last["placement_id"]
+
+
+And then update the placement label to use display_pid (best if present).
+
+5) Add objective/constraint term values into the optimized JSON output
+
+You asked that the optimized JSON “should contain individual values of each objective terms, each constraint terms, and placements”.
+
+Where
+
+Class: OptimizationManager
+Function: _auto_save_optimized_config
+
+Right after you deep copy config:
+
+cfg_out = json.loads(json.dumps(self.config))
+
+
+and after you compute:
+
+centres = self.problem.decode_centres(self.best_x)
+
+
+Add:
+
+# Store best-so-far detailed result into output JSON
+cfg_out["optimization_result"] = {
+    "algorithm": self.current_algorithm,
+    "algorithm_params": self.current_params,
+    "best_iteration": (self.best_record or {}).get("iteration"),
+    "best_placement_id": (self.best_record or {}).get("placement_id"),
+    "best_x_vector": self.best_x.tolist(),
+    "best_metrics": self.best_metrics,   # includes all objective + constraint terms
+    "best_centres": [
+        {"id": r.rect_id, "center": [float(cx), float(cy)], "width": r.width, "height": r.height}
+        for r, (cx, cy) in zip(self.problem.rectangles, centres)
+    ],
+}
+
+
+✅ This satisfies your “include individual values + placements” requirement inside the output JSON.
