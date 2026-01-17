@@ -1,0 +1,1459 @@
+// src/rect_place_module.cpp
+
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+
+#include <armadillo>
+#include <ensmallen.hpp>   // C++14 optimizer library (DE/PSO/SA, etc.)
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace py = pybind11;
+using json = nlohmann::json;
+
+// ------------------------------
+// Utility: timing
+// ------------------------------
+class Stopwatch
+{
+public:
+  Stopwatch() : start_(std::chrono::high_resolution_clock::now()) {}
+  double Seconds() const
+  {
+    const auto now = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double>(now - start_).count();
+  }
+private:
+  std::chrono::high_resolution_clock::time_point start_;
+};
+
+// ------------------------------
+// Domain classes (NO struct usage)
+// ------------------------------
+class Rectangle
+{
+public:
+  Rectangle() : x_(0.0), y_(0.0), w_(0.0), h_(0.0) {}
+  Rectangle(const double x, const double y, const double w, const double h)
+    : x_(x), y_(y), w_(w), h_(h) {}
+
+  double X() const { return x_; }
+  double Y() const { return y_; }
+  double W() const { return w_; }
+  double H() const { return h_; }
+
+  void SetXY(const double x, const double y) { x_ = x; y_ = y; }
+
+  double Left() const { return x_; }
+  double Right() const { return x_ + w_; }
+  double Bottom() const { return y_; }
+  double Top() const { return y_ + h_; }
+
+  double Cx() const { return x_ + 0.5 * w_; }
+  double Cy() const { return y_ + 0.5 * h_; }
+
+  double Area() const { return w_ * h_; }
+
+private:
+  double x_, y_, w_, h_;
+};
+
+class Canvas
+{
+public:
+  Canvas() : w_(0.0), h_(0.0) {}
+  Canvas(const double w, const double h) : w_(w), h_(h) {}
+  double W() const { return w_; }
+  double H() const { return h_; }
+  double Area() const { return w_ * h_; }
+private:
+  double w_, h_;
+};
+
+class BoundingBox
+{
+public:
+  BoundingBox()
+  : minx_(+std::numeric_limits<double>::infinity()),
+    miny_(+std::numeric_limits<double>::infinity()),
+    maxx_(-std::numeric_limits<double>::infinity()),
+    maxy_(-std::numeric_limits<double>::infinity())
+  {}
+
+  void Reset()
+  {
+    minx_ = +std::numeric_limits<double>::infinity();
+    miny_ = +std::numeric_limits<double>::infinity();
+    maxx_ = -std::numeric_limits<double>::infinity();
+    maxy_ = -std::numeric_limits<double>::infinity();
+  }
+
+  void ExpandByRect(const Rectangle& r)
+  {
+    minx_ = std::min(minx_, r.Left());
+    miny_ = std::min(miny_, r.Bottom());
+    maxx_ = std::max(maxx_, r.Right());
+    maxy_ = std::max(maxy_, r.Top());
+  }
+
+  double MinX() const { return minx_; }
+  double MinY() const { return miny_; }
+  double MaxX() const { return maxx_; }
+  double MaxY() const { return maxy_; }
+
+  double Width() const { return std::max(0.0, maxx_ - minx_); }
+  double Height() const { return std::max(0.0, maxy_ - miny_); }
+  double Cx() const { return 0.5 * (minx_ + maxx_); }
+  double Cy() const { return 0.5 * (miny_ + maxy_); }
+  double Area() const { return Width() * Height(); }
+
+  double AspectRatio() const
+  {
+    const double h = Height();
+    if (h <= 1e-12) return std::numeric_limits<double>::infinity();
+    return Width() / h;
+  }
+
+private:
+  double minx_, miny_, maxx_, maxy_;
+};
+
+class Metrics
+{
+public:
+  Metrics()
+  : bbox_area(0.0), bbox_aspect(0.0), hpwl(0.0),
+    overlap(0.0), boundary_violation(0.0), aspect_ratio_violation(0.0),
+    augmented_objective(0.0),
+    bbox_cx(0.0), bbox_cy(0.0), bbox_w(0.0), bbox_h(0.0),
+    iteration_index(0)
+  {}
+
+  double bbox_area;
+  double bbox_aspect;
+  double hpwl;
+
+  double overlap;
+  double boundary_violation;
+  double aspect_ratio_violation;
+
+  double augmented_objective;
+
+  double bbox_cx, bbox_cy, bbox_w, bbox_h;
+
+  std::size_t iteration_index;
+};
+
+class ConstraintConfig
+{
+public:
+  ConstraintConfig()
+  : enabled(false), weight(0.0), normalization("no norm"), aggregation("sum")
+  {}
+
+  bool enabled;
+  double weight;
+  std::string normalization;
+  std::string aggregation;
+};
+
+class ObjectiveConfig
+{
+public:
+  ObjectiveConfig() : w_hpwl(1.0), w_area(1.0) {}
+  double w_hpwl;
+  double w_area;
+};
+
+class OptimizerConfig
+{
+public:
+  OptimizerConfig()
+  : algorithm("differential_evolution_DE"),
+    max_iter(1000),
+    stopping_criteria("max_iter"),
+    stopping_value(0.0),
+    pop_size(40),
+    seed(1),
+    recombination(0.6),
+    strategy("best1bin"),
+    mutation_min(0.5),
+    mutation_max(0.8)
+  {}
+
+  std::string algorithm;
+  std::size_t max_iter;
+  std::string stopping_criteria;   // "max_iter" | "target_objective"
+  double stopping_value;
+
+  std::size_t pop_size;
+  std::uint64_t seed;
+
+  double recombination;            // crossover rate (CR)
+  std::string strategy;            // present in JSON; ensmallen DE uses classic DE (no strategy variants)
+  double mutation_min;             // used to pick differentialWeight
+  double mutation_max;
+};
+
+class ExpectedParams
+{
+public:
+  ExpectedParams()
+  : output_file("out.json"), overlap_buffer(0.0), aspect_ratio(1.0),
+    num_threads(1), canvas(0.0, 0.0)
+  {}
+
+  std::string output_file;
+  double overlap_buffer;
+  double aspect_ratio;
+  std::size_t num_threads;
+  Canvas canvas;
+};
+
+class LayoutConfig
+{
+public:
+  LayoutConfig() {}
+
+  std::vector<std::string> rect_keys;   // stable order
+  std::vector<Rectangle> rectangles;    // x,y,w,h
+
+  ObjectiveConfig objective;
+  ConstraintConfig overlap_c;
+  ConstraintConfig boundary_c;
+  ConstraintConfig aspect_c;
+
+  ExpectedParams expected;
+  OptimizerConfig optimizer;
+};
+
+// ------------------------------
+// Parsing helpers
+// ------------------------------
+class JsonIO
+{
+public:
+  static json LoadJsonFile(const std::string& path)
+  {
+    std::ifstream ifs(path.c_str(), std::ios::in);
+    if (!ifs) throw std::runtime_error("Cannot open JSON file: " + path);
+    json j;
+    ifs >> j;
+    return j;
+  }
+
+  static void SaveJsonFile(const std::string& path, const json& j)
+  {
+    std::ofstream ofs(path.c_str(), std::ios::out | std::ios::trunc);
+    if (!ofs) throw std::runtime_error("Cannot write JSON file: " + path);
+    ofs << j.dump(2);
+  }
+
+  static bool ParseBoolString(const std::string& s)
+  {
+    if (s == "true") return true;
+    if (s == "false") return false;
+    throw std::runtime_error("Invalid switch value (expected \"true\" or \"false\"): " + s);
+  }
+
+  static ConstraintConfig ParseConstraint(const json& cnode)
+  {
+    ConstraintConfig cc;
+    cc.enabled = ParseBoolString(cnode.at("switch").get<std::string>());
+    cc.weight = cnode.at("weight").get<double>();
+    cc.normalization = cnode.at("normalization").get<std::string>();
+    cc.aggregation = cnode.at("aggregation").get<std::string>();
+    return cc;
+  }
+
+  static LayoutConfig ParseConfig(const json& j)
+  {
+    LayoutConfig cfg;
+
+    // rectangles
+    const json& rnode = j.at("rectangles");
+    std::vector<std::pair<int, std::string>> keyed;
+    keyed.reserve(rnode.size());
+    for (auto it = rnode.begin(); it != rnode.end(); ++it)
+    {
+      keyed.push_back(std::make_pair(std::stoi(it.key()), it.key()));
+    }
+    std::sort(keyed.begin(), keyed.end(),
+              [](const std::pair<int, std::string>& a, const std::pair<int, std::string>& b)
+              { return a.first < b.first; });
+
+    cfg.rect_keys.reserve(keyed.size());
+    cfg.rectangles.reserve(keyed.size());
+    for (std::size_t i = 0; i < keyed.size(); ++i)
+    {
+      const std::string& key = keyed[i].second;
+      const json& rr = rnode.at(key);
+      const double x = rr.at("x").get<double>();
+      const double y = rr.at("y").get<double>();
+      const double w = rr.at("w").get<double>();
+      const double h = rr.at("h").get<double>();
+      cfg.rect_keys.push_back(key);
+      cfg.rectangles.push_back(Rectangle(x, y, w, h));
+    }
+
+    // objective weights
+    cfg.objective.w_hpwl = j.at("objective").at("hpwl").get<double>();
+    cfg.objective.w_area = j.at("objective").at("area").get<double>();
+
+    // constraints
+    const json& c = j.at("constraints");
+    cfg.overlap_c  = ParseConstraint(c.at("overlap"));
+    cfg.aspect_c   = ParseConstraint(c.at("aspect_violation"));
+    cfg.boundary_c = ParseConstraint(c.at("boundary_violation"));
+
+    // expected params
+    const json& ep = j.at("expected_params");
+    cfg.expected.output_file = ep.at("output_file").get<std::string>();
+    cfg.expected.overlap_buffer = ep.at("overlap_buffer").get<double>();
+    cfg.expected.aspect_ratio = ep.at("aspect_ratio").get<double>();
+    cfg.expected.num_threads = ep.at("num_threads").get<std::size_t>();
+    const json& canv = ep.at("canvas");
+    cfg.expected.canvas = Canvas(canv.at("width").get<double>(), canv.at("height").get<double>());
+
+    // optimizer
+    const json& o = j.at("optimizer");
+    cfg.optimizer.algorithm = o.at("algorithm").get<std::string>();
+    cfg.optimizer.max_iter = o.at("max_iter").get<std::size_t>();
+    cfg.optimizer.stopping_criteria = o.at("stopping_criteria").get<std::string>();
+    cfg.optimizer.stopping_value = o.at("stopping_criteria_value").get<double>();
+    cfg.optimizer.pop_size = o.at("pop_size").get<std::size_t>();
+    cfg.optimizer.seed = o.at("seed").get<std::uint64_t>();
+    cfg.optimizer.recombination = o.at("recombination").get<double>();
+    cfg.optimizer.strategy = o.at("strategy").get<std::string>();
+    cfg.optimizer.mutation_min = o.at("mutation_constant_min").get<double>();
+    cfg.optimizer.mutation_max = o.at("mutation_constant_max").get<double>();
+
+    return cfg;
+  }
+};
+
+// ------------------------------
+// Aggregation + normalization (fast, simple, scalable)
+// ------------------------------
+class PenaltyTools
+{
+public:
+  static double SafeLog(const double v)
+  {
+    return std::log(std::max(v, 1e-300));
+  }
+
+  static double Aggregate(const std::string& how,
+                          const std::vector<double>& values)
+  {
+    if (values.empty()) return 0.0;
+
+    if (how == "sum" || how == "weighted_sum")
+    {
+      double s = 0.0;
+      for (std::size_t i = 0; i < values.size(); ++i) s += values[i];
+      return s;
+    }
+    if (how == "max")
+    {
+      double m = values[0];
+      for (std::size_t i = 1; i < values.size(); ++i) m = std::max(m, values[i]);
+      return m;
+    }
+    if (how == "mean" || how == "weighted_mean")
+    {
+      double s = 0.0;
+      for (std::size_t i = 0; i < values.size(); ++i) s += values[i];
+      return s / static_cast<double>(values.size());
+    }
+    if (how == "product" || how == "weighted_product")
+    {
+      double p = 1.0;
+      for (std::size_t i = 0; i < values.size(); ++i) p *= values[i];
+      return p;
+    }
+    if (how == "geometric_mean" || how == "weighted_geometric_mean")
+    {
+      double s = 0.0;
+      for (std::size_t i = 0; i < values.size(); ++i) s += SafeLog(values[i]);
+      return std::exp(s / static_cast<double>(values.size()));
+    }
+
+    // fallback
+    double s = 0.0;
+    for (std::size_t i = 0; i < values.size(); ++i) s += values[i];
+    return s;
+  }
+
+  static double NormalizeScalar(const std::string& norm,
+                                const double value,
+                                const double total_rect_area,
+                                const double canvas_area,
+                                const double bbox_area,
+                                const double scale_len)
+  {
+    if (norm == "no norm") return value;
+    if (norm == "total_rect_area") return value / std::max(1e-12, total_rect_area);
+    if (norm == "canvas_area") return value / std::max(1e-12, canvas_area);
+    if (norm == "bbox_area") return value / std::max(1e-12, bbox_area);
+    // for distance-like terms, allow these too:
+    if (norm == "max_canvas_rect_area") return value / std::max(1e-12, std::max(canvas_area, total_rect_area));
+    if (norm == "min_canvas_rect_area") return value / std::max(1e-12, std::min(canvas_area, total_rect_area));
+
+    // fallback: scale by a length for scalar violations
+    return value / std::max(1e-12, scale_len);
+  }
+
+  static double NormalizePairOverlap(const std::string& norm,
+                                     const double overlap_ij,
+                                     const double ai,
+                                     const double aj,
+                                     const double total_rect_area,
+                                     const double canvas_area,
+                                     const double bbox_area)
+  {
+    if (norm == "no norm") return overlap_ij;
+    if (norm == "min_pair_area") return overlap_ij / std::max(1e-12, std::min(ai, aj));
+    if (norm == "max_pair_area") return overlap_ij / std::max(1e-12, std::max(ai, aj));
+    if (norm == "sum_pair_area") return overlap_ij / std::max(1e-12, (ai + aj));
+    if (norm == "total_rect_area") return overlap_ij / std::max(1e-12, total_rect_area);
+    if (norm == "canvas_area") return overlap_ij / std::max(1e-12, canvas_area);
+    if (norm == "bbox_area") return overlap_ij / std::max(1e-12, bbox_area);
+    return overlap_ij;
+  }
+};
+
+// ------------------------------
+// Extremely fast overlap via uniform grid + pair-stamping (scales to 1000 rects)
+// ------------------------------
+class OverlapGrid
+{
+public:
+  OverlapGrid() : n_(0), cs_(10.0), nx_(1), ny_(1),
+                  minx_(0.0), miny_(0.0), eval_stamp_(1) {}
+
+  void Init(const std::size_t n, const Canvas& canvas, const double cell_size_hint)
+  {
+    n_ = n;
+
+    // Search space padded; rectangles leaving canvas are penalized anyway.
+    minx_ = -2.0 * canvas.W();
+    miny_ = -2.0 * canvas.H();
+    const double maxx =  3.0 * canvas.W();
+    const double maxy =  3.0 * canvas.H();
+
+    cs_ = std::max(1.0, cell_size_hint);
+    nx_ = static_cast<std::size_t>(std::ceil((maxx - minx_) / cs_));
+    ny_ = static_cast<std::size_t>(std::ceil((maxy - miny_) / cs_));
+    const std::size_t cells = std::max<std::size_t>(1, nx_ * ny_);
+
+    head_.assign(cells, -1);
+    cell_stamp_.assign(cells, 0);
+
+    // generous node capacity; grows if needed
+    nodes_rect_.resize(std::max<std::size_t>(n * 16, 1024));
+    nodes_next_.resize(nodes_rect_.size());
+
+    // pair stamping for dedup across multiple cells
+    const std::size_t pair_count = (n_ * (n_ - 1)) / 2;
+    pair_stamp_.assign(pair_count, 0);
+
+    eval_stamp_ = 1;
+  }
+
+  double ComputeTotalOverlapAreaBuffered(const double* xy,
+                                        const std::vector<double>& w,
+                                        const std::vector<double>& h,
+                                        const std::vector<double>& area,
+                                        const double buffer,
+                                        const std::string& norm,
+                                        const std::string& agg,
+                                        const double total_rect_area,
+                                        const double canvas_area,
+                                        const double bbox_area)
+  {
+    if (n_ <= 1) return 0.0;
+
+    // stamping: avoid clearing big arrays
+    ++eval_stamp_;
+    if (eval_stamp_ == 0) // wrapped
+    {
+      eval_stamp_ = 1;
+      std::fill(pair_stamp_.begin(), pair_stamp_.end(), 0);
+      std::fill(cell_stamp_.begin(), cell_stamp_.end(), 0);
+    }
+
+    used_cells_.clear();
+    node_count_ = 0;
+
+    // Insert rectangles into grid cells
+    for (std::size_t i = 0; i < n_; ++i)
+    {
+      const double x = xy[2 * i + 0];
+      const double y = xy[2 * i + 1];
+
+      const double x0 = x - buffer;
+      const double y0 = y - buffer;
+      const double x1 = x + w[i] + buffer;
+      const double y1 = y + h[i] + buffer;
+
+      const int ix0 = ClampCell(static_cast<int>(std::floor((x0 - minx_) / cs_)), static_cast<int>(nx_) - 1);
+      const int iy0 = ClampCell(static_cast<int>(std::floor((y0 - miny_) / cs_)), static_cast<int>(ny_) - 1);
+      const int ix1 = ClampCell(static_cast<int>(std::floor((x1 - minx_) / cs_)), static_cast<int>(nx_) - 1);
+      const int iy1 = ClampCell(static_cast<int>(std::floor((y1 - miny_) / cs_)), static_cast<int>(ny_) - 1);
+
+      for (int iy = iy0; iy <= iy1; ++iy)
+      {
+        for (int ix = ix0; ix <= ix1; ++ix)
+        {
+          const std::size_t c = static_cast<std::size_t>(iy) * nx_ + static_cast<std::size_t>(ix);
+          if (cell_stamp_[c] != eval_stamp_)
+          {
+            cell_stamp_[c] = eval_stamp_;
+            head_[c] = -1;
+            used_cells_.push_back(static_cast<int>(c));
+          }
+          PushNode(static_cast<int>(c), static_cast<int>(i));
+        }
+      }
+    }
+
+    // For aggregation, we collect normalized pair overlaps, then aggregate.
+    pair_values_.clear();
+    pair_values_.reserve(256);
+
+    // Evaluate overlaps cell-by-cell; dedup with pair_stamp_
+    double total_raw_overlap = 0.0;
+
+    for (std::size_t uc = 0; uc < used_cells_.size(); ++uc)
+    {
+      const int c = used_cells_[uc];
+      // gather indices from linked list
+      idx_buf_.clear();
+      for (int p = head_[static_cast<std::size_t>(c)]; p != -1; p = nodes_next_[static_cast<std::size_t>(p)])
+      {
+        idx_buf_.push_back(nodes_rect_[static_cast<std::size_t>(p)]);
+      }
+      const std::size_t m = idx_buf_.size();
+      if (m < 2) continue;
+
+      for (std::size_t a = 0; a < m; ++a)
+      {
+        const std::size_t i = static_cast<std::size_t>(idx_buf_[a]);
+        const double xi = xy[2 * i + 0];
+        const double yi = xy[2 * i + 1];
+        const double x0i = xi - buffer;
+        const double y0i = yi - buffer;
+        const double x1i = xi + w[i] + buffer;
+        const double y1i = yi + h[i] + buffer;
+
+        for (std::size_t b = a + 1; b < m; ++b)
+        {
+          const std::size_t j = static_cast<std::size_t>(idx_buf_[b]);
+          const std::size_t pi = PairIndex(i, j);
+          if (pair_stamp_[pi] == eval_stamp_) continue;
+          pair_stamp_[pi] = eval_stamp_;
+
+          const double xj = xy[2 * j + 0];
+          const double yj = xy[2 * j + 1];
+          const double x0j = xj - buffer;
+          const double y0j = yj - buffer;
+          const double x1j = xj + w[j] + buffer;
+          const double y1j = yj + h[j] + buffer;
+
+          const double ox0 = std::max(x0i, x0j);
+          const double oy0 = std::max(y0i, y0j);
+          const double ox1 = std::min(x1i, x1j);
+          const double oy1 = std::min(y1i, y1j);
+
+          const double ow = ox1 - ox0;
+          const double oh = oy1 - oy0;
+          if (ow > 0.0 && oh > 0.0)
+          {
+            const double oarea = ow * oh;
+            total_raw_overlap += oarea;
+
+            const double normed = PenaltyTools::NormalizePairOverlap(
+              norm, oarea, area[i], area[j], total_rect_area, canvas_area, bbox_area);
+
+            pair_values_.push_back(normed);
+          }
+        }
+      }
+    }
+
+    // If aggregation is "sum", we could skip vector collection; but we still need normalization-per-pair.
+    const double agg_val = PenaltyTools::Aggregate(agg, pair_values_);
+    // For reporting, overlap metric = raw overlap area (un-normalized sum of intersections)
+    last_raw_overlap_ = total_raw_overlap;
+    return agg_val;
+  }
+
+  double LastRawOverlapArea() const { return last_raw_overlap_; }
+
+private:
+  int ClampCell(const int v, const int vmax) const
+  {
+    if (v < 0) return 0;
+    if (v > vmax) return vmax;
+    return v;
+  }
+
+  void PushNode(const int cell, const int rect_idx)
+  {
+    if (node_count_ >= nodes_rect_.size())
+    {
+      const std::size_t new_cap = nodes_rect_.size() * 2;
+      nodes_rect_.resize(new_cap);
+      nodes_next_.resize(new_cap);
+    }
+    nodes_rect_[node_count_] = rect_idx;
+    nodes_next_[node_count_] = head_[static_cast<std::size_t>(cell)];
+    head_[static_cast<std::size_t>(cell)] = static_cast<int>(node_count_);
+    ++node_count_;
+  }
+
+  std::size_t PairIndex(std::size_t i, std::size_t j) const
+  {
+    if (i > j) std::swap(i, j);
+    // index in packed upper triangle (excluding diagonal)
+    // idx = i*n - i*(i+1)/2 + (j-i-1)
+    return i * n_ - (i * (i + 1)) / 2 + (j - i - 1);
+  }
+
+private:
+  std::size_t n_;
+  double cs_;
+  std::size_t nx_, ny_;
+  double minx_, miny_;
+
+  std::vector<int> head_;
+  std::vector<std::uint32_t> cell_stamp_;
+
+  std::vector<int> nodes_rect_;
+  std::vector<int> nodes_next_;
+  std::size_t node_count_;
+
+  std::vector<std::uint32_t> pair_stamp_;
+  std::uint32_t eval_stamp_;
+
+  std::vector<int> used_cells_;
+  std::vector<int> idx_buf_;
+  std::vector<double> pair_values_;
+
+  double last_raw_overlap_;
+};
+
+// ------------------------------
+// Core evaluator: all metrics + augmented objective (fast, scalable to 1000 rects)
+// ------------------------------
+class LayoutEvaluator
+{
+public:
+  LayoutEvaluator() : n_(0), overlap_buffer_(0.0), expected_ar_(1.0), num_threads_(1),
+                      total_rect_area_(0.0), canvas_area_(0.0), scale_len_(1.0) {}
+
+  void Init(const LayoutConfig& cfg)
+  {
+    cfg_ = cfg;
+    n_ = cfg_.rectangles.size();
+
+    w_.resize(n_);
+    h_.resize(n_);
+    area_.resize(n_);
+    x0_.resize(n_);
+    y0_.resize(n_);
+
+    total_rect_area_ = 0.0;
+    for (std::size_t i = 0; i < n_; ++i)
+    {
+      w_[i] = cfg_.rectangles[i].W();
+      h_[i] = cfg_.rectangles[i].H();
+      area_[i] = w_[i] * h_[i];
+      total_rect_area_ += area_[i];
+      x0_[i] = cfg_.rectangles[i].X();
+      y0_[i] = cfg_.rectangles[i].Y();
+    }
+
+    overlap_buffer_ = cfg_.expected.overlap_buffer;
+    expected_ar_ = cfg_.expected.aspect_ratio;
+    num_threads_ = std::max<std::size_t>(1, cfg_.expected.num_threads);
+
+    canvas_area_ = cfg_.expected.canvas.Area();
+    scale_len_ = std::max(cfg_.expected.canvas.W(), cfg_.expected.canvas.H());
+
+    // Grid cell size heuristic: canvas / sqrt(n)
+    const double cs_hint = std::max(1.0, std::min(cfg_.expected.canvas.W(), cfg_.expected.canvas.H())
+                                         / std::sqrt(std::max<std::size_t>(1, n_)));
+    grid_.Init(n_, cfg_.expected.canvas, cs_hint);
+  }
+
+  std::size_t NumRects() const { return n_; }
+
+  arma::mat InitialPoint() const
+  {
+    arma::mat x(2 * n_, 1);
+    for (std::size_t i = 0; i < n_; ++i)
+    {
+      x(2 * i + 0, 0) = x0_[i];
+      x(2 * i + 1, 0) = y0_[i];
+    }
+    return x;
+  }
+
+  Metrics ComputeAll(const double* xy, const std::size_t iter_idx) const
+  {
+    // Build bbox + HPWL over centers in one pass
+    BoundingBox bbox;
+    bbox.Reset();
+
+    double min_cx = +std::numeric_limits<double>::infinity();
+    double min_cy = +std::numeric_limits<double>::infinity();
+    double max_cx = -std::numeric_limits<double>::infinity();
+    double max_cy = -std::numeric_limits<double>::infinity();
+
+    // boundary violations per rect (for aggregation)
+    boundary_vals_.clear();
+    boundary_vals_.reserve(n_);
+
+    // Use a local rectangle object (no allocations)
+    Rectangle rr;
+
+    for (std::size_t i = 0; i < n_; ++i)
+    {
+      rr = Rectangle(xy[2 * i + 0], xy[2 * i + 1], w_[i], h_[i]);
+      bbox.ExpandByRect(rr);
+
+      const double cx = rr.Cx();
+      const double cy = rr.Cy();
+      min_cx = std::min(min_cx, cx);
+      min_cy = std::min(min_cy, cy);
+      max_cx = std::max(max_cx, cx);
+      max_cy = std::max(max_cy, cy);
+
+      if (cfg_.boundary_c.enabled)
+      {
+        const double left_vi  = std::max(0.0, -rr.Left());
+        const double bot_vi   = std::max(0.0, -rr.Bottom());
+        const double right_vi = std::max(0.0, rr.Right()  - cfg_.expected.canvas.W());
+        const double top_vi   = std::max(0.0, rr.Top()    - cfg_.expected.canvas.H());
+        const double v = left_vi + bot_vi + right_vi + top_vi; // distance outside
+        const double vn = PenaltyTools::NormalizeScalar(cfg_.boundary_c.normalization, v,
+                                                        total_rect_area_, canvas_area_, bbox.Area(), scale_len_);
+        boundary_vals_.push_back(vn);
+      }
+    }
+
+    const double bbox_w = bbox.Width();
+    const double bbox_h = bbox.Height();
+    const double bbox_area = bbox.Area();
+    const double bbox_ar = bbox.AspectRatio();
+    const double hpwl = (max_cx - min_cx) + (max_cy - min_cy);
+
+    // aspect ratio violation (single scalar; still allow normalization/aggregation)
+    double aspect_vi = 0.0;
+    if (cfg_.aspect_c.enabled)
+    {
+      // relative deviation from expected aspect ratio
+      const double ar = bbox_ar;
+      const double e = expected_ar_;
+      const double rel = std::fabs(ar - e) / std::max(1e-12, e);
+      aspect_vi = PenaltyTools::NormalizeScalar(cfg_.aspect_c.normalization, rel,
+                                                total_rect_area_, canvas_area_, bbox_area, scale_len_);
+    }
+
+    // overlap (buffered) - returns aggregated normalized penalty, but we also report raw overlap area
+    double overlap_pen = 0.0;
+    double raw_overlap_area = 0.0;
+    if (cfg_.overlap_c.enabled)
+    {
+      overlap_pen = grid_.ComputeTotalOverlapAreaBuffered(
+        xy, w_, h_, area_, overlap_buffer_,
+        cfg_.overlap_c.normalization, cfg_.overlap_c.aggregation,
+        total_rect_area_, canvas_area_, bbox_area);
+
+      raw_overlap_area = grid_.LastRawOverlapArea();
+    }
+
+    // boundary aggregation
+    double boundary_agg = 0.0;
+    if (cfg_.boundary_c.enabled)
+    {
+      boundary_agg = PenaltyTools::Aggregate(cfg_.boundary_c.aggregation, boundary_vals_);
+    }
+
+    // objective
+    const double obj = cfg_.objective.w_area * bbox_area + cfg_.objective.w_hpwl * hpwl;
+
+    double penalty = 0.0;
+    if (cfg_.overlap_c.enabled)  penalty += cfg_.overlap_c.weight  * overlap_pen;
+    if (cfg_.boundary_c.enabled) penalty += cfg_.boundary_c.weight * boundary_agg;
+    if (cfg_.aspect_c.enabled)   penalty += cfg_.aspect_c.weight   * aspect_vi; // scalar
+
+    Metrics m;
+    m.iteration_index = iter_idx;
+
+    m.bbox_area = bbox_area;
+    m.bbox_aspect = bbox_ar;
+    m.hpwl = hpwl;
+
+    m.overlap = raw_overlap_area;             // report raw overlap area
+    m.boundary_violation = boundary_agg;      // report aggregated normalized violation (consistent with penalty)
+    m.aspect_ratio_violation = aspect_vi;     // normalized scalar
+
+    m.bbox_cx = bbox.Cx();
+    m.bbox_cy = bbox.Cy();
+    m.bbox_w = bbox_w;
+    m.bbox_h = bbox_h;
+
+    m.augmented_objective = obj + penalty;
+    return m;
+  }
+
+  double EvaluateObjective(const arma::mat& x) const
+  {
+    const double* xy = x.memptr();
+    const Metrics m = ComputeAll(xy, 0);
+    last_metrics_ = m;
+    return m.augmented_objective;
+  }
+
+  const Metrics& LastMetrics() const { return last_metrics_; }
+
+  const std::vector<double>& WVec() const { return w_; }
+  const std::vector<double>& HVec() const { return h_; }
+
+private:
+  LayoutConfig cfg_;
+  std::size_t n_;
+
+  double overlap_buffer_;
+  double expected_ar_;
+  std::size_t num_threads_;
+
+  std::vector<double> w_, h_, area_;
+  std::vector<double> x0_, y0_;
+
+  double total_rect_area_;
+  double canvas_area_;
+  double scale_len_;
+
+  mutable std::vector<double> boundary_vals_;
+  mutable Metrics last_metrics_;
+
+  mutable OverlapGrid grid_;
+};
+
+// ensmallen objective wrapper: arbitrary function needs Evaluate(x)
+class LayoutObjective
+{
+public:
+  LayoutObjective() : eval_(nullptr) {}
+  explicit LayoutObjective(const LayoutEvaluator* e) : eval_(e) {}
+  double Evaluate(const arma::mat& x) const
+  {
+    return eval_->EvaluateObjective(x);
+  }
+private:
+  const LayoutEvaluator* eval_;
+};
+
+// ------------------------------
+// History buffer (stores coords + metrics each "iteration" and best-so-far)
+// ------------------------------
+class HistoryStore
+{
+public:
+  HistoryStore() : n_(0), best_index_(0), best_obj_(std::numeric_limits<double>::infinity()) {}
+
+  void Init(const std::size_t n)
+  {
+    n_ = n;
+    iter_metrics_.clear();
+    coords_.clear();
+    best_coords_.assign(2 * n_, 0.0);
+    best_metrics_ = Metrics();
+    best_obj_ = std::numeric_limits<double>::infinity();
+    best_index_ = 0;
+  }
+
+  void Push(const arma::mat& x, const Metrics& m)
+  {
+    iter_metrics_.push_back(m);
+    const double* p = x.memptr();
+    coords_.insert(coords_.end(), p, p + (2 * n_));
+
+    if (m.augmented_objective < best_obj_)
+    {
+      best_obj_ = m.augmented_objective;
+      best_metrics_ = m;
+      best_index_ = iter_metrics_.size() - 1;
+      std::copy(p, p + (2 * n_), best_coords_.begin());
+    }
+  }
+
+  std::size_t IterCount() const { return iter_metrics_.size(); }
+  std::size_t NumRects() const { return n_; }
+
+  const Metrics& IterMetrics(const std::size_t i) const { return iter_metrics_.at(i); }
+  const Metrics& BestMetrics() const { return best_metrics_; }
+  std::size_t BestIndex() const { return best_index_; }
+
+  py::array_t<double> IterXY(const std::size_t i) const
+  {
+    if (i >= iter_metrics_.size()) throw std::out_of_range("iter index out of range");
+    const std::size_t offset = i * (2 * n_);
+    return MakeXYArray(coords_.data() + offset);
+  }
+
+  py::array_t<double> BestXY() const
+  {
+    return MakeXYArray(best_coords_.data());
+  }
+
+private:
+  py::array_t<double> MakeXYArray(const double* base) const
+  {
+    py::array_t<double> arr({ static_cast<py::ssize_t>(n_), static_cast<py::ssize_t>(2) });
+    auto buf = arr.mutable_unchecked<2>();
+    for (std::size_t i = 0; i < n_; ++i)
+    {
+      buf(static_cast<py::ssize_t>(i), 0) = base[2 * i + 0];
+      buf(static_cast<py::ssize_t>(i), 1) = base[2 * i + 1];
+    }
+    return arr;
+  }
+
+private:
+  std::size_t n_;
+  std::vector<Metrics> iter_metrics_;
+  std::vector<double> coords_;
+
+  std::size_t best_index_;
+  double best_obj_;
+  std::vector<double> best_coords_;
+  Metrics best_metrics_;
+};
+
+// ensmallen callback: StepTaken is called after coordinate update. :contentReference[oaicite:1]{index=1}
+class IterationCallback
+{
+public:
+  IterationCallback() : eval_(nullptr), store_(nullptr), stopping_mode_("max_iter"), stop_value_(0.0), iter_(0) {}
+
+  void Init(const LayoutEvaluator* eval,
+            HistoryStore* store,
+            const std::string& stopping_mode,
+            const double stop_value)
+  {
+    eval_ = eval;
+    store_ = store;
+    stopping_mode_ = stopping_mode;
+    stop_value_ = stop_value;
+    iter_ = 0;
+  }
+
+  template<typename OptimizerType, typename FunctionType, typename MatType>
+  bool StepTaken(OptimizerType& /*optimizer*/, FunctionType& /*function*/, MatType& coordinates)
+  {
+    // Compute full metrics (one extra evaluation per iteration callback).
+    const double* xy = coordinates.memptr();
+    Metrics m = eval_->ComputeAll(xy, iter_);
+    store_->Push(coordinates, m);
+    ++iter_;
+
+    if (stopping_mode_ == "target_objective")
+    {
+      return (m.augmented_objective <= stop_value_);
+    }
+    return false;
+  }
+
+private:
+  const LayoutEvaluator* eval_;
+  HistoryStore* store_;
+  std::string stopping_mode_;
+  double stop_value_;
+  std::size_t iter_;
+};
+
+// ------------------------------
+// Engine: parse json, optimize, write output json, expose history to Python
+// ------------------------------
+class RectPlacementEngine
+{
+public:
+  RectPlacementEngine() : optimized_(false), runtime_s_(0.0) {}
+
+  explicit RectPlacementEngine(const std::string& json_path)
+  {
+    Load(json_path);
+  }
+
+  void Load(const std::string& json_path)
+  {
+    input_path_ = json_path;
+    input_json_ = JsonIO::LoadJsonFile(json_path);
+    cfg_ = JsonIO::ParseConfig(input_json_);
+
+    evaluator_.Init(cfg_);
+    store_.Init(cfg_.rectangles.size());
+
+    optimized_ = false;
+    runtime_s_ = 0.0;
+  }
+
+  void Optimize()
+  {
+    store_.Init(cfg_.rectangles.size());
+
+    // Seed RNG for ensmallen/armadillo
+    arma::arma_rng::set_seed(static_cast<arma::uword>(cfg_.optimizer.seed));
+
+    LayoutObjective obj(&evaluator_);
+    arma::mat x = evaluator_.InitialPoint();
+
+    IterationCallback cb;
+    cb.Init(&evaluator_, &store_, cfg_.optimizer.stopping_criteria, cfg_.optimizer.stopping_value);
+
+    Stopwatch sw;
+
+    if (cfg_.optimizer.algorithm == "differential_evolution_DE")
+    {
+      // ensmallen DE constructors: DE(populationSize, maxGenerations, crossoverRate, differentialWeight, tolerance). :contentReference[oaicite:2]{index=2}
+      const double F = 0.5 * (cfg_.optimizer.mutation_min + cfg_.optimizer.mutation_max);
+      const double tol = (cfg_.optimizer.stopping_criteria == "target_objective")
+                           ? cfg_.optimizer.stopping_value
+                           : -1.0; // disable tolerance
+
+      ens::DE optimizer(cfg_.optimizer.pop_size,
+                        cfg_.optimizer.max_iter,
+                        cfg_.optimizer.recombination,
+                        F,
+                        tol);
+
+      optimizer.Optimize(obj, x, cb);
+    }
+    else if (cfg_.optimizer.algorithm == "pso")
+    {
+      // Example fallback: PSO is also available for arbitrary functions in ensmallen. :contentReference[oaicite:3]{index=3}
+      ens::PSO optimizer;
+      optimizer.Optimize(obj, x, cb);
+    }
+    else if (cfg_.optimizer.algorithm == "simulated_annealing_SA")
+    {
+      ens::SA optimizer;
+      optimizer.Optimize(obj, x, cb);
+    }
+    else
+    {
+      throw std::runtime_error("Unsupported optimizer.algorithm: " + cfg_.optimizer.algorithm);
+    }
+
+    runtime_s_ = sw.Seconds();
+
+    // Use best solution (not necessarily last).
+    BuildOutputJsonFromBest();
+    optimized_ = true;
+  }
+
+  bool IsOptimized() const { return optimized_; }
+  double RuntimeSeconds() const { return runtime_s_; }
+
+  std::size_t NumRectangles() const { return evaluator_.NumRects(); }
+  std::size_t IterationCount() const { return store_.IterCount(); }
+  std::size_t BestIterationIndex() const { return store_.BestIndex(); }
+
+  py::array_t<double> RectWH() const
+  {
+    const std::size_t n = evaluator_.NumRects();
+    py::array_t<double> arr({ static_cast<py::ssize_t>(n), static_cast<py::ssize_t>(2) });
+    auto buf = arr.mutable_unchecked<2>();
+    const std::vector<double>& w = evaluator_.WVec();
+    const std::vector<double>& h = evaluator_.HVec();
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      buf(static_cast<py::ssize_t>(i), 0) = w[i];
+      buf(static_cast<py::ssize_t>(i), 1) = h[i];
+    }
+    return arr;
+  }
+
+  py::array_t<double> IterXY(const std::size_t i) const { return store_.IterXY(i); }
+  py::array_t<double> BestXY() const { return store_.BestXY(); }
+
+  py::dict IterMetricsDict(const std::size_t i) const { return MetricsToDict(store_.IterMetrics(i)); }
+  py::dict BestMetricsDict() const { return MetricsToDict(store_.BestMetrics()); }
+
+  std::string OutputJsonString() const
+  {
+    return output_json_.dump(2);
+  }
+
+  void SaveOutputJson(const std::string& path) const
+  {
+    JsonIO::SaveJsonFile(path, output_json_);
+  }
+
+  std::string DefaultOutputPath() const { return cfg_.expected.output_file; }
+
+private:
+  py::dict MetricsToDict(const Metrics& m) const
+  {
+    py::dict d;
+    d["iteration_index"] = py::int_(m.iteration_index);
+
+    d["bbox_area"] = m.bbox_area;
+    d["bbox_aspect_ratio"] = m.bbox_aspect;
+    d["bbox_cx"] = m.bbox_cx;
+    d["bbox_cy"] = m.bbox_cy;
+    d["bbox_w"] = m.bbox_w;
+    d["bbox_h"] = m.bbox_h;
+
+    d["hpwl"] = m.hpwl;
+
+    d["overlap"] = m.overlap;
+    d["boundary_violation"] = m.boundary_violation;
+    d["aspect_ratio_violation"] = m.aspect_ratio_violation;
+
+    d["augmented_objective"] = m.augmented_objective;
+    return d;
+  }
+
+  void BuildOutputJsonFromBest()
+  {
+    output_json_ = input_json_; // "same as input"
+
+    const std::size_t n = evaluator_.NumRects();
+    py::array_t<double> best_xy = store_.BestXY();
+    auto b = best_xy.unchecked<2>();
+
+    // Update rectangle coordinates in-place in JSON
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      const std::string& key = cfg_.rect_keys[i];
+      output_json_["rectangles"][key]["x"] = b(static_cast<py::ssize_t>(i), 0);
+      output_json_["rectangles"][key]["y"] = b(static_cast<py::ssize_t>(i), 1);
+      // keep w/h unchanged
+    }
+
+    // Add metrics head key
+    const Metrics bm = store_.BestMetrics();
+    json mj;
+    mj["bounding_box_area"] = bm.bbox_area;
+    mj["bounding_box_aspect_ratio"] = bm.bbox_aspect;
+    mj["hpwl"] = bm.hpwl;
+    mj["overlap"] = bm.overlap;
+    mj["boundary_violation"] = bm.boundary_violation;
+    mj["aspect_ratio_violation"] = bm.aspect_ratio_violation;
+    mj["augmented_objective"] = bm.augmented_objective;
+    mj["number_of_iterations"] = store_.IterCount();
+    mj["runtime_seconds"] = runtime_s_;
+    mj["best_iteration_index"] = store_.BestIndex();
+
+    output_json_["metrics"] = mj;
+  }
+
+private:
+  std::string input_path_;
+  json input_json_;
+  json output_json_;
+
+  LayoutConfig cfg_;
+  LayoutEvaluator evaluator_;
+  HistoryStore store_;
+
+  bool optimized_;
+  double runtime_s_;
+};
+
+// ------------------------------
+// pybind11 module
+// ------------------------------
+PYBIND11_MODULE(rect_place, m)
+{
+  m.doc() = "Fast rectangle placement optimizer (C++14, ensmallen, pybind11)";
+
+  py::class_<RectPlacementEngine>(m, "RectPlacementEngine")
+    .def(py::init<const std::string&>(), py::arg("json_path"))
+    .def("load", &RectPlacementEngine::Load, py::arg("json_path"))
+    .def("optimize", &RectPlacementEngine::Optimize)
+    .def("is_optimized", &RectPlacementEngine::IsOptimized)
+    .def("runtime_seconds", &RectPlacementEngine::RuntimeSeconds)
+    .def("num_rectangles", &RectPlacementEngine::NumRectangles)
+    .def("iteration_count", &RectPlacementEngine::IterationCount)
+    .def("best_iteration_index", &RectPlacementEngine::BestIterationIndex)
+    .def("rect_wh", &RectPlacementEngine::RectWH)
+    .def("iter_xy", &RectPlacementEngine::IterXY, py::arg("iter_index"))
+    .def("best_xy", &RectPlacementEngine::BestXY)
+    .def("iter_metrics", &RectPlacementEngine::IterMetricsDict, py::arg("iter_index"))
+    .def("best_metrics", &RectPlacementEngine::BestMetricsDict)
+    .def("output_json_string", &RectPlacementEngine::OutputJsonString)
+    .def("default_output_path", &RectPlacementEngine::DefaultOutputPath)
+    .def("save_output_json", &RectPlacementEngine::SaveOutputJson, py::arg("path"));
+}
+
+
+
+
+
+
+
+// CMakeLists.txt
+
+cmake_minimum_required(VERSION 3.18)
+project(rect_place LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+include(FetchContent)
+
+# pybind11
+FetchContent_Declare(
+  pybind11
+  GIT_REPOSITORY https://github.com/pybind/pybind11.git
+  GIT_TAG v2.12.0
+)
+FetchContent_MakeAvailable(pybind11)
+
+# nlohmann/json
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG v3.11.3
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
+# ensmallen (header-only)
+FetchContent_Declare(
+  ensmallen
+  GIT_REPOSITORY https://github.com/mlpack/ensmallen.git
+  GIT_TAG 3.11.0
+)
+FetchContent_MakeAvailable(ensmallen)
+
+# Armadillo is required by ensmallen.
+find_package(Armadillo REQUIRED)
+
+pybind11_add_module(rect_place src/rect_place_module.cpp)
+
+target_include_directories(rect_place PRIVATE
+  ${ensmallen_SOURCE_DIR}/include
+)
+
+target_link_libraries(rect_place PRIVATE
+  nlohmann_json::nlohmann_json
+  armadillo
+)
+
+# Helpful optimizations
+if (MSVC)
+  target_compile_options(rect_place PRIVATE /O2 /DNDEBUG)
+else()
+  target_compile_options(rect_place PRIVATE -O3 -DNDEBUG)
+endif()
+
+
+
+
+
+
+// requirements.txt
+numpy>=1.26
+bokeh>=3.3
+panel>=1.3
+
+
+
+
+//python/run_panel.py
+
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import panel as pn
+from bokeh.models import ColumnDataSource, Div, Slider
+from bokeh.plotting import figure
+
+import rect_place  # the compiled pybind11 module
+
+pn.extension()
+
+def _load_json(p: Path) -> dict:
+    return json.loads(p.read_text())
+
+def _rects_to_sources(xy: np.ndarray, wh: np.ndarray):
+    # bokeh rect expects centers
+    cx = xy[:, 0] + 0.5 * wh[:, 0]
+    cy = xy[:, 1] + 0.5 * wh[:, 1]
+    return dict(cx=cx, cy=cy, w=wh[:, 0], h=wh[:, 1])
+
+def _bbox_from_xywh(xy: np.ndarray, wh: np.ndarray):
+    minx = float(np.min(xy[:, 0]))
+    miny = float(np.min(xy[:, 1]))
+    maxx = float(np.max(xy[:, 0] + wh[:, 0]))
+    maxy = float(np.max(xy[:, 1] + wh[:, 1]))
+    return minx, miny, maxx, maxy
+
+def _bbox_source(minx, miny, maxx, maxy):
+    cx = 0.5 * (minx + maxx)
+    cy = 0.5 * (miny + maxy)
+    w = max(0.0, maxx - minx)
+    h = max(0.0, maxy - miny)
+    return dict(cx=[cx], cy=[cy], w=[w], h=[h])
+
+def make_app(json_path: str):
+    json_path = str(Path(json_path).resolve())
+    cfg = _load_json(Path(json_path))
+
+    # engine
+    eng = rect_place.RectPlacementEngine(json_path)
+
+    # initial plot data
+    wh = eng.rect_wh()
+    init_xy = np.zeros((eng.num_rectangles(), 2), dtype=np.float64)
+    for i, k in enumerate(sorted(cfg["rectangles"].keys(), key=lambda s: int(s))):
+        init_xy[i, 0] = cfg["rectangles"][k]["x"]
+        init_xy[i, 1] = cfg["rectangles"][k]["y"]
+
+    canvas_w = float(cfg["expected_params"]["canvas"]["width"])
+    canvas_h = float(cfg["expected_params"]["canvas"]["height"])
+
+    src_in = ColumnDataSource(_rects_to_sources(init_xy, wh))
+    minx, miny, maxx, maxy = _bbox_from_xywh(init_xy, wh)
+    src_in_bb = ColumnDataSource(_bbox_source(minx, miny, maxx, maxy))
+
+    # output/iter plot sources (start = initial)
+    src_it = ColumnDataSource(_rects_to_sources(init_xy, wh))
+    src_it_bb = ColumnDataSource(_bbox_source(minx, miny, maxx, maxy))
+
+    p = figure(title="Rectangles + Bounding Box (iteration view)",
+               x_range=(0, canvas_w), y_range=(0, canvas_h),
+               width=850, height=650, match_aspect=True)
+    p.rect(x="cx", y="cy", width="w", height="h", source=src_it, fill_alpha=0.15, line_alpha=0.8)
+    p.rect(x="cx", y="cy", width="w", height="h", source=src_it_bb, fill_alpha=0.0, line_alpha=1.0, line_width=3)
+
+    p_in = figure(title="Input (initial)",
+                  x_range=(0, canvas_w), y_range=(0, canvas_h),
+                  width=850, height=650, match_aspect=True)
+    p_in.rect(x="cx", y="cy", width="w", height="h", source=src_in, fill_alpha=0.15, line_alpha=0.8)
+    p_in.rect(x="cx", y="cy", width="w", height="h", source=src_in_bb, fill_alpha=0.0, line_alpha=1.0, line_width=3)
+
+    info = Div(text="<b>Status:</b> not optimized yet")
+
+    def run_opt(_):
+        t0 = time.time()
+        eng.optimize()
+        dt = time.time() - t0
+
+        out_path = eng.default_output_path()
+        eng.save_output_json(out_path)
+
+        info.text = f"<b>Status:</b> optimized in {dt:.3f}s, saved output: {out_path}<br>" \
+                    f"<b>Best iteration:</b> {eng.best_iteration_index()} / {eng.iteration_count()-1}"
+
+        slider.end = max(0, eng.iteration_count() - 1)
+        slider.value = eng.best_iteration_index()
+
+        # jump to best immediately
+        update_iter(slider.value)
+
+    def update_iter(i: int):
+        if eng.iteration_count() == 0:
+            return
+
+        xy = np.asarray(eng.iter_xy(int(i)))
+        src_it.data = _rects_to_sources(xy, wh)
+
+        minx, miny, maxx, maxy = _bbox_from_xywh(xy, wh)
+        src_it_bb.data = _bbox_source(minx, miny, maxx, maxy)
+
+        md = eng.iter_metrics(int(i))
+        info.text = (
+            f"<b>Status:</b> iter {i}<br>"
+            f"aug_obj={md['augmented_objective']:.6g} | bbox_area={md['bbox_area']:.6g} | hpwl={md['hpwl']:.6g}<br>"
+            f"overlap(raw area)={md['overlap']:.6g} | boundary={md['boundary_violation']:.6g} | aspect_vi={md['aspect_ratio_violation']:.6g}<br>"
+            f"bbox_ar={md['bbox_aspect_ratio']:.6g} | bbox(cx,cy)=({md['bbox_cx']:.3f},{md['bbox_cy']:.3f})"
+        )
+
+    btn = pn.widgets.Button(name="Run optimization", button_type="primary")
+    btn.on_click(run_opt)
+
+    slider = Slider(title="Iteration", start=0, end=0, value=0, step=1)
+    slider.on_change("value", lambda attr, old, new: update_iter(new))
+
+    best_btn = pn.widgets.Button(name="Jump to best", button_type="success")
+    best_btn.on_click(lambda _: update_iter(eng.best_iteration_index() if eng.iteration_count() else 0))
+
+    layout = pn.Row(
+        pn.Column(btn, best_btn, pn.pane.Bokeh(slider), pn.pane.Bokeh(p), info),
+        pn.Column(pn.pane.Bokeh(p_in))
+    )
+    return layout
+
+# Panel entrypoint:
+# panel serve python/run_panel.py --show --args input.json
+import sys
+json_arg = sys.argv[1] if len(sys.argv) > 1 else "input.json"
+pn.serve(lambda: make_app(json_arg), show=False)
+
+
+
+
+// Run commands
+
+B) Install Armadillo (required by ensmallen)
+
+Windows (vcpkg recommended):
+
+git clone https://github.com/microsoft/vcpkg
+cd vcpkg
+.\bootstrap-vcpkg.bat
+.\vcpkg install armadillo
+
+
+Then build with the vcpkg toolchain:
+
+cd ..\rect_place
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=..\vcpkg\scripts\buildsystems\vcpkg.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+
+
+Linux (Debian/Ubuntu):
+
+sudo apt-get update
+sudo apt-get install -y libarmadillo-dev
+cd rect_place
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+C) Run Panel app
+
+From the project root:
+
+# Make sure the built module is importable:
+# On Windows, the .pyd will be under build/Release/; on Linux under build/
+# Easiest: run from a shell where PYTHONPATH points to the build output.
+
+# Windows PowerShell example:
+$env:PYTHONPATH="$PWD\build\Release;$env:PYTHONPATH"
+panel serve python/run_panel.py --show --args input.json
+
+# Linux/macOS:
+PYTHONPATH=build:$PYTHONPATH panel serve python/run_panel.py --show --args input.json
