@@ -84,3 +84,9 @@ notepad $PROFILE
 
 $env:VCPKG_ROOT = "C:\src\vcpkg"
 $env:Path = "$env:VCPKG_ROOT;$env:Path"
+
+
+
+
+vcpkg x-update-baseline --add-initial-baseline
+
