@@ -90,3 +90,19 @@ $env:Path = "$env:VCPKG_ROOT;$env:Path"
 
 vcpkg x-update-baseline --add-initial-baseline
 
+
+
+$vswhere = "$env:ProgramFiles(x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+Test-Path $vswhere
+
+& $vswhere -all -products * -format table
+
+$vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$vsPath
+
+
+$vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+$vcvars
+Test-Path $vcvars
+
+
