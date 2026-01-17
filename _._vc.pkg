@@ -52,3 +52,35 @@ where.exe cl
 cl
 
 
+
+
+
+@'
+{
+  "name": "opt-dash02",
+  "version-string": "0.0.1",
+  "dependencies": [
+    "armadillo"
+  ]
+}
+'@ | Set-Content -Encoding UTF8 .\vcpkg.json
+
+
+vcpkg install
+
+
+vcpkg install --triplet x64-windows
+
+
+$vcpkgExe = (Get-Command vcpkg).Source
+$vcpkgRoot = Split-Path $vcpkgExe
+$vcpkgExe
+$vcpkgRoot
+
+
+New-Item -ItemType Directory -Force (Split-Path $PROFILE) | Out-Null
+notepad $PROFILE
+
+
+$env:VCPKG_ROOT = "C:\src\vcpkg"
+$env:Path = "$env:VCPKG_ROOT;$env:Path"
