@@ -1,0 +1,361 @@
+#pragma once
+
+#include <string>
+#include <vector>
+
+class Block {
+public:
+    Block(int id, std::string name, double width, double height);
+
+    // existing behavior + now prints dimensions and position
+    void print_info() const;
+    void do_work(int work_units) const;
+
+    // accessors
+    int id() const noexcept { return id_; }
+    const std::string& name() const noexcept { return name_; }
+    double width() const noexcept { return width_; }
+    double height() const noexcept { return height_; }
+
+    double x() const noexcept { return x_; }
+    double y() const noexcept { return y_; }
+    void set_position(double x, double y) noexcept { x_ = x; y_ = y; }
+
+private:
+    int id_;
+    std::string name_;
+
+    // new data members from JSON
+    double width_;
+    double height_;
+
+    // new data members initialized to 0.0
+    double x_ = 0.0;
+    double y_ = 0.0;
+};
+
+// JSON parsing happens in C++ and returns fully initialized Blocks.
+// If json_path is empty, it tries common relative paths to find configs/input.json.
+std::vector<Block> load_blocks_from_json(const std::string& json_path = "");
+
+
+
+
+
+
+
+
+#include "blocks.h"
+
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+#include <filesystem>
+
+// nlohmann/json
+#include <nlohmann/json.hpp>
+using nlohmann::json;
+
+Block::Block(int id, std::string name, double width, double height)
+    : id_(id),
+      name_(std::move(name)),
+      width_(width),
+      height_(height),
+      x_(0.0),
+      y_(0.0) {}
+
+void Block::print_info() const {
+    std::cout
+        << "[Block::print_info] name=\"" << name_ << "\""
+        << ", id=" << id_
+        << ", width=" << width_
+        << ", height=" << height_
+        << ", x=" << x_
+        << ", y=" << y_
+        << "\n";
+}
+
+void Block::do_work(int work_units) const {
+    std::cout
+        << "[Block::do_work] \"" << name_ << "\" (id=" << id_ << ") doing "
+        << work_units << " unit(s) of work"
+        << " with (w,h)=(" << width_ << "," << height_ << ")"
+        << "\n";
+}
+
+static std::filesystem::path choose_json_path_or_throw(const std::string& requested) {
+    namespace fs = std::filesystem;
+
+    std::vector<fs::path> candidates;
+
+    if (!requested.empty()) {
+        candidates.emplace_back(fs::path(requested));
+    } else {
+        // Common cases:
+        // - run from repo root: configs/input.json
+        // - run from build dir: ../configs/input.json or ../../configs/input.json, etc.
+        candidates.emplace_back("configs/input.json");
+        candidates.emplace_back("../configs/input.json");
+        candidates.emplace_back("../../configs/input.json");
+        candidates.emplace_back("../../../configs/input.json");
+    }
+
+    for (const auto& p : candidates) {
+        std::error_code ec;
+        if (fs::exists(p, ec) && fs::is_regular_file(p, ec)) {
+            return p;
+        }
+    }
+
+    std::ostringstream oss;
+    oss << "Could not find input.json. Tried paths:\n";
+    for (const auto& p : candidates) oss << "  - " << p.string() << "\n";
+    throw std::runtime_error(oss.str());
+}
+
+std::vector<Block> load_blocks_from_json(const std::string& json_path) {
+    namespace fs = std::filesystem;
+
+    const fs::path path = choose_json_path_or_throw(json_path);
+
+    std::ifstream ifs(path);
+    if (!ifs) {
+        throw std::runtime_error("Failed to open JSON file: " + path.string());
+    }
+
+    json j;
+    try {
+        ifs >> j;
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("JSON parse error in ") + path.string() + ": " + e.what());
+    }
+
+    if (!j.is_object()) {
+        throw std::runtime_error("Top-level JSON must be an object (dict). File: " + path.string());
+    }
+
+    std::vector<Block> blocks;
+    blocks.reserve(j.size());
+
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        const std::string block_name = it.key();
+        const json& arr = it.value();
+
+        if (!arr.is_array() || arr.empty()) {
+            throw std::runtime_error("Block \"" + block_name + "\" must be a non-empty list.");
+        }
+        const json& first = arr.at(0);
+        if (!first.is_object()) {
+            throw std::runtime_error("Block \"" + block_name + "\": first element must be a dict/object.");
+        }
+
+        // Required keys in the first dict
+        if (!first.contains("ID") || !first.contains("width") || !first.contains("height")) {
+            throw std::runtime_error(
+                "Block \"" + block_name + "\": first dict must contain keys: ID, width, height."
+            );
+        }
+
+        const int id = first.at("ID").get<int>();
+        const double width = first.at("width").get<double>();
+        const double height = first.at("height").get<double>();
+
+        blocks.emplace_back(id, block_name, width, height);
+        // x,y remain 0.0 per requirement
+    }
+
+    return blocks;
+}
+
+
+
+
+#include "blocks.h"
+#include <iostream>
+#include <vector>
+
+int main(int argc, char** argv) {
+    try {
+        // Optional: allow explicit path override via argv[1]
+        const std::string path = (argc >= 2) ? std::string(argv[1]) : std::string("");
+
+        std::vector<Block> blocks = load_blocks_from_json(path);
+
+        std::cout << "Loaded " << blocks.size() << " block(s)\n";
+
+        for (auto& b : blocks) {
+            b.print_info();
+            b.do_work(2);
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << "\n";
+        return 1;
+    }
+}
+
+
+
+
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+#include "blocks.h"
+
+namespace py = pybind11;
+
+PYBIND11_MODULE(blocks_py, m) {
+    m.doc() = "pybind11 example exposing Block class and JSON loader";
+
+    py::class_<Block>(m, "Block")
+        .def(py::init<int, std::string, double, double>(),
+             py::arg("id"), py::arg("name"), py::arg("width"), py::arg("height"))
+        .def("print_info", &Block::print_info)
+        .def("do_work", &Block::do_work, py::arg("work_units"))
+
+        .def_property_readonly("id", &Block::id)
+        .def_property_readonly("name", &Block::name)
+        .def_property_readonly("width", &Block::width)
+        .def_property_readonly("height", &Block::height)
+
+        .def_property_readonly("x", &Block::x)
+        .def_property_readonly("y", &Block::y)
+        .def("set_position", &Block::set_position, py::arg("x"), py::arg("y"))
+
+        .def("__repr__", [](const Block& b) {
+            return "<Block name='" + b.name() + "' id=" + std::to_string(b.id()) +
+                   " w=" + std::to_string(b.width()) +
+                   " h=" + std::to_string(b.height()) +
+                   " x=" + std::to_string(b.x()) +
+                   " y=" + std::to_string(b.y()) + ">";
+        });
+
+    // The requested "create list of Block objects initialized with JSON directly"
+    m.def("load_blocks_from_json", &load_blocks_from_json,
+          py::arg("json_path") = "",
+          "Load blocks from JSON file and return a list of Block objects.");
+}
+
+
+
+
+
+from pathlib import Path
+import sys
+
+# Ensure we can import the built .pyd
+root = Path(__file__).resolve().parents[1]
+candidates = [
+    root / "build_pybind" / "Release",
+    root / "build_pybind" / "Debug",
+    root / "build_pybind",
+]
+for p in candidates:
+    if p.exists():
+        sys.path.insert(0, str(p))
+
+import blocks_py
+
+json_path = root / "configs" / "input.json"
+
+blocks = blocks_py.load_blocks_from_json(str(json_path))
+print(f"Loaded {len(blocks)} blocks from {json_path}")
+
+for b in blocks:
+    b.print_info()
+    b.do_work(3)
+
+
+
+
+
+
+cmake_minimum_required(VERSION 3.20)
+project(blocks_example LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ---- Dependency: nlohmann_json (no git required) ----
+find_package(nlohmann_json CONFIG QUIET)
+if(NOT nlohmann_json_FOUND)
+    include(FetchContent)
+    # Downloads a release tarball (no git.exe needed). Requires internet.
+    FetchContent_Declare(
+        nlohmann_json
+        URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+endif()
+
+# ---- Core library ----
+add_library(blocks_lib STATIC
+    src/blocks.cpp
+)
+target_include_directories(blocks_lib PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(blocks_lib PUBLIC nlohmann_json::nlohmann_json)
+
+# ---- Executable ----
+add_executable(blocks_app
+    src/main.cpp
+)
+target_link_libraries(blocks_app PRIVATE blocks_lib)
+
+# ---- Optional pybind build ----
+option(BUILD_PYBIND "Build pybind11 Python module" ON)
+
+if(BUILD_PYBIND)
+    find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter Development.Module)
+
+    # Use pybind11 from the active venv Python (no git download)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
+        OUTPUT_VARIABLE pybind11_cmake_dir
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+
+    if(NOT EXISTS "${pybind11_cmake_dir}")
+        message(FATAL_ERROR "pybind11 CMake dir not found. Got: '${pybind11_cmake_dir}'. Is pybind11 installed in this venv?")
+    endif()
+
+    list(APPEND CMAKE_PREFIX_PATH "${pybind11_cmake_dir}")
+    find_package(pybind11 CONFIG REQUIRED)
+
+    pybind11_add_module(blocks_py
+        src/pybind_module.cpp
+    )
+    target_link_libraries(blocks_py PRIVATE blocks_lib)
+endif()
+
+
+
+
+
+
+cmake -S .\cpp -B .\build_exe -DBUILD_PYBIND=OFF
+cmake --build .\build_exe --config Release
+.\build_exe\Release\blocks_app.exe
+
+
+.\build_exe\Release\blocks_app.exe ..\..\..\configs\input.json
+
+
+Remove-Item -Recurse -Force .\build_pybind -ErrorAction SilentlyContinue
+
+$venvPython = (Get-Command python).Source
+
+cmake -S .\cpp -B .\build_pybind `
+  -DBUILD_PYBIND=ON `
+  -DPython3_EXECUTABLE="$venvPython"
+
+cmake --build .\build_pybind --config Release
+
+python .\python\main.py
+
+
