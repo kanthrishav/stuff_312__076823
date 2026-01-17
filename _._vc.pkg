@@ -106,3 +106,26 @@ $vcvars
 Test-Path $vcvars
 
 
+
+
+
+$installer = "$env:ProgramFiles(x86)\Microsoft Visual Studio\Installer\vs_installer.exe"
+Test-Path $installer
+
+# If $vsPath was empty earlier, get the latest instance without the VC requirement:
+if (-not $vsPath) {
+  $vsPath = & $vswhere -latest -products * -property installationPath
+}
+
+& $installer modify `
+  --installPath "$vsPath" `
+  --add Microsoft.VisualStudio.Workload.VCTools `
+  --includeRecommended `
+  --passive --norestart
+
+
+$vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+Test-Path $vcvars
+
+
+$env:VCPKG_VISUAL_STUDIO_PATH = $vsPath
