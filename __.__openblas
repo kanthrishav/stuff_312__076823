@@ -1,0 +1,10 @@
+$OB = "C:/Program Files (x86)/OpenBLAS"
+$OB_LIB = "$OB/lib/openblas.lib"
+
+cmake -S . -B build `
+  -DBLA_VENDOR=OpenBLAS `
+  -DBLAS_LIBRARIES="$OB_LIB" `
+  -DLAPACK_LIBRARIES="$OB_LIB" `
+  -DCMAKE_PREFIX_PATH="$OB/lib/cmake/OpenBLAS"
+
+cmake --build build --config Release
