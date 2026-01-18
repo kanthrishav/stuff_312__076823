@@ -1,10 +1,237 @@
-$OB = "C:/Program Files (x86)/OpenBLAS"
-$OB_LIB = "$OB/lib/openblas.lib"
+Below is the safest Windows/MSVC way to get Armadillo + ensmallen working together on your machine without vcpkg, without relying on CMake “finding” BLAS/LAPACK, and without building any fragile wrapper libraries.
 
-cmake -S . -B build `
-  -DBLA_VENDOR=OpenBLAS `
-  -DBLAS_LIBRARIES="$OB_LIB" `
-  -DLAPACK_LIBRARIES="$OB_LIB" `
-  -DCMAKE_PREFIX_PATH="$OB/lib/cmake/OpenBLAS"
+Key idea (this avoids the exact problem you hit):
 
-cmake --build build --config Release
+Use Armadillo as a “pure template” library and link OpenBLAS directly by defining ARMA_DONT_USE_WRAPPER. Armadillo explicitly supports this.
+
+ensmallen is header-only; the repo explicitly supports “manual install” by copying headers.
+
+This path works especially well when OpenBLAS is in a non-standard location like yours (C:\Program Files (x86)\OpenBLAS). Armadillo’s own FAQ basically recommends the same strategy when OpenBLAS isn’t in a standard location.
+
+1) Exact repos + exact tags to use
+Armadillo
+
+Repo: https://gitlab.com/conradsnicta/armadillo-code.git
+
+Tag: 15.2.2
+
+ensmallen
+
+Repo: https://github.com/mlpack/ensmallen.git
+
+Tag: 3.11.0 (released Dec 16, 2025)
+
+Also note: ensmallen requires C++14 and Armadillo ≥ 10.8.2.
+
+2) Pre-flight checks (PowerShell commands that won’t throw “command not found” errors)
+
+Copy/paste these as-is (they only print status).
+
+# --- tools on PATH? (no errors if missing) ---
+foreach ($name in "cmake","git","python","cl") {
+  $c = Get-Command $name -ErrorAction SilentlyContinue
+  if ($c) { Write-Host "[OK] $name -> $($c.Source)" }
+  else    { Write-Host "[MISS] $name not found on PATH" }
+}
+
+# --- show versions if available (safe) ---
+$cm = Get-Command cmake -ErrorAction SilentlyContinue
+if ($cm) { & $cm.Source --version | Select-Object -First 1 }
+
+$g = Get-Command git -ErrorAction SilentlyContinue
+if ($g) { & $g.Source --version }
+
+$py = Get-Command python -ErrorAction SilentlyContinue
+if ($py) { & $py.Source --version }
+
+# --- verify OpenBLAS files exist (safe) ---
+$OpenBLASRoot = "C:\Program Files (x86)\OpenBLAS"
+Write-Host "`nOpenBLASRoot = $OpenBLASRoot"
+foreach ($p in @(
+  "$OpenBLASRoot\include\cblas.h",
+  "$OpenBLASRoot\include\lapacke.h",
+  "$OpenBLASRoot\lib\openblas.lib",
+  "$OpenBLASRoot\lib\cmake\OpenBLAS\OpenBLASConfig.cmake"
+)) {
+  if (Test-Path $p) { Write-Host "[OK] $p" } else { Write-Host "[MISS] $p" }
+}
+
+# --- optional: check openblas.lib architecture if dumpbin exists (safe) ---
+$db = Get-Command dumpbin -ErrorAction SilentlyContinue
+if ($db -and (Test-Path "$OpenBLASRoot\lib\openblas.lib")) {
+  & $db.Source /headers "$OpenBLASRoot\lib\openblas.lib" 2>$null | Select-String -Pattern "machine" -First 1
+} else {
+  Write-Host "[INFO] dumpbin not available (or openblas.lib missing) -> skipping architecture check"
+}
+
+
+If cl is [MISS] in normal PowerShell, you can still build by launching the VS dev environment once per terminal (next step).
+
+3) Ensure MSVC is available in normal PowerShell (safe loader)
+
+Run this in the same terminal before building anything C++ if cl was missing:
+
+$vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+if (Test-Path $vswhere) {
+  $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+  if ($vsPath) {
+    $devShell = Join-Path $vsPath "Common7\Tools\Launch-VsDevShell.ps1"
+    if (Test-Path $devShell) {
+      & $devShell -Arch amd64 -HostArch amd64 | Out-Null
+      $cl = Get-Command cl -ErrorAction SilentlyContinue
+      if ($cl) { Write-Host "[OK] MSVC ready: $($cl.Source)" } else { Write-Host "[WARN] DevShell ran, but cl still not found" }
+    } else {
+      Write-Host "[MISS] Launch-VsDevShell.ps1 not found under: $vsPath"
+    }
+  } else {
+    Write-Host "[MISS] vswhere found but no suitable VS/BuildTools instance detected"
+  }
+} else {
+  Write-Host "[MISS] vswhere.exe not found"
+}
+
+
+This avoids the vcpkg-style “cannot locate VS instance” issue by letting Microsoft’s own discovery do the work.
+
+4) Clone the two repos at the exact tags (won’t error if folders already exist)
+
+Pick a deps folder (example: C:\codespace\deps):
+
+$Deps = "C:\codespace\deps"
+New-Item -ItemType Directory -Force -Path $Deps | Out-Null
+Set-Location $Deps
+
+# Armadillo (tag 15.2.2)
+if (-not (Test-Path "$Deps\armadillo-code")) {
+  if (Get-Command git -ErrorAction SilentlyContinue) {
+    git clone --branch 15.2.2 --depth 1 https://gitlab.com/conradsnicta/armadillo-code.git armadillo-code
+  } else {
+    Write-Host "[MISS] git not found on PATH"
+  }
+} else { Write-Host "[SKIP] armadillo-code already exists" }
+
+# ensmallen (tag 3.11.0)
+if (-not (Test-Path "$Deps\ensmallen")) {
+  if (Get-Command git -ErrorAction SilentlyContinue) {
+    git clone --branch 3.11.0 --depth 1 https://github.com/mlpack/ensmallen.git ensmallen
+  } else {
+    Write-Host "[MISS] git not found on PATH"
+  }
+} else { Write-Host "[SKIP] ensmallen already exists" }
+
+5) “Install” headers locally (safest) — no CMake detection required
+
+ensmallen explicitly supports manual header install.
+Armadillo supports pure-template usage with ARMA_DONT_USE_WRAPPER.
+
+Create a local include bundle:
+
+$Install = Join-Path $Deps "install"
+$Inc = Join-Path $Install "include"
+New-Item -ItemType Directory -Force -Path $Inc | Out-Null
+
+# Copy Armadillo headers
+$ArmaInc = Join-Path $Deps "armadillo-code\include"
+if (Test-Path $ArmaInc) {
+  Copy-Item -Recurse -Force "$ArmaInc\*" $Inc
+  Write-Host "[OK] Copied Armadillo headers -> $Inc"
+} else {
+  Write-Host "[MISS] Armadillo include dir not found: $ArmaInc"
+}
+
+# Copy ensmallen headers (include/ensmallen.hpp and include/ensmallen_bits)
+$EnsInc = Join-Path $Deps "ensmallen\include"
+if (Test-Path $EnsInc) {
+  Copy-Item -Recurse -Force "$EnsInc\*" $Inc
+  Write-Host "[OK] Copied ensmallen headers -> $Inc"
+} else {
+  Write-Host "[MISS] ensmallen include dir not found: $EnsInc"
+}
+
+
+At the end you’ll have:
+
+C:\codespace\deps\install\include\armadillo
+
+C:\codespace\deps\install\include\armadillo_bits
+
+C:\codespace\deps\install\include\ensmallen.hpp
+
+C:\codespace\deps\install\include\ensmallen_bits\...
+
+6) Verify by building a tiny CMake project that links OpenBLAS directly (most robust)
+
+Create a folder anywhere, e.g. C:\codespace\deps\verify:
+
+verify.cpp
+#define ARMA_DONT_USE_WRAPPER
+#include <armadillo>
+#include <ensmallen.hpp>
+#include <iostream>
+
+struct Rosenbrock
+{
+  double Evaluate(const arma::mat& x) const
+  {
+    const double a = 1.0;
+    const double b = 100.0;
+    const double t1 = (a - x(0));
+    const double t2 = (x(1) - x(0) * x(0));
+    return t1*t1 + b*t2*t2;
+  }
+
+  void Gradient(const arma::mat& x, arma::mat& g) const
+  {
+    const double a = 1.0;
+    const double b = 100.0;
+    g.set_size(2,1);
+    g(0) = -2.0*(a - x(0)) - 4.0*b*x(0)*(x(1) - x(0)*x(0));
+    g(1) =  2.0*b*(x(1) - x(0)*x(0));
+  }
+};
+
+int main()
+{
+  arma::mat x = { {-1.2}, {1.0} };
+
+  ens::L_BFGS opt;
+  Rosenbrock f;
+  double finalObj = opt.Optimize(f, x);
+
+  std::cout << "finalObj=" << finalObj << "\n";
+  std::cout << "x=" << x.t();
+  return 0;
+}
+
+CMakeLists.txt
+cmake_minimum_required(VERSION 3.18)
+project(verify_ensmallen_armadillo LANGUAGES CXX)
+
+add_executable(verify verify.cpp)
+target_compile_features(verify PRIVATE cxx_std_14)
+
+# header bundle from step 5
+target_include_directories(verify PRIVATE "C:/codespace/deps/install/include")
+
+# Disable wrapper and link OpenBLAS directly (most robust on Windows)
+target_compile_definitions(verify PRIVATE ARMA_DONT_USE_WRAPPER)
+
+# Link OpenBLAS (MSVC .lib)
+target_link_libraries(verify PRIVATE "C:/Program Files (x86)/OpenBLAS/lib/openblas.lib")
+
+Configure + build + run (PowerShell)
+$Verify = "C:\codespace\deps\verify"
+cmake -S $Verify -B "$Verify\build"
+cmake --build "$Verify\build" --config Release
+& "$Verify\build\Release\verify.exe"
+
+
+If that runs, your Armadillo + ensmallen + OpenBLAS toolchain is correct.
+
+Why this is the “safest” path on your setup
+
+ensmallen is header-only and officially supports copying headers directly.
+
+Armadillo officially supports bypassing the runtime wrapper via ARMA_DONT_USE_WRAPPER, in which case you must link BLAS/LAPACK directly (OpenBLAS provides both).
+
+This avoids fragile auto-detection when libraries live under Program Files (x86) and avoids the whole “can’t find LAPACK/BLAS even though installed” failure mode.
