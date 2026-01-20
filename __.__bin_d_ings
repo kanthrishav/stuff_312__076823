@@ -557,3 +557,47 @@ each engine has its own HistoryStore and LayoutEvaluator
 expose Runner.run(index) and Runner.coords_history(index) etc.
 
 The pybind approach stays the same: return NumPy views into the chosen engine’s buffers.
+
+
+
+
+
+
+
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+
+#include <type_traits>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+// IMPORTANT: include the header that DEFINES Metrics explicitly.
+// Do NOT rely on runner.hpp or other headers to include it for you.
+#include "data_classes.h"
+
+// Hard compile-time checks: if these fail, Metrics is not visible/complete here.
+static_assert(sizeof(Metrics) > 0, "Metrics is not visible or is incomplete at this point.");
+static_assert(std::is_standard_layout_v<Metrics>, "Metrics must be standard-layout for PYBIND11_NUMPY_DTYPE.");
+static_assert(std::is_trivially_copyable_v<Metrics>, "Metrics must be trivially copyable for zero-copy NumPy views.");
+
+// Must be at *global scope* (not inside PYBIND11_MODULE, not inside any namespace).
+PYBIND11_NUMPY_DTYPE(Metrics,
+  bbox_area,
+  bbox_aspect,
+  hpwl,
+  overlap,
+  boundary_violation,
+  aspect_ratio_violation,
+  augmented_objective,
+  bbox_cx, bbox_cy, bbox_w, bbox_h,
+  iteration_index
+);
+
+// Now include runner AFTER dtype registration (order is not critical now,
+// but this avoids any possibility of a forward declaration shadowing the full type).
+#include "runner.hpp"
+
+namespace py = pybind11;
