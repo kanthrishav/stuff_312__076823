@@ -1,0 +1,559 @@
+Below is a complete, zero-copy (Python-side) pybind11 interface that lets you:
+
+set Runner.jPars_file and Runner.jBlock_file
+
+call Runner.execute() (GIL released)
+
+read all iteration coordinates as a NumPy view (no copy)
+
+read W/H as NumPy views
+
+read all iteration metrics as a NumPy structured array view
+
+read best coords and best metrics
+
+read all optimizer parameters (cheap dict)
+
+To make the views safe + fast, you need a few surgical C++ changes (mainly: make HistoryStore store data in a stable contiguous buffer with getters, and make Metrics a standard-layout struct).
+
+1) Required C++ code changes (exact “replace/insert” pieces)
+1.1 Replace your Metrics class with a standard-layout struct
+
+REPLACE the current class Metrics{ ... } with this:
+
+// --- REPLACE ENTIRE Metrics DEFINITION WITH THIS ---
+struct Metrics {
+  double bbox_area = 0.0;
+  double bbox_aspect = 0.0;
+  double hpwl = 0.0;
+  double overlap = 0.0;
+  double boundary_violation = 0.0;
+  double aspect_ratio_violation = 0.0;
+  double augmented_objective = 0.0;
+  double bbox_cx = 0.0, bbox_cy = 0.0, bbox_w = 0.0, bbox_h = 0.0;
+  std::size_t iteration_index = 0;
+};
+
+
+Why: pybind11 can expose this as a NumPy structured dtype with zero-copy.
+
+1.2 Replace HistoryStore with a pre-sized, stable-buffer version + getters
+
+This prevents reallocation invalidating pointers and enables very fast views.
+
+REPLACE your entire HistoryStore class with:
+
+// --- REPLACE ENTIRE HistoryStore DEFINITION WITH THIS ---
+class HistoryStore {
+public:
+  HistoryStore() = default;
+
+  // reserve_iters should be (max_iter + 1) typically
+  void init(std::size_t n, std::size_t reserve_iters) {
+    n_ = n;
+    max_iters_ = std::max<std::size_t>(1, reserve_iters);
+
+    iter_count_ = 0;
+    best_index_ = 0;
+    best_obj_ = std::numeric_limits<double>::infinity();
+    best_metrics_ = Metrics{};
+
+    // Pre-size so memory is stable and "elements exist" (safe to view from Python)
+    coords_.assign(max_iters_ * 2 * n_, 0.0);
+    iter_metrics_.assign(max_iters_, Metrics{});
+    best_coords_.assign(2 * n_, 0.0);
+  }
+
+  void reset_runtime_only() {
+    iter_count_ = 0;
+    best_index_ = 0;
+    best_obj_ = std::numeric_limits<double>::infinity();
+    best_metrics_ = Metrics{};
+    std::fill(coords_.begin(), coords_.end(), 0.0);
+    std::fill(iter_metrics_.begin(), iter_metrics_.end(), Metrics{});
+    std::fill(best_coords_.begin(), best_coords_.end(), 0.0);
+  }
+
+  void push(const arma::mat& x, const Metrics& m) {
+    if (iter_count_ >= max_iters_) return; // safety; shouldn't happen if sized correctly
+
+    const double* p = x.memptr();
+    const std::size_t off = iter_count_ * (2 * n_);
+
+    // Copy into our stable buffer (this is internal storage, not Python-side copying)
+    std::copy(p, p + (2 * n_), coords_.begin() + static_cast<std::ptrdiff_t>(off));
+
+    iter_metrics_[iter_count_] = m;
+
+    if (m.augmented_objective < best_obj_) {
+      best_obj_ = m.augmented_objective;
+      best_index_ = iter_count_;
+      best_metrics_ = m;
+      std::copy(p, p + (2 * n_), best_coords_.begin());
+    }
+
+    ++iter_count_;
+  }
+
+  // ---- getters for pybind zero-copy views ----
+  std::size_t n() const noexcept { return n_; }
+  std::size_t max_iters() const noexcept { return max_iters_; }
+  std::size_t iterations() const noexcept { return iter_count_; }
+  std::size_t best_index() const noexcept { return best_index_; }
+
+  const std::vector<double>& coords_buffer() const noexcept { return coords_; }        // size = max_iters * 2n
+  const std::vector<double>& best_coords() const noexcept { return best_coords_; }    // size = 2n
+  const std::vector<Metrics>& metrics_buffer() const noexcept { return iter_metrics_; } // size = max_iters
+  const Metrics& best_metrics() const noexcept { return best_metrics_; }
+
+private:
+  std::size_t n_ = 0;
+  std::size_t max_iters_ = 0;
+  std::size_t iter_count_ = 0;
+
+  std::vector<double> coords_;       // [iter][2n] flattened
+  std::vector<Metrics> iter_metrics_;
+
+  std::size_t best_index_ = 0;
+  double best_obj_ = std::numeric_limits<double>::infinity();
+  std::vector<double> best_coords_;
+  Metrics best_metrics_;
+};
+
+1.3 Placement: add read-only accessors needed by Runner (and init store with max_iter+1)
+
+You said only HistoryStore and Runner have .cpp; Placement is header-only. Add these methods.
+
+INSERT inside class Placement public: section:
+
+// --- INSERT INSIDE Placement public: ---
+const HistoryStore& history() const noexcept { return store_; }
+HistoryStore& history() noexcept { return store_; }
+
+const LayoutEvaluator& evaluator() const noexcept { return evaluator_; }
+const LayoutConfig& config() const noexcept { return cfg_; }
+
+bool optimized() const noexcept { return optimized_; }
+double runtime_seconds() const noexcept { return runtime_s_; }
+
+
+Then CHANGE your load() so it sizes the store with (max_iter + 1):
+
+REPLACE the tail of Placement::load(...) that currently does:
+
+evaluator_.init(cfg_, store_);
+store_.init(cfg_.blocks.size());
+
+
+with:
+
+evaluator_.init(cfg_, store_);
+store_.init(cfg_.blocks.size(), cfg_.optimizer.max_iter + 1);
+
+1.4 Runner: add setters/getters + forwarding access (still “Runner-only” for Python)
+
+In Runner header, INSERT into public::
+
+// --- INSERT INSIDE Runner public: ---
+void set_jPars_file(const std::string& p) { jPars_file = p; }
+void set_jBlock_file(const std::string& p) { jBlock_file = p; }
+const std::string& get_jPars_file() const noexcept { return jPars_file; }
+const std::string& get_jBlock_file() const noexcept { return jBlock_file; }
+
+const Placement& placement() const noexcept { return place; }
+Placement& placement() noexcept { return place; }
+
+
+If you already have plptr() it’s fine; keep it. The above just standardizes.
+
+1.5 CMakeLists.txt: fix a typo (your snippet has pydin11)
+
+REPLACE:
+
+COMMAND "${Python3_EXECUTABLE}" -m pydin11 --cmakedir
+
+
+with:
+
+COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
+
+2) Complete src/pybind_module.cpp (drop-in)
+
+Save this as: src/pybind_module.cpp
+
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+#include <string>
+
+// Include ONLY your top-level Runner header; it should pull needed types transitively.
+#include "runner.hpp"
+
+namespace py = pybind11;
+
+// Register Metrics as a NumPy structured dtype (zero-copy structured array view).
+// This requires Metrics to be a standard-layout struct with PUBLIC fields.
+PYBIND11_NUMPY_DTYPE(Metrics,
+  bbox_area,
+  bbox_aspect,
+  hpwl,
+  overlap,
+  boundary_violation,
+  aspect_ratio_violation,
+  augmented_objective,
+  bbox_cx, bbox_cy, bbox_w, bbox_h,
+  iteration_index
+);
+
+// Helper: create a zero-copy NumPy array view over a raw pointer.
+// base: keeps C++ owner alive (we use the Runner instance).
+static py::array make_array_view_double(
+    const py::object& base,
+    double* ptr,
+    const std::vector<py::ssize_t>& shape,
+    const std::vector<py::ssize_t>& strides)
+{
+  py::buffer_info info(
+      ptr,
+      sizeof(double),
+      py::format_descriptor<double>::format(),
+      static_cast<py::ssize_t>(shape.size()),
+      shape,
+      strides
+  );
+  return py::array(info, base);
+}
+
+static py::array make_array_view_metrics(
+    const py::object& base,
+    Metrics* ptr,
+    py::ssize_t n)
+{
+  // 1D structured array: shape (n,), stride sizeof(Metrics)
+  py::buffer_info info(
+      ptr,
+      sizeof(Metrics),
+      py::format_descriptor<Metrics>::format(),
+      1,
+      std::vector<py::ssize_t>{n},
+      std::vector<py::ssize_t>{static_cast<py::ssize_t>(sizeof(Metrics))}
+  );
+  return py::array(py::dtype::of<Metrics>(), info, base);
+}
+
+PYBIND11_MODULE(placement_engine_py, m) {
+  m.doc() = "Rectangle placement engine bindings (zero-copy views for history/metrics).";
+
+  py::class_<Runner>(m, "Runner")
+    .def(py::init<>())
+
+    // File paths
+    .def_property("jPars_file",
+      [](const Runner& r) { return r.get_jPars_file(); },
+      [](Runner& r, const std::string& p) { r.set_jPars_file(p); }
+    )
+    .def_property("jBlock_file",
+      [](const Runner& r) { return r.get_jBlock_file(); },
+      [](Runner& r, const std::string& p) { r.set_jBlock_file(p); }
+    )
+
+    // Execute optimizer (release GIL)
+    .def("execute",
+      [](Runner& r) {
+        py::gil_scoped_release release;
+        r.execute();
+      },
+      "Run the optimizer (GIL released)."
+    )
+
+    // Basic counters
+    .def("num_blocks",
+      [](const Runner& r) -> std::size_t {
+        return r.placement().history().n();
+      }
+    )
+    .def("max_iters_reserved",
+      [](const Runner& r) -> std::size_t {
+        return r.placement().history().max_iters();
+      }
+    )
+    .def("iterations",
+      [](const Runner& r) -> std::size_t {
+        return r.placement().history().iterations();
+      }
+    )
+    .def("best_index",
+      [](const Runner& r) -> std::size_t {
+        return r.placement().history().best_index();
+      }
+    )
+
+    // ---- Zero-copy views ----
+
+    // coords_history(): shape = (iters, n, 2), view into HistoryStore::coords_buffer()
+    .def("coords_history",
+      [](Runner& r) -> py::array {
+        auto base = py::cast(&r); // keep Runner alive
+
+        const HistoryStore& hs = r.placement().history();
+        const std::size_t n = hs.n();
+        const std::size_t iters = hs.iterations();
+
+        const auto& buf = hs.coords_buffer();
+        double* ptr = const_cast<double*>(buf.data()); // view only; Python should not mutate
+
+        // layout: [iter][2n] flattened -> reshape (iter, n, 2)
+        const py::ssize_t S0 = static_cast<py::ssize_t>(iters);
+        const py::ssize_t S1 = static_cast<py::ssize_t>(n);
+        const py::ssize_t S2 = 2;
+
+        const py::ssize_t stride_iter = static_cast<py::ssize_t>(2 * n * sizeof(double));
+        const py::ssize_t stride_n    = static_cast<py::ssize_t>(2 * sizeof(double));
+        const py::ssize_t stride_xy   = static_cast<py::ssize_t>(sizeof(double));
+
+        return make_array_view_double(
+          base, ptr,
+          {S0, S1, S2},
+          {stride_iter, stride_n, stride_xy}
+        );
+      },
+      "Zero-copy view of all iteration coordinates as (iters, n, 2)."
+    )
+
+    // coords_at(i): shape = (n,2) view into buffer at iteration i
+    .def("coords_at",
+      [](Runner& r, std::size_t i) -> py::array {
+        auto base = py::cast(&r);
+
+        const HistoryStore& hs = r.placement().history();
+        const std::size_t n = hs.n();
+        const std::size_t iters = hs.iterations();
+        if (i >= iters) throw py::index_error("coords_at: iteration out of range");
+
+        const auto& buf = hs.coords_buffer();
+        double* ptr0 = const_cast<double*>(buf.data());
+        double* ptr = ptr0 + static_cast<std::ptrdiff_t>(i * 2 * n);
+
+        const py::ssize_t S0 = static_cast<py::ssize_t>(n);
+        const py::ssize_t S1 = 2;
+
+        const py::ssize_t stride_n  = static_cast<py::ssize_t>(2 * sizeof(double));
+        const py::ssize_t stride_xy = static_cast<py::ssize_t>(sizeof(double));
+
+        return make_array_view_double(base, ptr, {S0, S1}, {stride_n, stride_xy});
+      },
+      py::arg("i"),
+      "Zero-copy view of coordinates at iteration i as (n,2)."
+    )
+
+    // best_coords(): shape = (n,2)
+    .def("best_coords",
+      [](Runner& r) -> py::array {
+        auto base = py::cast(&r);
+
+        const HistoryStore& hs = r.placement().history();
+        const std::size_t n = hs.n();
+
+        const auto& buf = hs.best_coords();
+        double* ptr = const_cast<double*>(buf.data());
+
+        const py::ssize_t S0 = static_cast<py::ssize_t>(n);
+        const py::ssize_t S1 = 2;
+
+        const py::ssize_t stride_n  = static_cast<py::ssize_t>(2 * sizeof(double));
+        const py::ssize_t stride_xy = static_cast<py::ssize_t>(sizeof(double));
+
+        return make_array_view_double(base, ptr, {S0, S1}, {stride_n, stride_xy});
+      },
+      "Zero-copy view of best coordinates as (n,2)."
+    )
+
+    // widths(): shape = (n,)
+    .def("widths",
+      [](Runner& r) -> py::array {
+        auto base = py::cast(&r);
+
+        const auto& w = r.placement().evaluator().WVec();
+        double* ptr = const_cast<double*>(w.data());
+        const py::ssize_t n = static_cast<py::ssize_t>(w.size());
+
+        return make_array_view_double(
+          base, ptr,
+          {n},
+          {static_cast<py::ssize_t>(sizeof(double))}
+        );
+      },
+      "Zero-copy view of widths (n,)."
+    )
+
+    // heights(): shape = (n,)
+    .def("heights",
+      [](Runner& r) -> py::array {
+        auto base = py::cast(&r);
+
+        const auto& h = r.placement().evaluator().HVec();
+        double* ptr = const_cast<double*>(h.data());
+        const py::ssize_t n = static_cast<py::ssize_t>(h.size());
+
+        return make_array_view_double(
+          base, ptr,
+          {n},
+          {static_cast<py::ssize_t>(sizeof(double))}
+        );
+      },
+      "Zero-copy view of heights (n,)."
+    )
+
+    // metrics_history(): structured array shape = (iters,)
+    .def("metrics_history",
+      [](Runner& r) -> py::array {
+        auto base = py::cast(&r);
+
+        const HistoryStore& hs = r.placement().history();
+        const std::size_t iters = hs.iterations();
+
+        const auto& buf = hs.metrics_buffer();
+        Metrics* ptr = const_cast<Metrics*>(buf.data());
+
+        return make_array_view_metrics(base, ptr, static_cast<py::ssize_t>(iters));
+      },
+      "Zero-copy view of metrics history as a NumPy structured array (iters,)."
+    )
+
+    // best_metrics(): return as small dict (cheap)
+    .def("best_metrics",
+      [](const Runner& r) -> py::dict {
+        const Metrics& bm = r.placement().history().best_metrics();
+        py::dict d;
+        d["iteration_index"] = bm.iteration_index;
+        d["bbox_area"] = bm.bbox_area;
+        d["bbox_aspect"] = bm.bbox_aspect;
+        d["hpwl"] = bm.hpwl;
+        d["overlap"] = bm.overlap;
+        d["boundary_violation"] = bm.boundary_violation;
+        d["aspect_ratio_violation"] = bm.aspect_ratio_violation;
+        d["augmented_objective"] = bm.augmented_objective;
+        d["bbox_cx"] = bm.bbox_cx;
+        d["bbox_cy"] = bm.bbox_cy;
+        d["bbox_w"] = bm.bbox_w;
+        d["bbox_h"] = bm.bbox_h;
+        return d;
+      },
+      "Best metrics as a dict (tiny, cheap)."
+    )
+
+    // optimizer_params(): return dict (small, cheap)
+    .def("optimizer_params",
+      [](const Runner& r) -> py::dict {
+        const auto& opt = r.placement().config().optimizer;
+        py::dict d;
+        d["algorithm"] = opt.algorithm;
+        d["max_iter"] = opt.max_iter;
+        d["stopping_criteria"] = opt.stopping_criteria;
+        d["stopping_value"] = opt.stopping_value;
+        d["seed"] = opt.seed;
+        d["pop_size"] = opt.pop_size;
+        d["recombination"] = opt.recombination;
+        d["strategy"] = opt.strategy;
+        d["mutation_min"] = opt.mutation_min;
+        d["mutation_max"] = opt.mutation_max;
+        return d;
+      },
+      "All optimizer parameters as dict (small)."
+    )
+  ;
+}
+
+
+Python-side is zero-copy for:
+
+coords_history(), coords_at(i), best_coords(), widths(), heights(), metrics_history()
+
+(They are views into C++ owned memory. Don’t wrap them in np.array(...) unless you want a copy.)
+
+3) How to use it from Python (+ a small Panel app with slider)
+import numpy as np
+import panel as pn
+from bokeh.plotting import figure
+from bokeh.models import ColumnDataSource
+
+import placement_engine_py as pe
+
+pn.extension("bokeh")
+
+runner = pe.Runner()
+runner.jPars_file  = r"D:\path\to\params.json"
+runner.jBlock_file = r"D:\path\to\blocks.json"
+
+runner.execute()
+
+coords = runner.coords_history()     # (iters, n, 2) zero-copy view
+w = runner.widths()                  # (n,) zero-copy view
+h = runner.heights()                 # (n,) zero-copy view
+metrics = runner.metrics_history()   # (iters,) structured array view
+
+iters = runner.iterations()
+n = runner.num_blocks()
+
+# Initial iteration
+i0 = 0
+source = ColumnDataSource(data=dict(
+    x = coords[i0, :, 0],
+    y = coords[i0, :, 1],
+    w = w,
+    h = h,
+))
+
+p = figure(title="Placement iterations", match_aspect=True, width=700, height=700)
+p.rect(x="x", y="y", width="w", height="h", source=source, fill_alpha=0.35, line_alpha=0.9)
+
+slider = pn.widgets.IntSlider(name="Iteration", start=0, end=max(0, iters-1), value=0)
+
+# Fast update: swap x/y arrays (they are numpy views)
+def _on_iter_change(event):
+    i = int(event.new)
+    source.data.update(
+        x = coords[i, :, 0],
+        y = coords[i, :, 1],
+        w = w,
+        h = h,
+    )
+slider.param.watch(_on_iter_change, "value")
+
+best_idx = runner.best_index()
+best_metrics = runner.best_metrics()
+
+info = pn.pane.Markdown(
+    f"**iters:** {iters}  \n"
+    f"**best_idx:** {best_idx}  \n"
+    f"**best_obj:** {best_metrics['augmented_objective']:.6g}"
+)
+
+pn.Column(info, slider, p).servable()
+
+
+Tip for speed: keep coords, w, h cached (as above). Don’t call runner.coords_history() repeatedly inside callbacks.
+
+4) Notes on “ZERO COPYING ACTION” and <10 ms latency
+
+The bindings above guarantee zero-copy for all large arrays when crossing into Python.
+
+Internally, you must store iteration history somewhere; that necessarily involves copying the optimizer’s current x into your history buffer. The approach above makes that one fast contiguous copy per iteration into pre-sized memory (no realloc jitter).
+
+execute() releases the GIL so your Panel server thread won’t freeze while C++ runs.
+
+5) Future-proofing for “multiple PlacementEngine objects per Runner”
+
+If you want one Runner to manage multiple variations (e.g., multiple jBlock_files) concurrently, the clean extension is:
+
+Runner holds std::vector<Placement> engines_;
+
+each engine has its own HistoryStore and LayoutEvaluator
+
+expose Runner.run(index) and Runner.coords_history(index) etc.
+
+The pybind approach stays the same: return NumPy views into the chosen engine’s buffers.
