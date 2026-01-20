@@ -601,3 +601,43 @@ PYBIND11_NUMPY_DTYPE(Metrics,
 #include "runner.hpp"
 
 namespace py = pybind11;
+
+
+
+
+
+
+
+
+
+static py::array make_array_view_metrics(
+    const py::object& base,
+    Metrics* ptr,
+    py::ssize_t n)
+{
+  // Structured dtype registered via PYBIND11_NUMPY_DTYPE(Metrics, ...)
+  const py::dtype dt = py::dtype::of<Metrics>();
+
+  // shape: (n,)
+  const std::vector<py::ssize_t> shape{n};
+
+  // stride: sizeof(Metrics)
+  const std::vector<py::ssize_t> strides{static_cast<py::ssize_t>(sizeof(Metrics))};
+
+  // This ctor is stable across pybind11 versions:
+  // array(dtype, shape, strides, data_ptr, base_owner)
+  return py::array(dt, shape, strides, ptr, base);
+}
+
+
+
+
+
+
+auto arr = make_array_view_metrics(base, ptr, static_cast<py::ssize_t>(iters));
+arr.attr("flags").attr("writeable") = false;
+return arr;
+
+
+
+
