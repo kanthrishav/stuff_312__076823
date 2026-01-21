@@ -1,0 +1,1010 @@
+
+# placement_panel_app.py
+# Panel + Bokeh UI for the placement_engine_py Runner bindings.
+#
+# Run (Windows / Linux):
+#   panel serve placement_panel_app.py --show --autoreload
+#
+# Notes:
+# - Tab1 runs a single optimization and displays full iteration history using zero-copy NumPy views
+#   returned from the C++ bindings (as long as the Runner object remains alive).
+# - Tab2 sweeps all varList combinations in parallel *only to identify the best combination*,
+#   then re-runs the best one once in the main process to display full history (zero-copy).
+
+from __future__ import annotations
+
+import os
+import json
+import re
+import time
+import math
+import itertools
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Callable, Optional
+
+import numpy as np
+import panel as pn
+from bokeh.plotting import figure
+from bokeh.models import ColumnDataSource, Range1d
+
+pn.extension("bokeh")
+
+# ---- import the pybind module ----
+try:
+    import placement_engine_py as pe  # your built pybind11 module
+except Exception as e:
+    pe = None
+    _IMPORT_ERR = e
+else:
+    _IMPORT_ERR = None
+
+# ---- worker for parallel sweep ----
+# We keep worker logic in a separate module so ProcessPoolExecutor(spawn) won't re-import UI code.
+from runner_worker import sweep_one_varlist
+
+# ------------------------ JSON loading (lenient) ------------------------
+
+_TRAILING_COMMA_RE = re.compile(r",(\s*[\]}])", flags=re.MULTILINE)
+_ELLIPSIS_LINE_RE = re.compile(r"^\s*\.\.\.\s*$", flags=re.MULTILINE)
+
+def load_json_lenient(path: str | Path) -> Any:
+    """
+    Load JSON that may contain:
+      - trailing commas before ']' or '}'
+      - standalone lines containing '...'
+    Your real files should be strict JSON; this is just to tolerate common editing artifacts.
+    """
+    p = Path(path)
+    s = p.read_text(encoding="utf-8", errors="replace")
+    s = _ELLIPSIS_LINE_RE.sub("", s)
+
+    # iteratively remove trailing commas
+    prev = None
+    while prev != s:
+        prev = s
+        s = _TRAILING_COMMA_RE.sub(r"\1", s)
+
+    return json.loads(s)
+
+def save_json_strict(obj: Any, out_path: str | Path) -> Path:
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+    return out_path
+
+# ------------------------ Widget builder ------------------------
+
+_ENUM_OPTIONS = {
+    # optimizer
+    "algorithm": ["DE", "CMAES", "SA", "SGD", "Adam"],
+    "stopping_criteria": ["max_iter", "target_objective"],
+    "strategy": ["best1bin", "rand1bin", "best2bin", "rand2bin"],
+    # constraints
+    "normalization": ["no norm", "canvas_area", "total_rect_area", "scale_len"],
+    "aggregation": ["sum", "mean", "max"],
+    "type": ["overlap", "boundary", "aspect"],
+}
+
+def _widget_for_value(key: str, value: Any) -> pn.viewable.Viewable:
+    # enums
+    if isinstance(value, str) and key in _ENUM_OPTIONS:
+        return pn.widgets.Select(name=key, options=_ENUM_OPTIONS[key], value=value)
+
+    # scalar types
+    if isinstance(value, bool):
+        return pn.widgets.Checkbox(name=key, value=value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return pn.widgets.IntInput(name=key, value=value)
+    if isinstance(value, float):
+        return pn.widgets.FloatInput(name=key, value=value, step=0.01)
+    if isinstance(value, str):
+        return pn.widgets.TextInput(name=key, value=value)
+
+    # list
+    if isinstance(value, list):
+        # Special handling for varList: list of indices
+        if key == "varList" and all(isinstance(x, int) for x in value):
+            items = []
+            for i, v in enumerate(value):
+                items.append(pn.widgets.IntInput(name=f"varList[{i}]", value=int(v), width=120))
+            return pn.Row(*items, sizing_mode="stretch_width")
+
+        # simple list
+        return pn.widgets.TextAreaInput(name=key, value=json.dumps(value), height=90)
+
+    # dict fallback
+    return pn.widgets.TextAreaInput(name=key, value=json.dumps(value, indent=2), height=140)
+
+@dataclass
+class JsonForm:
+    root_key: str
+    data: Dict[str, Any]
+    widgets: Dict[Tuple[str, ...], pn.viewable.Viewable] = field(default_factory=dict)
+
+    def build(self) -> pn.Column:
+        col = pn.Column(sizing_mode="stretch_width")
+        col.append(pn.pane.Markdown(f"### {self.root_key}", margin=(0, 0, 10, 0)))
+        col.append(self._build_node((self.root_key,), self.data))
+        return col
+
+    def _build_node(self, path: Tuple[str, ...], node: Any) -> pn.viewable.Viewable:
+        if isinstance(node, dict):
+            # group in an accordion for readability
+            acc_items = []
+            for k, v in node.items():
+                child_path = path + (k,)
+                acc_items.append((k, self._build_node(child_path, v)))
+            acc = pn.Accordion(*acc_items, active=list(range(len(acc_items))), sizing_mode="stretch_width")
+            return acc
+
+        # leaf widget
+        w = _widget_for_value(path[-1], node)
+        self.widgets[path] = w
+        return w
+
+    def collect(self) -> Dict[str, Any]:
+        """Return a deep-updated copy of self.data using widget values."""
+        def set_in(obj: Any, p: Tuple[str, ...], val: Any):
+            # p includes root_key at index 0
+            cur = obj
+            for k in p[1:-1]:
+                cur = cur[k]
+            cur[p[-1]] = val
+
+        out = json.loads(json.dumps(self.data))  # deep copy
+        for path, w in self.widgets.items():
+            key = path[-1]
+            if isinstance(w, pn.widgets.TextAreaInput):
+                # for TextAreaInput, try to parse JSON; fallback to raw string
+                try:
+                    v = json.loads(w.value)
+                except Exception:
+                    v = w.value
+            elif isinstance(w, pn.widgets.Select):
+                v = w.value
+            elif isinstance(w, pn.widgets.Checkbox):
+                v = bool(w.value)
+            elif isinstance(w, pn.widgets.IntInput):
+                v = int(w.value)
+            elif isinstance(w, pn.widgets.FloatInput):
+                v = float(w.value)
+            elif isinstance(w, pn.widgets.TextInput):
+                v = w.value
+            elif isinstance(w, pn.Row) and key == "varList":
+                # handled separately below
+                continue
+            else:
+                v = getattr(w, "value", None)
+
+            # varList row: reconstruct from its IntInputs
+            if key == "varList" and isinstance(w, pn.Row):
+                vals = []
+                for item in w:
+                    if isinstance(item, pn.widgets.IntInput):
+                        vals.append(int(item.value))
+                v = vals
+
+            set_in(out, path, v)
+
+        # Special: if varList is rendered as Row at root
+        # (in our build, varList leaf widget is a Row)
+        var_path = (self.root_key, "varList")
+        if var_path in self.widgets and isinstance(self.widgets[var_path], pn.Row):
+            vals = []
+            for item in self.widgets[var_path]:
+                if isinstance(item, pn.widgets.IntInput):
+                    vals.append(int(item.value))
+            out["varList"] = vals
+
+        return out
+
+def make_varlist_controls(block_json: Dict[str, Any], current: List[int]) -> pn.Row:
+    """Rebuild varList controls sized to number of keys in block_json."""
+    keys = list(block_json.keys())
+    n = len(keys)
+    cur = list(current) if isinstance(current, list) else []
+    if len(cur) < n:
+        cur = cur + [0] * (n - len(cur))
+    if len(cur) > n:
+        cur = cur[:n]
+
+    row_items = []
+    for i, k in enumerate(keys):
+        max_idx = max(0, len(block_json[k]) - 1) if isinstance(block_json[k], list) else 0
+        row_items.append(
+            pn.Column(
+                pn.pane.Markdown(f"**{k}**", margin=(0,0,0,0)),
+                pn.widgets.IntInput(name=f"varList[{i}]", value=int(cur[i]), start=0, end=max_idx, width=120),
+                margin=(0,10,0,0)
+            )
+        )
+    return pn.Row(*row_items, sizing_mode="stretch_width")
+
+def read_varlist_from_controls(var_row: pn.Row) -> List[int]:
+    out = []
+    for col in var_row:
+        if isinstance(col, pn.Column):
+            for w in col:
+                if isinstance(w, pn.widgets.IntInput):
+                    out.append(int(w.value))
+    return out
+
+# ------------------------ Bokeh plotting ------------------------
+
+def make_rect_plot() -> Tuple[figure, ColumnDataSource]:
+    src = ColumnDataSource(data=dict(x=[], y=[], w=[], h=[]))
+    p = figure(
+        title="Block placement",
+        width=800, height=800,
+        match_aspect=True,
+        tools="pan,wheel_zoom,reset,save",
+        active_scroll="wheel_zoom",
+    )
+    p.rect(x="x", y="y", width="w", height="h", source=src, fill_alpha=0.35, line_alpha=0.9)
+    p.xaxis.axis_label = "X"
+    p.yaxis.axis_label = "Y"
+    return p, src
+
+def make_metric_plot(title: str, y_key: str) -> Tuple[figure, ColumnDataSource]:
+    src = ColumnDataSource(data=dict(i=[], y=[]))
+    p = figure(title=title, width=380, height=240, tools="pan,wheel_zoom,reset,save", active_scroll="wheel_zoom")
+    p.line(x="i", y="y", source=src)
+    p.xaxis.axis_label = "Iteration"
+    p.yaxis.axis_label = y_key
+    return p, src
+
+def set_rect_data(src: ColumnDataSource, coords_i: np.ndarray, w: np.ndarray, h: np.ndarray):
+    # coords_i: (n,2)
+    src.data = dict(
+        x=np.asarray(coords_i[:, 0]),
+        y=np.asarray(coords_i[:, 1]),
+        w=np.asarray(w),
+        h=np.asarray(h),
+    )
+
+# ------------------------ App state ------------------------
+
+@dataclass
+class RunData:
+    runner: Any
+    coords: Any  # zero-copy view (iters,n,2)
+    w: Any       # zero-copy view (n,)
+    h: Any       # zero-copy view (n,)
+    metrics: Any # zero-copy structured array (iters,)
+    iters: int
+    best_idx: int
+
+@dataclass
+class AppState:
+    par_path: Optional[Path] = None
+    block_path: Optional[Path] = None
+    par_json: Optional[Dict[str, Any]] = None
+    block_json: Optional[Dict[str, Any]] = None
+
+    par_form: Optional[JsonForm] = None
+    varlist_row: Optional[pn.Row] = None
+
+    run_data: Optional[RunData] = None
+
+STATE = AppState()
+
+# ------------------------ UI building blocks ------------------------
+
+status = pn.pane.Markdown("", sizing_mode="stretch_width")
+
+file_par = pn.widgets.FileSelector(name="Select jsonPar.json", path=str(Path.home()), file_pattern="*.json", width=700)
+file_blk = pn.widgets.FileSelector(name="Select jsonBlock.json", path=str(Path.home()), file_pattern="*.json", width=700)
+
+btn_load = pn.widgets.Button(name="Load JSONs", button_type="primary", width=150)
+btn_update = pn.widgets.Button(name="Update jsonPar (copy)", button_type="primary", width=180)
+btn_run = pn.widgets.Button(name="Run (single)", button_type="success", width=150)
+
+iter_slider = pn.widgets.IntSlider(name="Iteration", start=0, end=0, value=0, width=800)
+btn_best = pn.widgets.Button(name="Go to best iteration", button_type="warning", width=200)
+
+plot_main, src_rect = make_rect_plot()
+
+p_overlap, src_overlap = make_metric_plot("Overlap vs Iterations", "overlap")
+p_area, src_area = make_metric_plot("BBox Area vs Iterations", "bbox_area")
+p_hpwl, src_hpwl = make_metric_plot("HPWL vs Iterations", "hpwl")
+p_aspect, src_aspect = make_metric_plot("BBox Aspect vs Iterations", "bbox_aspect")
+p_boundary, src_boundary = make_metric_plot("Boundary violation vs Iterations", "boundary_violation")
+
+metrics_grid = pn.GridBox(
+    pn.pane.Bokeh(p_overlap), pn.pane.Bokeh(p_area),
+    pn.pane.Bokeh(p_hpwl), pn.pane.Bokeh(p_aspect),
+    pn.pane.Bokeh(p_boundary),
+    ncols=2,
+    sizing_mode="stretch_width",
+)
+
+form_container = pn.Column(sizing_mode="stretch_width")
+varlist_container = pn.Column(sizing_mode="stretch_width")
+
+# TAB2 widgets
+btn_sweep = pn.widgets.Button(name="Run sweep (all varList combos)", button_type="danger", width=260)
+sweep_workers = pn.widgets.IntInput(name="Parallel workers", value=max(1, (os.cpu_count() or 4) - 1), start=1, width=180)
+sweep_progress = pn.indicators.Progress(name="Sweep progress", value=0, max=1, width=700)
+sweep_info = pn.pane.Markdown("", sizing_mode="stretch_width")
+
+# ------------------------ Callbacks ------------------------
+
+def _set_status(msg: str):
+    status.object = msg
+
+def _ensure_pe():
+    if pe is None:
+        raise RuntimeError(
+            "placement_engine_py import failed. Build/install the pybind module in this environment.\n"
+            f"Original error: {_IMPORT_ERR}"
+        )
+
+def _load_jsons():
+    # FileSelector.value is a list of selected files (strings)
+    if not file_par.value or not file_blk.value:
+        _set_status("❌ Please select both jsonPar.json and jsonBlock.json.")
+        return
+
+    par_path = Path(file_par.value[0])
+    blk_path = Path(file_blk.value[0])
+
+    try:
+        par_obj = load_json_lenient(par_path)
+        blk_obj = load_json_lenient(blk_path)
+        if not isinstance(par_obj, dict) or not isinstance(blk_obj, dict):
+            raise ValueError("Expected both JSON files to be JSON objects (dicts).")
+    except Exception as e:
+        _set_status(f"❌ Failed to load JSONs: {e}")
+        return
+
+    STATE.par_path = par_path
+    STATE.block_path = blk_path
+    STATE.par_json = par_obj
+    STATE.block_json = blk_obj
+
+    # Build param form
+    STATE.par_form = JsonForm(root_key="jsonPar", data=par_obj)
+    form_container.clear()
+    form_container.append(STATE.par_form.build())
+
+    # Build varList controls aligned to block keys
+    current_var = par_obj.get("varList", [])
+    STATE.varlist_row = make_varlist_controls(blk_obj, current_var)
+    varlist_container.clear()
+    varlist_container.append(pn.pane.Markdown("### varList (aligned to jsonBlock keys)", margin=(0,0,10,0)))
+    varlist_container.append(STATE.varlist_row)
+
+    # show info
+    k = list(blk_obj.keys())
+    combo_count = 1
+    for kk in k:
+        if isinstance(blk_obj[kk], list):
+            combo_count *= max(1, len(blk_obj[kk]))
+    _set_status(
+        f"✅ Loaded.\n\n"
+        f"- jsonPar: `{par_path}`\n"
+        f"- jsonBlock: `{blk_path}`\n"
+        f"- block keys: {len(k)}\n"
+        f"- sweep combinations (product of list lengths): **{combo_count}**"
+    )
+
+def _write_updated_params_copy() -> Optional[Path]:
+    if STATE.par_form is None or STATE.par_path is None or STATE.block_json is None:
+        _set_status("❌ Load JSONs first.")
+        return None
+
+    par_new = STATE.par_form.collect()
+
+    # overwrite varList from dedicated controls (so it matches jsonBlock)
+    if STATE.varlist_row is not None:
+        par_new["varList"] = read_varlist_from_controls(STATE.varlist_row)
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out = STATE.par_path.with_name(f"{STATE.par_path.stem}_updated_{ts}{STATE.par_path.suffix}")
+    try:
+        save_json_strict(par_new, out)
+    except Exception as e:
+        _set_status(f"❌ Failed to write updated params file: {e}")
+        return None
+
+    _set_status(f"✅ Wrote updated params copy:\n\n`{out}`")
+    return out
+
+def _run_single():
+    _ensure_pe()
+
+    if STATE.block_path is None or STATE.par_path is None or STATE.block_json is None:
+        _set_status("❌ Load JSONs first.")
+        return
+
+    par_updated_path = _write_updated_params_copy()
+    if par_updated_path is None:
+        return
+
+    try:
+        runner = pe.Runner()
+        runner.jPars_file = str(par_updated_path)
+        runner.jBlock_file = str(STATE.block_path)
+        runner.execute()
+
+        coords = runner.coords_history()     # (iters,n,2) view
+        w = runner.widths()                  # (n,) view
+        h = runner.heights()                 # (n,) view
+        metrics = runner.metrics_history()   # (iters,) structured view
+        iters = int(runner.iterations())
+        best_idx = int(runner.best_index())
+
+        STATE.run_data = RunData(
+            runner=runner, coords=coords, w=w, h=h, metrics=metrics, iters=iters, best_idx=best_idx
+        )
+
+        # update slider + plots
+        iter_slider.start = 0
+        iter_slider.end = max(0, iters - 1)
+        iter_slider.value = 0
+
+        if iters > 0:
+            set_rect_data(src_rect, coords[0], w, h)
+
+        # update metric plots (static)
+        i = np.arange(iters, dtype=np.int32)
+        src_overlap.data = dict(i=i, y=np.asarray(metrics["overlap"]))
+        src_area.data = dict(i=i, y=np.asarray(metrics["bbox_area"]))
+        src_hpwl.data = dict(i=i, y=np.asarray(metrics["hpwl"]))
+        src_aspect.data = dict(i=i, y=np.asarray(metrics["bbox_aspect"]))
+        src_boundary.data = dict(i=i, y=np.asarray(metrics["boundary_violation"]))
+
+        best_obj = float(metrics["augmented_objective"][best_idx]) if iters > 0 else float("nan")
+        _set_status(
+            f"✅ Run complete.\n\n"
+            f"- iterations: **{iters}**\n"
+            f"- best_idx: **{best_idx}**\n"
+            f"- best objective: **{best_obj:.6g}**"
+        )
+    except Exception as e:
+        _set_status(f"❌ Run failed: {e}")
+
+def _on_slider_change(event):
+    rd = STATE.run_data
+    if rd is None:
+        return
+    i = int(event.new)
+    if i < 0 or i >= rd.iters:
+        return
+    set_rect_data(src_rect, rd.coords[i], rd.w, rd.h)
+
+def _go_best(_=None):
+    rd = STATE.run_data
+    if rd is None:
+        return
+    iter_slider.value = int(rd.best_idx)
+
+async def _run_sweep_async():
+    """
+    Run all varList combinations in parallel to find best objective.
+    Then re-run that best combination once in the main process (single-run) to display.
+    """
+    _ensure_pe()
+
+    if STATE.block_path is None or STATE.par_form is None or STATE.block_json is None or STATE.par_path is None:
+        _set_status("❌ Load JSONs first.")
+        return
+
+    # Build the base updated params (in-memory dict)
+    base_par = STATE.par_form.collect()
+    if STATE.varlist_row is not None:
+        base_par["varList"] = read_varlist_from_controls(STATE.varlist_row)
+
+    block_obj = STATE.block_json
+    keys = list(block_obj.keys())
+
+    # ranges per key
+    ranges = []
+    for k in keys:
+        v = block_obj[k]
+        if not isinstance(v, list) or len(v) == 0:
+            ranges.append([0])
+        else:
+            ranges.append(list(range(len(v))))
+
+    combos = list(itertools.product(*ranges))
+    total = len(combos)
+    sweep_progress.max = max(1, total)
+    sweep_progress.value = 0
+    sweep_info.object = f"Running sweep with **{total}** combinations using **{int(sweep_workers.value)}** workers..."
+
+    # We offload the sweep orchestration itself to a thread, but actual work is in subprocesses.
+    import asyncio
+    import concurrent.futures
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    max_workers = int(sweep_workers.value)
+
+    # Use a temp directory for params files written by workers.
+    tmpdir = Path(tempfile.mkdtemp(prefix="placement_sweep_"))
+
+    def run_sweep_blocking():
+        best_obj = math.inf
+        best_combo = None
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+            futs = []
+            for combo in combos:
+                varlist = list(combo)
+                futs.append(ex.submit(
+                    sweep_one_varlist,
+                    base_par,
+                    str(STATE.block_path),
+                    varlist,
+                    str(tmpdir),
+                ))
+
+            done = 0
+            for fut in concurrent.futures.as_completed(futs):
+                done += 1
+                try:
+                    obj, combo_ret = fut.result()
+                except Exception:
+                    # ignore worker failures but keep going
+                    obj, combo_ret = math.inf, None
+                if obj < best_obj:
+                    best_obj = obj
+                    best_combo = combo_ret
+                # progress update is handled outside (async) by returning counts
+                yield done, best_obj, best_combo
+
+    # Consume the generator without blocking UI too long
+    best_obj = math.inf
+    best_combo = None
+    loop = asyncio.get_running_loop()
+
+    # run the blocking generator in a thread and stream progress back
+    def _drain():
+        out = []
+        for step in run_sweep_blocking():
+            out.append(step)
+        return out
+
+    steps = await loop.run_in_executor(None, _drain)
+
+    for done, bo, bc in steps:
+        sweep_progress.value = done
+        best_obj, best_combo = bo, bc
+
+    if best_combo is None:
+        sweep_info.object = "❌ Sweep completed but no successful run was found."
+        return
+
+    sweep_info.object = (
+        f"✅ Sweep done.\n\n"
+        f"- best objective: **{best_obj:.6g}**\n"
+        f"- best varList: **{list(best_combo)}**\n\n"
+        f"Re-running best varList once to load full history..."
+    )
+
+    # apply best varList to controls
+    if STATE.varlist_row is not None:
+        # update IntInputs in place
+        i = 0
+        for col in STATE.varlist_row:
+            if isinstance(col, pn.Column):
+                for w in col:
+                    if isinstance(w, pn.widgets.IntInput):
+                        w.value = int(best_combo[i])
+                        i += 1
+
+    # now just run single-run path (writes updated file + executes + plots)
+    _run_single()
+
+def _run_sweep(_=None):
+    # Schedule async sweep
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+        pn.state.execute(_run_sweep_async)
+    except RuntimeError:
+        # no running loop (rare). Panel will have one; fallback anyway.
+        pn.state.execute(_run_sweep_async)
+
+# wire callbacks
+btn_load.on_click(lambda _: _load_jsons())
+btn_update.on_click(lambda _: _write_updated_params_copy())
+btn_run.on_click(lambda _: _run_single())
+btn_best.on_click(_go_best)
+iter_slider.param.watch(_on_slider_change, "value")
+btn_sweep.on_click(_run_sweep)
+
+# ------------------------ TAB layouts ------------------------
+
+controls_row = pn.Row(btn_load, btn_update, btn_run, btn_best, sizing_mode="stretch_width")
+
+tab1 = pn.Column(
+    pn.pane.Markdown("## TAB 1 — Single run", margin=(0,0,10,0)),
+    pn.Row(pn.Column(file_par, file_blk, controls_row, status, sizing_mode="stretch_width"),
+           pn.Column(form_container, varlist_container, sizing_mode="stretch_width"),
+           sizing_mode="stretch_width"),
+    pn.pane.Markdown("### Iteration viewer", margin=(10,0,5,0)),
+    iter_slider,
+    pn.pane.Bokeh(plot_main),
+    pn.pane.Markdown("### Metrics", margin=(10,0,5,0)),
+    metrics_grid,
+    sizing_mode="stretch_width"
+)
+
+tab2_controls = pn.Row(btn_sweep, sweep_workers, sizing_mode="stretch_width")
+
+tab2 = pn.Column(
+    pn.pane.Markdown("## TAB 2 — Sweep varList combinations (parallel)", margin=(0,0,10,0)),
+    pn.Row(pn.Column(file_par, file_blk, btn_load, btn_update, btn_run, status, sizing_mode="stretch_width"),
+           pn.Column(form_container, varlist_container, sizing_mode="stretch_width"),
+           sizing_mode="stretch_width"),
+    tab2_controls,
+    sweep_progress,
+    sweep_info,
+    pn.pane.Markdown("### Best-run iteration viewer", margin=(10,0,5,0)),
+    iter_slider,
+    pn.pane.Bokeh(plot_main),
+    pn.pane.Markdown("### Metrics (best run)", margin=(10,0,5,0)),
+    metrics_grid,
+    sizing_mode="stretch_width"
+)
+
+app = pn.Tabs(
+    ("TAB 1", tab1),
+    ("TAB 2", tab2),
+    dynamic=True,
+    sizing_mode="stretch_width"
+)
+
+# Serve
+app.servable()
+
+
+
+
+
+
+
+
+
+
+# runner_worker.py
+# Worker helpers for ProcessPoolExecutor (spawn-safe on Windows).
+from __future__ import annotations
+
+import json
+import math
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+def _save_params(base_par: Dict[str, Any], varlist: List[int], out_dir: str) -> Path:
+    out = dict(base_par)
+    out["varList"] = list(varlist)
+    out_path = Path(out_dir) / f"jsonPar_var_{'_'.join(map(str,varlist))}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+    return out_path
+
+def sweep_one_varlist(base_par: Dict[str, Any], block_path: str, varlist: List[int], tmpdir: str) -> Tuple[float, Tuple[int, ...]]:
+    """
+    Run one optimization for a given varList.
+    Returns: (best_objective, varlist_tuple)
+
+    IMPORTANT:
+    - returns only scalar objective + varList to keep IPC overhead tiny.
+    - the main UI will re-run the best varList once to load full history (zero-copy).
+    """
+    import placement_engine_py as pe
+
+    par_path = _save_params(base_par, varlist, tmpdir)
+
+    runner = pe.Runner()
+    runner.jPars_file = str(par_path)
+    runner.jBlock_file = str(block_path)
+    runner.execute()
+
+    bm = runner.best_metrics()
+    obj = float(bm.get("augmented_objective", math.inf))
+    return obj, tuple(varlist)
+
+
+
+
+
+
+
+
+
+
+
+elow is a complete, concrete implementation of the “no filesystem writes in TAB2 sweep” idea by adding:
+
+C++: Runner::execute_from_json_strings(par_json_str, block_json_str)
+
+pybind11: binding method on Runner
+
+Python: worker + TAB2 sweep updated to call the new method (no temp files per combo)
+
+This keeps the sweep hot-path to: (Python dict → compact JSON string) + (C++ parse) + (optimize) + (return scalar best objective).
+
+1) C++ changes
+1.1 runner.h — add new public API (exact insert)
+
+FILE: include/runner.h (or wherever class Runner is declared)
+
+INSERT inside class Runner public section (near execute()):
+
+// Run using in-memory JSON strings (no file IO).
+void execute_from_json_strings(const std::string& jPars_json,
+                               const std::string& jBlock_json);
+
+
+Optionally, if you want to share code with the existing execute() implementation, add a private helper too:
+
+private:
+  void execute_from_json_objects(const nlohmann::json& jPars,
+                                 const nlohmann::json& jBlock);
+
+
+(If your code uses using json = nlohmann::json;, replace nlohmann::json with json.)
+
+1.2 runner.cpp — implement the string entrypoint
+
+FILE: src/runner.cpp
+
+A) Ensure includes (exact insert)
+
+At the top, make sure you have:
+
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <stdexcept>
+#include <vector>
+#include <string>
+
+
+…and your existing includes.
+
+B) Add these helpers (exact insert)
+
+INSERT near the top of runner.cpp (above Runner::execute...), inside an anonymous namespace:
+
+namespace {
+using json = nlohmann::json;
+
+static std::vector<int> parse_varlist_from_pars(const json& jPars) {
+  std::vector<int> out;
+  auto it = jPars.find("varList");
+  if (it == jPars.end() || !it->is_array()) return out;
+
+  out.reserve(it->size());
+  for (const auto& v : *it) {
+    if (!v.is_number_integer()) out.push_back(0);
+    else out.push_back(v.get<int>());
+  }
+  return out;
+}
+
+// IMPORTANT: nlohmann::json uses std::map by default -> keys iterate in SORTED order.
+// To be deterministic and match typical existing C++ behavior, we also sort keys here.
+static json select_blocks_by_varlist_sorted_keys(const json& jBlock,
+                                                const std::vector<int>& varList) {
+  if (!jBlock.is_object()) {
+    throw std::runtime_error("jsonBlock must be a JSON object at top level.");
+  }
+
+  std::vector<std::string> keys;
+  keys.reserve(jBlock.size());
+  for (auto it = jBlock.begin(); it != jBlock.end(); ++it) keys.push_back(it.key());
+  std::sort(keys.begin(), keys.end());
+
+  json out = json::object();
+  out.reserve(keys.size());
+
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    const auto& k = keys[i];
+    const auto& v = jBlock.at(k);
+
+    if (v.is_array() && !v.empty()) {
+      std::size_t idx = 0;
+      if (i < varList.size() && varList[i] >= 0) idx = static_cast<std::size_t>(varList[i]);
+      if (idx >= v.size()) idx = v.size() - 1;
+      out[k] = v[idx];               // pick dict at idx
+    } else {
+      out[k] = v;                    // passthrough (non-array or empty array)
+    }
+  }
+  return out;
+}
+} // namespace
+
+C) Implement the shared “objects” executor (exact insert)
+
+If you added the private helper in the header, INSERT this implementation in runner.cpp:
+
+void Runner::execute_from_json_objects(const nlohmann::json& jPars,
+                                      const nlohmann::json& jBlock) {
+  // varList read from jPars["varList"]
+  std::vector<int> varList = parse_varlist_from_pars(jPars);
+
+  // pick one dict per key from jsonBlock using varList (sorted-key order)
+  nlohmann::json jQgen = select_blocks_by_varlist_sorted_keys(jBlock, varList);
+
+  // Existing pipeline (unchanged)
+  place.load(jPars, jQgen, varList);
+  place.execute();
+}
+
+D) Implement the new string entrypoint (exact insert)
+
+INSERT:
+
+void Runner::execute_from_json_strings(const std::string& jPars_json,
+                                      const std::string& jBlock_json) {
+  // Parse from strings (no disk IO). Throws on invalid JSON.
+  nlohmann::json jPars = nlohmann::json::parse(jPars_json);
+  nlohmann::json jBlock = nlohmann::json::parse(jBlock_json);
+
+  execute_from_json_objects(jPars, jBlock);
+}
+
+E) Optional: refactor existing file-based Runner::execute() to reuse the helper
+
+Inside your current Runner::execute() (which reads files), after you parse to json jPars and json jBlock, just call:
+
+execute_from_json_objects(jPars, jBlock);
+
+
+This guarantees file-run and string-run behave identically.
+
+2) pybind11 changes (pybind_module.cpp)
+
+Inside your py::class_<Runner>(..., "Runner") bindings, ADD:
+
+.def("execute_from_json_strings",
+     [](Runner& r, const std::string& pars_json, const std::string& block_json) {
+       py::gil_scoped_release release;
+       r.execute_from_json_strings(pars_json, block_json);
+     },
+     py::arg("pars_json_str"),
+     py::arg("block_json_str"),
+     "Run optimizer from in-memory JSON strings (no filesystem IO).")
+
+
+That’s it.
+
+3) Python changes for TAB2 sweep (no temp files)
+3.1 runner_worker.py (replace your worker with this)
+# runner_worker.py
+from __future__ import annotations
+
+import json
+import math
+from typing import Any, Dict, List, Tuple, Optional
+
+_BLOCK_JSON_STR: Optional[str] = None
+
+def init_worker(block_json_str: str):
+    """Initializer for each worker process: store jsonBlock string once."""
+    global _BLOCK_JSON_STR
+    _BLOCK_JSON_STR = block_json_str
+
+def sweep_one_varlist(par_base: Dict[str, Any], varlist: List[int]) -> Tuple[float, Tuple[int, ...]]:
+    """
+    Run one optimization for a given varList (NO file IO).
+    Returns (best_objective, varlist_tuple)
+    """
+    global _BLOCK_JSON_STR
+    if _BLOCK_JSON_STR is None:
+        raise RuntimeError("Worker not initialized. init_worker(block_json_str) was not called.")
+
+    import placement_engine_py as pe
+
+    par = dict(par_base)
+    par["varList"] = list(varlist)
+
+    # Compact JSON => less IPC + faster C++ parse
+    par_str = json.dumps(par, separators=(",", ":"))
+
+    runner = pe.Runner()
+    runner.execute_from_json_strings(par_str, _BLOCK_JSON_STR)
+
+    bm = runner.best_metrics()
+    obj = float(bm.get("augmented_objective", math.inf))
+    return obj, tuple(varlist)
+
+3.2 TAB2 sweep orchestration (key changes)
+
+Where you create the executor, use initializer=init_worker to broadcast the block JSON once per process:
+
+from runner_worker import init_worker, sweep_one_varlist
+import concurrent.futures
+import multiprocessing as mp
+import itertools
+import math
+
+ctx = mp.get_context("spawn")  # Windows-safe
+max_workers = int(sweep_workers.value)
+
+# block_json_str should be built once in the main UI:
+# block_json_str = json.dumps(block_obj, separators=(",", ":"))
+
+best_obj = math.inf
+best_combo = None
+
+ranges = [...]  # list of index ranges for each key
+combos_iter = itertools.product(*ranges)
+
+with concurrent.futures.ProcessPoolExecutor(
+    max_workers=max_workers,
+    mp_context=ctx,
+    initializer=init_worker,
+    initargs=(block_json_str,),
+) as ex:
+    inflight = set()
+    window = max_workers * 4
+
+    def submit_next():
+        try:
+            combo = next(combos_iter)
+        except StopIteration:
+            return False
+        varlist = list(combo)
+        fut = ex.submit(sweep_one_varlist, base_par_dict, varlist)
+        inflight.add(fut)
+        return True
+
+    for _ in range(window):
+        if not submit_next():
+            break
+
+    done = 0
+    while inflight:
+        done_futs, inflight = concurrent.futures.wait(
+            inflight, return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        for fut in done_futs:
+            done += 1
+            try:
+                obj, combo_ret = fut.result()
+            except Exception:
+                obj, combo_ret = math.inf, None
+
+            if combo_ret is not None and obj < best_obj:
+                best_obj, best_combo = obj, combo_ret
+
+            # keep pipeline full
+            submit_next()
+
+
+This avoids:
+
+writing temp params files per combo
+
+passing the block json repeatedly as a huge argument per task
+
+Notes that matter for correctness/performance
+Deterministic varList ordering
+
+In C++ above I used sorted key order for jsonBlock keys because nlohmann::json iterates object keys in sorted order by default. This matches typical existing C++ behavior and prevents mismatch with how varList[i] maps to keys.
+
+If your existing C++ uses nlohmann::ordered_json (insertion order), tell me and I’ll adjust the selection helper to use insertion order instead; then your Python UI should keep insertion order too (it already does).
+
+Remaining bottleneck
+
+After removing file IO, the next big cost for huge sweeps is ProcessPoolExecutor overhead per combination. If combinations explode, the best next step is chunking (each worker evaluates many varLists per call). I can give a chunked version too, but the above is the minimal “no file IO” change you asked for.
+
+
+
+
+
+
+
+
+
