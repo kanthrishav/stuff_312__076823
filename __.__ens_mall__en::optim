@@ -1,0 +1,785 @@
+Below is a complete, fast, and extensible way to add optimizer strategy selection for:
+
+DE (already)
+
+SA (ensmallen)
+
+CNE (ensmallen)
+
+PSO (ensmallen)
+
+SPSA (ensmallen)
+
+ADAM (ensmallen, but needs a gradient interface → we’ll add a very fast SPSA-gradient wrapper)
+
+GA (not a first-class ensmallen “arbitrary function” optimizer in the official docs, so the cleanest path is: implement a small real-coded GA in your codebase, with the same callback/history semantics as DE/CNE/PSO)
+
+I’m also making the selection extremely fast by parsing the JSON once into an OptimizerId enum and using a switch (no string compares in hot paths).
+
+All constructor parameter sequences below follow the ensmallen docs:
+
+DE constructor signature: DE(popSize, maxIterations, crossoverRate, differentialWeight, tolerance)
+
+CNE constructor signature: CNE(populationSize, maxGenerations, mutationProb, selectPercent, tolerance)
+
+PSO constructor signature: PSO(numParticles, maxIterations, lowerBound, upperBound, inertiaWeight, cognitiveCoeff, socialCoeff, tolerance)
+
+SA constructors/attributes (ExponentialSchedule default; full parameter list shown):
+
+SPSA constructor signature: SPSA(alpha, gamma, stepSize, evaluationStepSize, maxIterations, tolerance)
+
+Adam constructors/attributes (for differentiable separable functions):
+
+1) Optimizer control JSON (exhaustive, constructor-order)
+
+Even though JSON objects are unordered by spec, keep this human order (constructor argument order) exactly as below.
+
+"common_pars": {
+  "seed": 5305,
+
+  // "maxiter" or "target_objective"
+  "stopping_criteria": "maxiter",
+
+  // used only when stopping_criteria == "target_objective"
+  "stopping_criteria_value": 0.001
+},
+
+"optimizers": {
+  "DE": {
+    "switch": true,
+
+    // ens::DE(popSize, maxIterations, crossoverRate, differentialWeight, tolerance)
+    "popSize": 40,
+    "maxIterations": 3000,
+    "crossoverRate": 0.6,
+    "differentialWeight": 0.8,
+
+    // used as tolerance only if stopping_criteria == "target_objective" (else -1)
+    "tolerance": 1e-5
+  },
+
+  "SA": {
+    "switch": false,
+
+    // Choose cooling schedule type (we will implement ExponentialSchedule only first)
+    "coolingSchedule": {
+      "type": "ExponentialSchedule",
+      "lambda": 0.001
+    },
+
+    // ens::SA<>(coolingSchedule, maxIterations, initT, initMoves, moveCtrlSweep,
+    //           tolerance, maxToleranceSweep, maxMoveCoef, initMoveCoef, gain)
+    "maxIterations": 1000000,
+    "initT": 10000.0,
+    "initMoves": 1000,
+    "moveCtrlSweep": 100,
+    "tolerance": 1e-5,
+    "maxToleranceSweep": 3,
+    "maxMoveCoef": 20.0,
+    "initMoveCoef": 0.3,
+    "gain": 0.3
+  },
+
+  "CNE": {
+    "switch": false,
+
+    // ens::CNE(populationSize, maxGenerations, mutationProb, selectPercent, tolerance)
+    "populationSize": 500,
+    "maxGenerations": 2000,
+    "mutationProb": 0.01,
+    "selectPercent": 0.2,
+    "tolerance": 1e-5
+  },
+
+  "PSO": {
+    "switch": false,
+
+    // ens::PSO(numParticles, maxIterations, lowerBound, upperBound,
+    //          inertiaWeight, cognitiveCoeff, socialCoeff, tolerance)
+
+    "numParticles": 500,
+    "maxIterations": 2000,
+
+    // bounds are REQUIRED by ens::PSO (arma::vec). We’ll build from canvas if omitted.
+    // Shape: [2*n] for (x0,y0,x1,y1,...)
+    "lowerBound": [],
+    "upperBound": [],
+
+    "inertiaWeight": 0.5,
+    "cognitiveCoeff": 1.0,
+    "socialCoeff": 1.0,
+    "tolerance": 1e-5
+  },
+
+  "SPSA": {
+    "switch": false,
+
+    // ens::SPSA(alpha, gamma, stepSize, evaluationStepSize, maxIterations, tolerance)
+    "alpha": 0.602,
+    "gamma": 0.101,
+    "stepSize": 0.16,
+    "evaluationStepSize": 0.3,
+    "maxIterations": 100000,
+    "tolerance": 1e-5
+  },
+
+  "ADAM": {
+    "switch": false,
+
+    // ens::Adam(stepSize, batchSize, beta1, beta2, eps, maxIterations, tolerance, shuffle, resetPolicy, exactObjective)
+    "stepSize": 0.001,
+    "batchSize": 1,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "eps": 1e-8,
+    "maxIterations": 20000,
+    "tolerance": 1e-5,
+    "shuffle": false,
+    "resetPolicy": true,
+    "exactObjective": false,
+
+    // REQUIRED in *your* use-case (non-smooth objective): gradient provider
+    // Fastest option: SPSA gradient estimator inside Gradient()
+    "gradProvider": {
+      "type": "SPSA",
+      "evaluationStepSize": 1e-3
+    }
+  },
+
+  "GA": {
+    "switch": false,
+
+    // (Custom real-coded GA in your code; see implementation below.)
+    "populationSize": 256,
+    "maxGenerations": 2000,
+
+    "eliteFraction": 0.05,
+    "tournamentSize": 3,
+
+    "crossoverRate": 0.9,
+    "blendAlpha": 0.25,
+
+    "mutationRate": 0.2,
+    "mutationSigma": 0.5,
+
+    // bounds: if empty -> derive from canvas like PSO
+    "lowerBound": [],
+    "upperBound": [],
+
+    "tolerance": 1e-5,
+    "stallGenerations": 50
+  }
+}
+
+2) C++ changes (exactly what to add/replace)
+A) OptimizerConfig (REPLACE your current OptimizerConfig)
+
+File: include/data_classes.h (or wherever OptimizerConfig lives)
+REPLACE your current class OptimizerConfig { ... } with:
+
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+enum class OptimizerId : uint8_t { DE, SA, CNE, PSO, SPSA, ADAM, GA };
+
+struct CommonPars {
+  std::uint64_t seed = 0;
+  std::string stopping_criteria = "maxiter";       // "maxiter" | "target_objective"
+  double stopping_criteria_value = 0.0;
+};
+
+struct DEPars {
+  std::size_t popSize = 40;
+  std::size_t maxIterations = 3000;
+  double crossoverRate = 0.6;
+  double differentialWeight = 0.8;
+  double tolerance = 1e-5;
+};
+
+struct SAPars {
+  // only ExponentialSchedule supported initially
+  double cooling_lambda = 0.001;
+
+  std::size_t maxIterations = 1000000;
+  double initT = 10000.0;
+  std::size_t initMoves = 1000;
+  std::size_t moveCtrlSweep = 100;
+  double tolerance = 1e-5;
+  std::size_t maxToleranceSweep = 3;
+  double maxMoveCoef = 20.0;
+  double initMoveCoef = 0.3;
+  double gain = 0.3;
+};
+
+struct CNEPars {
+  std::size_t populationSize = 500;
+  std::size_t maxGenerations = 2000;
+  double mutationProb = 0.01;
+  double selectPercent = 0.2;
+  double tolerance = 1e-5;
+};
+
+struct PSOPars {
+  std::size_t numParticles = 500;
+  std::size_t maxIterations = 2000;
+
+  // length = 2*n (flattened x0,y0,x1,y1...)
+  std::vector<double> lowerBound;
+  std::vector<double> upperBound;
+
+  double inertiaWeight = 0.5;
+  double cognitiveCoeff = 1.0;
+  double socialCoeff = 1.0;
+  double tolerance = 1e-5;
+};
+
+struct SPSAPars {
+  double alpha = 0.602;
+  double gamma = 0.101;
+  double stepSize = 0.16;            // 'a'
+  double evaluationStepSize = 0.3;   // 'c'
+  std::size_t maxIterations = 100000;
+  double tolerance = 1e-5;
+};
+
+struct AdamGradProviderPars {
+  // Only SPSA gradient provider implemented initially.
+  double evaluationStepSize = 1e-3;
+};
+
+struct AdamPars {
+  double stepSize = 0.001;
+  std::size_t batchSize = 1;
+  double beta1 = 0.9;
+  double beta2 = 0.999;
+  double eps = 1e-8;
+  std::size_t maxIterations = 100000;
+  double tolerance = 1e-5;
+  bool shuffle = false;
+  bool resetPolicy = true;
+  bool exactObjective = false;
+
+  AdamGradProviderPars grad;
+};
+
+struct GAPars {
+  std::size_t populationSize = 256;
+  std::size_t maxGenerations = 2000;
+
+  double eliteFraction = 0.05;
+  std::size_t tournamentSize = 3;
+
+  double crossoverRate = 0.9;
+  double blendAlpha = 0.25;
+
+  double mutationRate = 0.2;
+  double mutationSigma = 0.5;
+
+  std::vector<double> lowerBound;
+  std::vector<double> upperBound;
+
+  double tolerance = 1e-5;
+  std::size_t stallGenerations = 50;
+};
+
+struct OptimizerConfig {
+  // selected algorithm (parsed once)
+  OptimizerId id = OptimizerId::DE;
+
+  CommonPars common;
+
+  DEPars de;
+  SAPars sa;
+  CNEPars cne;
+  PSOPars pso;
+  SPSAPars spsa;
+  AdamPars adam;
+  GAPars ga;
+};
+
+B) Callback upgrade: support both StepTaken and GenerationalStepTaken
+
+This makes your metrics/history collection work correctly for population-based optimizers too.
+
+File: wherever IterationCallback is defined (your snippet shows it near Placement).
+
+REPLACE your current IterationCallback with:
+
+class IterationCallback {
+public:
+  IterationCallback()
+    : eval_(nullptr), store_(nullptr),
+      stopping_mode_("maxiter"), stop_value_(0.0), iter_(0) {}
+
+  void init(const LayoutEvaluator* eval,
+            HistoryStore* store,
+            const std::string& stopping_mode,
+            const double stop_value)
+  {
+    eval_ = eval;
+    store_ = store;
+    stopping_mode_ = stopping_mode;
+    stop_value_ = stop_value;
+    iter_ = 0;
+  }
+
+  // Called by many optimizers (single candidate).
+  template<typename OptimizerType, typename FunctionType, typename MatType>
+  bool StepTaken(OptimizerType&, FunctionType&, MatType& coordinates)
+  {
+    const double* xy = coordinates.memptr();
+    Metrics m = eval_->compute_all(xy, iter_);
+    store_->push(coordinates, m);
+    ++iter_;
+    if (stopping_mode_ == "target_objective") return (m.augmented_objective <= stop_value_);
+    return false;
+  }
+
+  // Called by population/generational optimizers.
+  template<typename OptimizerType,
+           typename... FunctionTypes,
+           typename MatType,
+           typename ObjectivesVecType,
+           typename IndicesType>
+  bool GenerationalStepTaken(OptimizerType&,
+                             std::tuple<FunctionTypes...>&,
+                             MatType& coordinates,
+                             ObjectivesVecType& objectives,
+                             IndicesType&)
+  {
+    // We assume single-objective: objectives[0] is a column vector (one value per population member).
+    // Find best member index.
+    std::size_t bestIdx = 0;
+    double bestObj = objectives;
+
+    const auto& obj0 = objectives[0];
+    for (std::size_t i = 1; i < (std::size_t) obj0.n_elem; ++i) {
+      if (obj0(i) < bestObj) { bestObj = obj0(i); bestIdx = i; }
+    }
+
+    // coordinates is typically [dim x popSize]. Best vector is column bestIdx.
+    auto bestCol = coordinates.col(bestIdx); // Armadillo subview (no copy)
+    const double* xy = bestCol.memptr();
+
+    Metrics m = eval_->compute_all(xy, iter_);
+    store_->push(bestCol, m);
+    ++iter_;
+
+    if (stopping_mode_ == "target_objective") return (m.augmented_objective <= stop_value_);
+    return false;
+  }
+
+private:
+  const LayoutEvaluator* eval_;
+  HistoryStore* store_;
+  std::string stopping_mode_;
+  double stop_value_;
+  std::size_t iter_;
+};
+
+C) ADAM wrapper: make your objective look like a separable differentiable function (NumFunctions=1) + SPSA-gradient
+
+This is the key that makes Adam usable without writing an analytic gradient.
+
+INSERT this helper class near LayoutObjective (same .cpp file as Placement::execute() is fine):
+
+class LayoutSeparableSPSA {
+public:
+  explicit LayoutSeparableSPSA(LayoutEvaluator* eval,
+                               const double evalStep)
+    : eval_(eval), c_(evalStep) {}
+
+  // Separable interface.
+  std::size_t NumFunctions() const { return 1; }
+
+  double Evaluate(const arma::mat& x) const {
+    return eval_->evaluate_objective(x);
+  }
+
+  double Evaluate(const std::size_t /*i*/, const arma::mat& x) const {
+    return eval_->evaluate_objective(x);
+  }
+
+  // SPSA gradient estimate: O(1) objective calls (2 calls), independent of dimension.
+  void Gradient(const std::size_t /*i*/, const arma::mat& x, arma::mat& g) const {
+    // Δ in {+1,-1}
+    arma::mat delta = arma::randi<arma::mat>(x.n_rows, x.n_cols, arma::distr_param(0, 1));
+    delta.transform([](arma::uword v) { return (v == 0) ? -1.0 : +1.0; });
+
+    arma::mat x_plus  = x + c_ * delta;
+    arma::mat x_minus = x - c_ * delta;
+
+    const double f_plus  = eval_->evaluate_objective(x_plus);
+    const double f_minus = eval_->evaluate_objective(x_minus);
+
+    const double scale = (f_plus - f_minus) / (2.0 * c_);
+    g.set_size(x.n_rows, x.n_cols);
+    g = scale / delta; // componentwise (since delta is ±1)
+  }
+
+private:
+  LayoutEvaluator* eval_;
+  double c_;
+};
+
+
+This is the fastest practical way to support Adam on your non-smooth objective.
+
+D) GA (custom real-coded GA) — minimal but complete
+
+INSERT this helper class near Placement (same .cpp):
+
+class RealCodedGA {
+public:
+  struct Params {
+    std::size_t populationSize;
+    std::size_t maxGenerations;
+
+    double eliteFraction;
+    std::size_t tournamentSize;
+
+    double crossoverRate;
+    double blendAlpha;
+
+    double mutationRate;
+    double mutationSigma;
+
+    std::vector<double> lowerBound;
+    std::vector<double> upperBound;
+
+    double tolerance;
+    std::size_t stallGenerations;
+  };
+
+  RealCodedGA(LayoutEvaluator* eval, HistoryStore* store, IterationCallback* cb,
+              const Params& p, const std::string& stopMode, double stopValue)
+    : eval_(eval), store_(store), cb_(cb), p_(p), stopMode_(stopMode), stopValue_(stopValue) {}
+
+  void Optimize(arma::mat& x0)
+  {
+    const std::size_t dim = (std::size_t) x0.n_rows;
+
+    // bounds (if empty -> no clamp)
+    const bool hasBounds = (p_.lowerBound.size() == dim && p_.upperBound.size() == dim);
+
+    arma::mat pop(dim, p_.populationSize);
+    arma::vec fit(p_.populationSize);
+
+    // init population around x0 (Gaussian)
+    pop.each_col() = x0;
+    pop += p_.mutationSigma * arma::randn<arma::mat>(dim, p_.populationSize);
+
+    if (hasBounds) clamp(pop);
+
+    evalPop(pop, fit);
+
+    double best = fit.min();
+    std::size_t stall = 0;
+
+    for (std::size_t gen = 0; gen < p_.maxGenerations; ++gen)
+    {
+      // record best-of-generation into HistoryStore via callback semantics
+      const arma::uword bestIdx = fit.index_min();
+      arma::mat bestCol = pop.col(bestIdx);
+      // emulate callback "StepTaken" so your history stays consistent
+      // (this will compute full Metrics and push)
+      if (cb_->StepTaken(*this, *this, bestCol)) { x0 = bestCol; return; }
+
+      if (stopMode_ == "target_objective") {
+        const double obj = eval_->evaluate_objective(bestCol);
+        if (obj <= stopValue_) { x0 = bestCol; return; }
+      }
+
+      // stall detection
+      if (fit(bestIdx) + p_.tolerance < best) { best = fit(bestIdx); stall = 0; }
+      else { ++stall; if (stall >= p_.stallGenerations) { x0 = bestCol; return; } }
+
+      // create next population
+      arma::mat nextPop(dim, p_.populationSize);
+
+      // elitism
+      const std::size_t eliteCount = std::max<std::size_t>(1, (std::size_t) std::floor(p_.eliteFraction * p_.populationSize));
+      arma::uvec sortedIdx = arma::sort_index(fit);
+      for (std::size_t e = 0; e < eliteCount; ++e) nextPop.col(e) = pop.col(sortedIdx(e));
+
+      // fill rest
+      for (std::size_t k = eliteCount; k < p_.populationSize; ++k) {
+        const arma::uword p1 = tournamentSelect(fit);
+        const arma::uword p2 = tournamentSelect(fit);
+
+        arma::vec child = pop.col(p1);
+
+        if (arma::randu() < p_.crossoverRate) {
+          child = blendCrossover(pop.col(p1), pop.col(p2));
+        }
+        if (arma::randu() < p_.mutationRate) {
+          child += p_.mutationSigma * arma::randn<arma::vec>(dim);
+        }
+
+        nextPop.col(k) = child;
+      }
+
+      pop = std::move(nextPop);
+      if (hasBounds) clamp(pop);
+      evalPop(pop, fit);
+    }
+
+    // final best
+    x0 = pop.col(fit.index_min());
+  }
+
+private:
+  void evalPop(const arma::mat& pop, arma::vec& fit)
+  {
+    for (arma::uword i = 0; i < pop.n_cols; ++i) {
+      fit(i) = eval_->evaluate_objective(pop.col(i));
+    }
+  }
+
+  arma::uword tournamentSelect(const arma::vec& fit)
+  {
+    arma::uword best = (arma::uword) (arma::randu() * fit.n_elem);
+    for (std::size_t t = 1; t < p_.tournamentSize; ++t) {
+      arma::uword j = (arma::uword) (arma::randu() * fit.n_elem);
+      if (fit(j) < fit(best)) best = j;
+    }
+    return best;
+  }
+
+  arma::vec blendCrossover(const arma::vec& a, const arma::vec& b)
+  {
+    // BLX-α
+    arma::vec lo = arma::min(a, b);
+    arma::vec hi = arma::max(a, b);
+    arma::vec d  = hi - lo;
+    arma::vec minv = lo - p_.blendAlpha * d;
+    arma::vec maxv = hi + p_.blendAlpha * d;
+    return minv + arma::randu<arma::vec>(a.n_elem) % (maxv - minv);
+  }
+
+  void clamp(arma::mat& pop)
+  {
+    for (arma::uword r = 0; r < pop.n_rows; ++r) {
+      const double lo = p_.lowerBound[(std::size_t) r];
+      const double hi = p_.upperBound[(std::size_t) r];
+      pop.row(r).transform([&](double v){ return std::min(hi, std::max(lo, v)); });
+    }
+  }
+
+private:
+  LayoutEvaluator* eval_;
+  HistoryStore* store_;
+  IterationCallback* cb_;
+  Params p_;
+  std::string stopMode_;
+  double stopValue_;
+};
+
+3) Placement::execute() — implement selection for all optimizers
+
+File: src/placement.cpp (or where Placement::execute() is implemented)
+REPLACE the body of your execute() with this:
+
+#include <ensmallen.hpp>
+
+// ... keep your other includes
+
+void execute()
+{
+  arma::arma_rng::set_seed(static_cast<arma::uword>(cfg_.optimizer.common.seed));
+
+  LayoutObjective obj(&evaluator_);
+  arma::mat x = evaluator_.initial_point();
+
+  IterationCallback cb;
+  cb.init(&evaluator_, &store_,
+          cfg_.optimizer.common.stopping_criteria,
+          cfg_.optimizer.common.stopping_criteria_value);
+
+  Stopwatch sw;
+
+  // tolerance passed to some optimizers is only meaningful for target objective mode
+  const double targetTol =
+    (cfg_.optimizer.common.stopping_criteria == "target_objective")
+      ? cfg_.optimizer.common.stopping_criteria_value
+      : -1.0;
+
+  switch (cfg_.optimizer.id)
+  {
+    case OptimizerId::DE:
+    {
+      const auto& p = cfg_.optimizer.de;
+      ens::DE optimizer(p.popSize, p.maxIterations, p.crossoverRate, p.differentialWeight, targetTol);
+      optimizer.Optimize(obj, x, cb);
+      break;
+    }
+
+    case OptimizerId::SA:
+    {
+      const auto& p = cfg_.optimizer.sa;
+      // ExponentialSchedule(lambda) per docs :contentReference[oaicite:7]{index=7}
+      ens::ExponentialSchedule schedule(p.cooling_lambda);
+      ens::SA<ens::ExponentialSchedule> optimizer(
+        schedule,
+        p.maxIterations,
+        p.initT,
+        p.initMoves,
+        p.moveCtrlSweep,
+        p.tolerance,
+        p.maxToleranceSweep,
+        p.maxMoveCoef,
+        p.initMoveCoef,
+        p.gain
+      );
+      optimizer.Optimize(obj, x, cb);
+      break;
+    }
+
+    case OptimizerId::CNE:
+    {
+      const auto& p = cfg_.optimizer.cne;
+      ens::CNE optimizer(p.populationSize, p.maxGenerations, p.mutationProb, p.selectPercent, p.tolerance);
+      optimizer.Optimize(obj, x, cb);
+      break;
+    }
+
+    case OptimizerId::PSO:
+    {
+      auto p = cfg_.optimizer.pso;
+      const std::size_t dim = (std::size_t) x.n_rows;
+
+      // If bounds omitted, derive from canvas (centers allowed anywhere in [0,W]/[0,H]).
+      if (p.lowerBound.size() != dim || p.upperBound.size() != dim) {
+        p.lowerBound.assign(dim, 0.0);
+        p.upperBound.assign(dim, 0.0);
+        const double W = cfg_.expected.canvas.W();
+        const double H = cfg_.expected.canvas.H();
+        for (std::size_t i = 0; i < dim; i += 2) {
+          p.lowerBound[i]   = 0.0;
+          p.upperBound[i]   = W;
+          p.lowerBound[i+1] = 0.0;
+          p.upperBound[i+1] = H;
+        }
+      }
+
+      arma::vec lb(p.lowerBound);
+      arma::vec ub(p.upperBound);
+
+      ens::PSO optimizer(p.numParticles, p.maxIterations, lb, ub,
+                         p.inertiaWeight, p.cognitiveCoeff, p.socialCoeff, p.tolerance);
+      optimizer.Optimize(obj, x, cb);
+      break;
+    }
+
+    case OptimizerId::SPSA:
+    {
+      const auto& p = cfg_.optimizer.spsa;
+      ens::SPSA optimizer(p.alpha, p.gamma, p.stepSize, p.evaluationStepSize, p.maxIterations, p.tolerance);
+      optimizer.Optimize(obj, x, cb);
+      break;
+    }
+
+    case OptimizerId::ADAM:
+    {
+      // Adam requires differentiable separable interface. We'll provide NumFunctions=1
+      // and SPSA gradient inside Gradient().
+      const auto& p = cfg_.optimizer.adam;
+
+      LayoutSeparableSPSA f(&evaluator_, p.grad.evaluationStepSize);
+
+      ens::Adam optimizer(p.stepSize, p.batchSize, p.beta1, p.beta2, p.eps,
+                          p.maxIterations, p.tolerance, p.shuffle, p.resetPolicy, p.exactObjective);
+
+      // Adam will call Evaluate(i, x) and Gradient(i, x, g) on f.
+      optimizer.Optimize(f, x, cb);
+      break;
+    }
+
+    case OptimizerId::GA:
+    {
+      RealCodedGA::Params gp;
+      const auto& p = cfg_.optimizer.ga;
+
+      gp.populationSize   = p.populationSize;
+      gp.maxGenerations   = p.maxGenerations;
+      gp.eliteFraction    = p.eliteFraction;
+      gp.tournamentSize   = p.tournamentSize;
+      gp.crossoverRate    = p.crossoverRate;
+      gp.blendAlpha       = p.blendAlpha;
+      gp.mutationRate     = p.mutationRate;
+      gp.mutationSigma    = p.mutationSigma;
+      gp.lowerBound       = p.lowerBound;
+      gp.upperBound       = p.upperBound;
+      gp.tolerance        = p.tolerance;
+      gp.stallGenerations = p.stallGenerations;
+
+      // derive bounds if omitted (same approach as PSO)
+      const std::size_t dim = (std::size_t) x.n_rows;
+      if (gp.lowerBound.size() != dim || gp.upperBound.size() != dim) {
+        gp.lowerBound.assign(dim, 0.0);
+        gp.upperBound.assign(dim, 0.0);
+        const double W = cfg_.expected.canvas.W();
+        const double H = cfg_.expected.canvas.H();
+        for (std::size_t i = 0; i < dim; i += 2) {
+          gp.lowerBound[i]   = 0.0;
+          gp.upperBound[i]   = W;
+          gp.lowerBound[i+1] = 0.0;
+          gp.upperBound[i+1] = H;
+        }
+      }
+
+      RealCodedGA ga(&evaluator_, &store_, &cb, gp,
+                     cfg_.optimizer.common.stopping_criteria,
+                     cfg_.optimizer.common.stopping_criteria_value);
+
+      ga.Optimize(x);
+      break;
+    }
+
+    default:
+      throw std::runtime_error("Unsupported optimizer id.");
+  }
+
+  runtime_s_ = sw.Seconds();
+  optimized_ = true;
+}
+
+4) JSON parsing: how to set OptimizerId FAST
+
+Wherever you parse optimizer JSON (likely JsonIO::parse_config()):
+
+Read common_pars into cfg.optimizer.common.
+
+Find exactly one optimizer with "switch": true.
+
+Set cfg.optimizer.id = ... enum.
+
+Parse that optimizer’s parameters into the matching struct.
+
+Important: do the string -> enum mapping once:
+
+static OptimizerId ParseOptimizerId(const std::string& s) {
+  if (s == "DE") return OptimizerId::DE;
+  if (s == "SA") return OptimizerId::SA;
+  if (s == "CNE") return OptimizerId::CNE;
+  if (s == "PSO") return OptimizerId::PSO;
+  if (s == "SPSA") return OptimizerId::SPSA;
+  if (s == "ADAM") return OptimizerId::ADAM;
+  if (s == "GA") return OptimizerId::GA;
+  throw std::runtime_error("Unknown optimizer: " + s);
+}
+
+
+This keeps selection overhead effectively zero.
+
+5) Notes you should not ignore
+ADAM will be “ADAM over SPSA-gradient”
+
+That’s intentional: your objective is piecewise / penalty-based / overlap-based, so a true analytic gradient is non-trivial and likely unstable. The SPSA-gradient inside Gradient() keeps per-step cost constant (2 objective calls) and works well in practice for these objectives.
+
+History semantics
+
+With the upgraded callback, for population optimizers you’ll store best-of-population per generation, which matches your GUI needs (slider over iterations).
