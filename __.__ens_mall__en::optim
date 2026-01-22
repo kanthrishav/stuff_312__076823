@@ -858,3 +858,672 @@ pop_size → optimizers["DE"]["popsize"]
 recombination → optimizers["DE"]["crossover_rate"]
 
 mutation constants → optimizers["DE"]["differential_weight"] (or your chosen mapping)
+
+
+
+
+
+
+
+
+
+
+
+
+
+Below is a drop-in replacement design that satisfies your constraints:
+
+Objective interface stays the same: double LayoutObjective::Evaluate(const arma::mat& x) const
+
+Coordinates stay the same: arma::mat x (2N×1) optimized in-place
+
+Callback stays the same: your IterationCallback::StepTaken(optimizer, obj, x)
+
+Algorithm selection stays extremely fast: parse JSON once → store an enum OptimKind → switch(kind) in execute()
+
+And per your requirement, ADAM and GA come from libraries other than ensmallen:
+
+ADAM (library): libtorch (PyTorch C++ API) — robust Adam update implementation; we provide gradient via SPSA gradient estimator (fast, 2 objective calls per SPSA sample). Libtorch install/build is documented by PyTorch.
+
+GA (library): pagmo2 — we’ll use pagmo::sga as the GA engine and drive it one generation at a time so you get an iteration callback every generation. sga ctor parameters are documented.
+Important license/deps note: pagmo2 is open-source but typically brings Boost + TBB, and its license may matter for your project.
+
+1) JSON: replace GA + ADAM parameter blocks (new schema)
+
+Keep your “switch” approach, but change GA and ADAM params to match the new backends.
+
+"optimizer": {
+  "common_pars": {
+    "seed": 5305,
+    "stopping_criteria": "maxiter",                 // "maxiter" | "target_objective"
+    "stopping_criteria_value": 0.001
+  },
+  "optimizers": {
+    "DE": {
+      "switch": false,
+      "popsize": 40,
+      "maxgen": 3000,
+      "crossover_rate": 0.6,
+      "differential_weight": 0.8
+    },
+
+    "GA": {
+      "switch": true,
+
+      // pagmo::sga parameters (we run gen=1 in a loop for callbacks)
+      "popsize": 80,
+      "maxgen": 3000,
+
+      "cr": 0.90,                 // crossover probability
+      "m": 0.02,                  // mutation probability
+      "param_m": 1.0,             // mutation distribution parameter
+      "param_s": 2,               // selection parameter
+      "selection": "tournament"   // "tournament" or "truncated"
+    },
+
+    "ADAM": {
+      "switch": false,
+
+      // Adam update params (torch::optim::AdamOptions equivalents)
+      "maxiter": 3000,
+      "lr": 0.01,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "eps": 1e-8,
+      "weight_decay": 0.0,
+      "amsgrad": false,
+
+      // REQUIRED for your case (no analytic gradient):
+      "grad_estimator": {
+        "type": "spsa",
+        "samples": 2,              // 1..8 typical
+        "ck0": 0.5,                // initial perturb scale
+        "ck_decay": 0.101,         // ck = ck0 / (k+1)^ck_decay
+        "clip_grad_norm": 0.0      // 0 disables
+      },
+
+      // Optional safety:
+      "project_to_canvas": true
+    },
+
+    "SA": { "switch": false },
+    "CNE": { "switch": false },
+    "PSO": { "switch": false },
+    "SPSA": { "switch": false }
+  }
+}
+
+
+pagmo::sga takes (gen, cr, m, param_m, param_s, selection, seed); we’ll set gen=1 and run a for loop to call your callback every generation.
+
+2) C++ changes (exactly what to change, and where)
+
+You said all classes are split across headers; Placement/Runner are in cpp+header. So the minimal change set is:
+
+A) Replace OptimizerConfig definition (in your data_classes.h or wherever it currently lives)
+
+REPLACE your current OptimizerConfig with this (names chosen to match your new JSON):
+
+// ---- data_classes.h (replace OptimizerConfig) ----
+#pragma once
+#include <cstdint>
+#include <string>
+
+enum class OptimKind : std::uint8_t {
+  DE,
+  GA,
+  ADAM,
+  SA,
+  CNE,
+  PSO,
+  SPSA
+};
+
+struct CommonOptPars {
+  std::uint64_t seed = 0;
+  std::string stopping_criteria = "maxiter";   // "maxiter" | "target_objective"
+  double stopping_value = 0.0;
+};
+
+struct DEPars {
+  std::size_t popsize = 40;
+  std::size_t maxgen  = 1000;
+  double crossover_rate = 0.9;        // your earlier "recombination"
+  double differential_weight = 0.8;   // your earlier "F"
+};
+
+struct GAPars {
+  std::size_t popsize = 80;
+  std::size_t maxgen  = 1000;
+  double cr = 0.90;
+  double m  = 0.02;
+  double param_m = 1.0;
+  unsigned param_s = 2;
+  std::string selection = "tournament"; // "tournament" | "truncated"
+};
+
+struct AdamGradSPSAPars {
+  std::size_t samples = 2;
+  double ck0 = 0.5;
+  double ck_decay = 0.101;
+  double clip_grad_norm = 0.0; // 0 disables
+};
+
+struct AdamPars {
+  std::size_t maxiter = 1000;
+  double lr = 1e-2;
+  double beta1 = 0.9;
+  double beta2 = 0.999;
+  double eps = 1e-8;
+  double weight_decay = 0.0;
+  bool amsgrad = false;
+
+  AdamGradSPSAPars spsa;
+  bool project_to_canvas = true;
+};
+
+struct OptimizerConfig {
+  CommonOptPars common;
+  OptimKind kind = OptimKind::DE;
+
+  DEPars de;
+  GAPars ga;
+  AdamPars adam;
+};
+
+
+This makes selection O(1) at runtime (switch(kind)).
+
+B) Replace optimizer parsing in JsonIO::parse_config(...)
+
+In your JsonIO::parse_config, you currently parse the old "optimizer" object.
+
+REPLACE ONLY the old optimizer parsing block with the following:
+
+// ---- json_io.h / json_io.cpp inside JsonIO::parse_config(...) ----
+static bool as_bool(const nlohmann::json &j) {
+  if (j.is_boolean()) return j.get<bool>();
+  if (j.is_string()) {
+    const auto s = j.get<std::string>();
+    return (s == "true" || s == "True" || s == "1");
+  }
+  if (j.is_number_integer()) return j.get<int>() != 0;
+  return false;
+}
+
+static OptimKind kind_from_key(const std::string &k) {
+  if (k == "DE") return OptimKind::DE;
+  if (k == "GA") return OptimKind::GA;
+  if (k == "ADAM") return OptimKind::ADAM;
+  if (k == "SA") return OptimKind::SA;
+  if (k == "CNE") return OptimKind::CNE;
+  if (k == "PSO") return OptimKind::PSO;
+  if (k == "SPSA") return OptimKind::SPSA;
+  throw std::runtime_error("Unknown optimizer key: " + k);
+}
+
+{
+  const auto &opt = jPars.at("optimizer");
+  const auto &common = opt.at("common_pars");
+  cfg.optimizer.common.seed = common.at("seed").get<std::uint64_t>();
+  cfg.optimizer.common.stopping_criteria = common.at("stopping_criteria").get<std::string>();
+  cfg.optimizer.common.stopping_value = common.at("stopping_criteria_value").get<double>();
+
+  const auto &opts = opt.at("optimizers");
+
+  bool found = false;
+  std::string chosen;
+
+  // Enforce exactly one switch=true
+  for (auto it = opts.begin(); it != opts.end(); ++it) {
+    const auto &node = it.value();
+    if (node.contains("switch") && as_bool(node.at("switch"))) {
+      if (found) throw std::runtime_error("Multiple optimizers have switch=true (already: " + chosen + ", also: " + it.key() + ")");
+      found = true;
+      chosen = it.key();
+    }
+  }
+  if (!found) throw std::runtime_error("No optimizer has switch=true");
+
+  cfg.optimizer.kind = kind_from_key(chosen);
+  const auto &node = opts.at(chosen);
+
+  switch (cfg.optimizer.kind) {
+    case OptimKind::DE: {
+      cfg.optimizer.de.popsize = node.at("popsize").get<std::size_t>();
+      cfg.optimizer.de.maxgen  = node.at("maxgen").get<std::size_t>();
+      cfg.optimizer.de.crossover_rate = node.at("crossover_rate").get<double>();
+      cfg.optimizer.de.differential_weight = node.at("differential_weight").get<double>();
+    } break;
+
+    case OptimKind::GA: {
+      cfg.optimizer.ga.popsize = node.at("popsize").get<std::size_t>();
+      cfg.optimizer.ga.maxgen  = node.at("maxgen").get<std::size_t>();
+      cfg.optimizer.ga.cr = node.at("cr").get<double>();
+      cfg.optimizer.ga.m  = node.at("m").get<double>();
+      cfg.optimizer.ga.param_m = node.at("param_m").get<double>();
+      cfg.optimizer.ga.param_s = node.at("param_s").get<unsigned>();
+      cfg.optimizer.ga.selection = node.at("selection").get<std::string>();
+    } break;
+
+    case OptimKind::ADAM: {
+      cfg.optimizer.adam.maxiter = node.at("maxiter").get<std::size_t>();
+      cfg.optimizer.adam.lr = node.at("lr").get<double>();
+      cfg.optimizer.adam.beta1 = node.at("beta1").get<double>();
+      cfg.optimizer.adam.beta2 = node.at("beta2").get<double>();
+      cfg.optimizer.adam.eps = node.at("eps").get<double>();
+      cfg.optimizer.adam.weight_decay = node.at("weight_decay").get<double>();
+      cfg.optimizer.adam.amsgrad = node.at("amsgrad").get<bool>();
+
+      const auto &g = node.at("grad_estimator");
+      const auto t = g.at("type").get<std::string>();
+      if (t != "spsa") throw std::runtime_error("ADAM.grad_estimator.type supported: spsa only (got " + t + ")");
+      cfg.optimizer.adam.spsa.samples = g.at("samples").get<std::size_t>();
+      cfg.optimizer.adam.spsa.ck0 = g.at("ck0").get<double>();
+      cfg.optimizer.adam.spsa.ck_decay = g.at("ck_decay").get<double>();
+      cfg.optimizer.adam.spsa.clip_grad_norm = g.at("clip_grad_norm").get<double>();
+
+      cfg.optimizer.adam.project_to_canvas = node.value("project_to_canvas", true);
+    } break;
+
+    default:
+      throw std::runtime_error("Optimizer implemented here only for DE/GA/ADAM in this patch");
+  }
+}
+
+C) Add GA wrapper (pagmo2) + ADAM wrapper (libtorch)
+
+Create two new files:
+
+1) include/opt_ga_pagmo.hpp
+#pragma once
+#include <pagmo/algorithms/sga.hpp>
+#include <pagmo/population.hpp>
+#include <pagmo/problem.hpp>
+#include <random>
+#include <vector>
+#include <stdexcept>
+#include <algorithm>
+#include <armadillo>
+
+// Wrap your LayoutObjective (Evaluate(arma::mat)) into a pagmo problem
+struct PagmoLayoutProblem {
+  std::size_t dim;
+  class LayoutObjective *obj;
+  std::vector<double> lb, ub;
+
+  std::vector<double> fitness(const std::vector<double> &dv) const {
+    // zero-copy view over dv
+    arma::mat x_view(const_cast<double*>(dv.data()), dim, 1, /*copy_aux_mem*/ false, /*strict*/ true);
+    const double f = obj->Evaluate(x_view);
+    return { f }; // minimization
+  }
+
+  std::pair<std::vector<double>, std::vector<double>> get_bounds() const {
+    return {lb, ub};
+  }
+};
+
+inline pagmo::sga::selection parse_sga_selection(const std::string &s) {
+  if (s == "tournament") return pagmo::sga::selection::TOURNAMENT;
+  if (s == "truncated")  return pagmo::sga::selection::TRUNCATED;
+  throw std::runtime_error("GA.selection must be 'tournament' or 'truncated' (got '" + s + "')");
+}
+
+// Drive GA one generation at a time, calling your callback every gen.
+template <typename CallbackT>
+inline void OptimizeGA_Pagmo(
+    LayoutObjective &obj,
+    arma::mat &x,                          // 2N x 1 (kept for API compatibility)
+    CallbackT &cb,
+    const std::size_t popsize,
+    const std::size_t maxgen,
+    const double cr,
+    const double m,
+    const double param_m,
+    const unsigned param_s,
+    const std::string &selection_str,
+    const std::uint64_t seed,
+    const std::vector<double> &lb,
+    const std::vector<double> &ub)
+{
+  const std::size_t dim = static_cast<std::size_t>(x.n_rows);
+
+  PagmoLayoutProblem prob{dim, &obj, lb, ub};
+  pagmo::problem p{prob};
+
+  pagmo::population pop(p, popsize, static_cast<unsigned>(seed));
+
+  // We evolve 1 generation per loop to guarantee one callback per generation.
+  pagmo::sga alg(
+      1u,
+      cr,
+      m,
+      param_m,
+      param_s,
+      parse_sga_selection(selection_str),
+      static_cast<unsigned>(seed)
+  );
+
+  for (std::size_t gen = 0; gen < maxgen; ++gen) {
+    pop = alg.evolve(pop);
+
+    // champion_x() is the best solution in the population
+    const auto &champ = pop.champion_x();
+    arma::mat champ_view(const_cast<double*>(champ.data()), dim, 1, false, true);
+
+    // call your callback (stores metrics+coords; supports early stop via target objective)
+    if (cb.StepTaken(alg, obj, champ_view)) {
+      // copy champion into x (optional; keeps the "x is final best" convention)
+      x = champ_view;
+      return;
+    }
+  }
+
+  // final: set x to champion
+  const auto &champ = pop.champion_x();
+  arma::mat champ_view(const_cast<double*>(champ.data()), dim, 1, false, true);
+  x = champ_view;
+}
+
+
+pagmo::sga parameters are taken from its documented constructor.
+
+2) include/opt_adam_torch.hpp
+
+This uses libtorch Adam but computes gradients with SPSA (because you don’t have analytic gradients).
+
+#pragma once
+#include <torch/torch.h>
+#include <armadillo>
+#include <random>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <cstdint>
+
+inline double clampd(double v, double lo, double hi) { return std::min(hi, std::max(lo, v)); }
+
+template <typename CallbackT>
+inline void OptimizeADAM_Torch_SPSA(
+    LayoutObjective &obj,
+    arma::mat &x,                // 2N x 1, updated in-place
+    CallbackT &cb,
+    const std::size_t maxiter,
+    const double lr,
+    const double beta1,
+    const double beta2,
+    const double eps,
+    const double weight_decay,
+    const bool amsgrad,
+    const std::size_t spsa_samples,
+    const double ck0,
+    const double ck_decay,
+    const double clip_grad_norm,
+    const bool project_to_canvas,
+    const double canvas_w,
+    const double canvas_h,
+    const std::uint64_t seed)
+{
+  const std::size_t dim = static_cast<std::size_t>(x.n_rows);
+
+  // Tensor view over Armadillo memory (no copy). Note: x must stay alive.
+  torch::Tensor params = torch::from_blob(
+      x.memptr(),
+      {(long long)dim},
+      torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU)
+  );
+  params.set_requires_grad(true);
+
+  torch::optim::AdamOptions opts(lr);
+  opts.betas(std::make_tuple(beta1, beta2));
+  opts.eps(eps);
+  opts.weight_decay(weight_decay);
+  opts.amsgrad(amsgrad);
+
+  torch::optim::Adam optim({params}, opts);
+
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<int> pm01(0, 1);
+
+  std::vector<double> grad(dim, 0.0);
+  std::vector<int> delta(dim, 1);
+
+  for (std::size_t iter = 0; iter < maxiter; ++iter) {
+    std::fill(grad.begin(), grad.end(), 0.0);
+
+    // ck schedule
+    const double ck = ck0 / std::pow(double(iter + 1), ck_decay);
+
+    // SPSA gradient estimate (averaged)
+    for (std::size_t s = 0; s < spsa_samples; ++s) {
+      for (std::size_t i = 0; i < dim; ++i) delta[i] = pm01(rng) ? 1 : -1;
+
+      // x_plus
+      for (std::size_t i = 0; i < dim; ++i) x(i, 0) += ck * double(delta[i]);
+      if (project_to_canvas) {
+        for (std::size_t k = 0; k < dim/2; ++k) {
+          x(2*k + 0, 0) = clampd(x(2*k + 0, 0), 0.0, canvas_w);
+          x(2*k + 1, 0) = clampd(x(2*k + 1, 0), 0.0, canvas_h);
+        }
+      }
+      const double f_plus = obj.Evaluate(x);
+
+      // x_minus
+      for (std::size_t i = 0; i < dim; ++i) x(i, 0) -= 2.0 * ck * double(delta[i]);
+      if (project_to_canvas) {
+        for (std::size_t k = 0; k < dim/2; ++k) {
+          x(2*k + 0, 0) = clampd(x(2*k + 0, 0), 0.0, canvas_w);
+          x(2*k + 1, 0) = clampd(x(2*k + 1, 0), 0.0, canvas_h);
+        }
+      }
+      const double f_minus = obj.Evaluate(x);
+
+      // restore original x
+      for (std::size_t i = 0; i < dim; ++i) x(i, 0) += ck * double(delta[i]);
+
+      const double scale = (f_plus - f_minus) / (2.0 * ck);
+      for (std::size_t i = 0; i < dim; ++i) {
+        grad[i] += scale * (1.0 / double(delta[i]));
+      }
+    }
+
+    for (auto &g : grad) g /= double(std::max<std::size_t>(1, spsa_samples));
+
+    // optional grad clipping
+    if (clip_grad_norm > 0.0) {
+      double nrm2 = 0.0;
+      for (double g : grad) nrm2 += g*g;
+      const double nrm = std::sqrt(nrm2);
+      if (nrm > clip_grad_norm) {
+        const double k = clip_grad_norm / (nrm + 1e-12);
+        for (auto &g : grad) g *= k;
+      }
+    }
+
+    // set gradient tensor (copy grad -> tensor, small relative to objective eval)
+    torch::Tensor g = torch::empty_like(params);
+    std::memcpy(g.data_ptr<double>(), grad.data(), dim * sizeof(double));
+
+    optim.zero_grad();
+    if (!params.grad().defined()) {
+      params.mutable_grad() = g;
+    } else {
+      params.grad().copy_(g);
+    }
+
+    optim.step(); // updates params -> updates x memory (shared)
+
+    if (project_to_canvas) {
+      for (std::size_t k = 0; k < dim/2; ++k) {
+        x(2*k + 0, 0) = clampd(x(2*k + 0, 0), 0.0, canvas_w);
+        x(2*k + 1, 0) = clampd(x(2*k + 1, 0), 0.0, canvas_h);
+      }
+    }
+
+    // Your callback stores history + checks target objective stop
+    if (cb.StepTaken(optim, obj, x)) return;
+  }
+}
+
+
+This keeps your interface intact and uses Adam from libtorch. The SPSA gradient estimator is what makes Adam workable for your “Evaluate-only” objective.
+
+PyTorch provides libtorch + CMake integration docs.
+
+D) Modify Placement::execute() to switch (DE / GA / ADAM)
+
+In Placement::execute(), you currently do:
+
+if(cfg_.optimizer.algorithm == "DE") { ... ens::DE ... }
+else throw ...
+
+
+REPLACE that selection with:
+
+#include "opt_ga_pagmo.hpp"
+#include "opt_adam_torch.hpp"
+
+void execute() {
+  arma::arma_rng::set_seed(static_cast<arma::uword>(cfg_.optimizer.common.seed));
+
+  LayoutObjective obj(&evaluator_);
+  arma::mat x = evaluator_.initial_point();
+
+  IterationCallback cb;
+  cb.init(&evaluator_, &store_, cfg_.optimizer.common.stopping_criteria, cfg_.optimizer.common.stopping_value);
+
+  Stopwatch sw;
+
+  const double canvas_w = cfg_.expected.canvas.W();
+  const double canvas_h = cfg_.expected.canvas.H();
+
+  switch (cfg_.optimizer.kind) {
+
+    case OptimKind::DE: {
+      // keep your current ensmallen DE path (fast and working)
+      const double F = cfg_.optimizer.de.differential_weight;
+      const double tol = (cfg_.optimizer.common.stopping_criteria == "target_objective")
+                           ? cfg_.optimizer.common.stopping_value : -1.0;
+
+      ens::DE optimizer(cfg_.optimizer.de.popsize,
+                        cfg_.optimizer.de.maxgen,
+                        cfg_.optimizer.de.crossover_rate,
+                        F,
+                        tol);
+      optimizer.Optimize(obj, x, cb);
+    } break;
+
+    case OptimKind::GA: {
+      // bounds: center positions within canvas
+      const std::size_t dim = static_cast<std::size_t>(x.n_rows);
+      std::vector<double> lb(dim, 0.0), ub(dim, 0.0);
+      for (std::size_t i = 0; i < dim/2; ++i) {
+        lb[2*i + 0] = 0.0; ub[2*i + 0] = canvas_w;
+        lb[2*i + 1] = 0.0; ub[2*i + 1] = canvas_h;
+      }
+
+      OptimizeGA_Pagmo(cb ? obj : obj, x, cb,
+        cfg_.optimizer.ga.popsize,
+        cfg_.optimizer.ga.maxgen,
+        cfg_.optimizer.ga.cr,
+        cfg_.optimizer.ga.m,
+        cfg_.optimizer.ga.param_m,
+        cfg_.optimizer.ga.param_s,
+        cfg_.optimizer.ga.selection,
+        cfg_.optimizer.common.seed,
+        lb, ub
+      );
+    } break;
+
+    case OptimKind::ADAM: {
+      OptimizeADAM_Torch_SPSA(
+        obj, x, cb,
+        cfg_.optimizer.adam.maxiter,
+        cfg_.optimizer.adam.lr,
+        cfg_.optimizer.adam.beta1,
+        cfg_.optimizer.adam.beta2,
+        cfg_.optimizer.adam.eps,
+        cfg_.optimizer.adam.weight_decay,
+        cfg_.optimizer.adam.amsgrad,
+        cfg_.optimizer.adam.spsa.samples,
+        cfg_.optimizer.adam.spsa.ck0,
+        cfg_.optimizer.adam.spsa.ck_decay,
+        cfg_.optimizer.adam.spsa.clip_grad_norm,
+        cfg_.optimizer.adam.project_to_canvas,
+        canvas_w, canvas_h,
+        cfg_.optimizer.common.seed
+      );
+    } break;
+
+    default:
+      throw std::runtime_error("Optimizer kind not implemented in this patch");
+  }
+
+  runtime_s_ = sw.Seconds();
+  optimized_ = true;
+}
+
+
+(You can remove that odd cb ? obj : obj—it’s just a placeholder; keep OptimizeGA_Pagmo(obj, x, cb, ...).)
+
+3) Build + install + CMake changes
+A) libtorch (PyTorch C++ API) install/build
+
+Use PyTorch’s official “libtorch + CMake” instructions (download the correct libtorch ZIP for your platform; set CMAKE_PREFIX_PATH or Torch_DIR; link against ${TORCH_LIBRARIES}).
+
+CMake additions (inside your root CMakeLists.txt, near the other find_package calls):
+
+option(USE_TORCH_ADAM "Enable libtorch-backed ADAM optimizer" ON)
+
+if(USE_TORCH_ADAM)
+  find_package(Torch REQUIRED) # Torch_DIR or CMAKE_PREFIX_PATH must point to libtorch
+  target_link_libraries(placement_engine_lib PUBLIC ${TORCH_LIBRARIES})
+  target_compile_definitions(placement_engine_lib PUBLIC USE_TORCH_ADAM=1)
+endif()
+
+
+Windows note: libtorch DLLs must be on PATH or copied next to your exe/module (PyTorch docs mention this).
+
+B) pagmo2 (GA engine) install/build
+
+Pagmo2 is CMake-based and typically depends on Boost and TBB.
+You can integrate via your package manager (recommended) or FetchContent.
+
+CMake (FetchContent approach):
+
+option(USE_PAGMO_GA "Enable pagmo2-backed GA optimizer" ON)
+
+if(USE_PAGMO_GA)
+  include(FetchContent)
+  FetchContent_Declare(
+    pagmo
+    GIT_REPOSITORY https://github.com/esa/pagmo2.git
+    GIT_TAG v2.19.0  # example; pick what you actually install
+  )
+  FetchContent_MakeAvailable(pagmo)
+
+  target_link_libraries(placement_engine_lib PUBLIC pagmo)
+  target_compile_definitions(placement_engine_lib PUBLIC USE_PAGMO_GA=1)
+endif()
+
+
+If you prefer vcpkg/conan, install Boost/TBB as required and point CMake at them (pagmo2 docs / recipes spell out deps).
+
+4) Why this will be “extremely fast” in your architecture
+
+Runtime optimizer selection is a single switch(enum) (no string compares inside the loop).
+
+Your callback is invoked exactly once per iteration/generation, and history is stored in your existing HistoryStore (same as DE).
+
+ADAM update is fast; the dominant cost is gradient estimation. SPSA keeps it at 2 objective calls per SPSA sample per iteration (not O(dim) like finite-diff). That’s the only realistic way to make Adam viable for your objective without rewriting it for autodiff.
+
+5) One critical reality check (so you don’t chase ghosts)
+
+Even with “fast Adam”, if you set:
+
+samples = 1..2, Adam will be very fast but noisier.
+
+samples = 4..8, it will be more stable but slower.
+
+Your objective itself is not smooth (min/max/overlap penalties), so Adam will never behave like it does for smooth ML loss functions. With SPSA it can still work well, but GA/DE will usually be more robust for this kind of landscape.
