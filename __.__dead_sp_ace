@@ -1,336 +1,536 @@
-Below is an extremely fast dead-space segmentation approach that matches what you described and keeps the hot path (compute_all()) lean:
+Below is a zero-latency design for the optimizer hot-path and a fast on-demand polygon extractor for Panel/Bokeh.
 
-We define an outer envelope inside the bounding box using a single x-sweep:
+Key design choice to keep your 10 ms / 10k iterations intact:
 
-At each x-interval, take top(x)=max(top_i) and bottom(x)=min(bottom_i) among blocks intersecting that x.
+compute_all() computes only the scalar dead-space areas A and B using an O(n + R) run-length envelope method (no polygon tracing, no BFS, no allocations).
 
-The envelope area is: AreaB = ∫ (top(x) − bottom(x)) dx
+Polygon coordinates for Area A and Area B are computed on-demand for a chosen iteration (slider), using a small uniform grid at a configurable step size dead_cell_size_ (this is your finite-step control variable).
+
+This satisfies:
+
+Dead-space scalars available in compute_all() and Metrics
+
+Dead-space polygons accessible via pybind (like bbox)
+
+No heavy branching/selection inside compute_all()
+
+Scalable to 1000 blocks (hot-path is linear; polygon path scales with grid cells, not blocks)
+
+Algorithm (fast + scalable)
+Definitions
+
+BBox: axis-aligned bounding box of all blocks.
+
+Outer envelope (row-span hull) at resolution dead_cell_size_:
+
+For each grid row (y-slab), compute:
+
+min_col[row] = min block-left column among blocks intersecting this row
+
+max_col[row] = max block-right column among blocks intersecting this row
+
+Envelope row segment is [min_col[row], max_col[row]] (if any block intersects the row).
+
+This envelope is extremely fast to compute because it is just range updates while scanning blocks.
+
+Dead-space areas
+
+Let:
+
+bbox_row_width_cells = bx1 - bx0 + 1
+
+env_row_width_cells = max_col[row] - min_col[row] + 1 for rows with blocks
+
+cell_area = dead_cell_size_^2
 
 Then:
 
-AreaA = bbox_area − AreaB (space between bbox and outer envelope)
+Area A (“between bbox and envelope”)
+For each row within bbox rows:
 
-If no overlap (or overlap is below a tiny epsilon), union area ≈ sum of block areas (constant), so:
+If envelope exists: A_cells += bbox_row_width_cells - env_row_width_cells
 
-DeadB = AreaB − total_block_area
+Else: A_cells += bbox_row_width_cells
+AreaA = A_cells * cell_area
 
-DeadA = AreaA (by definition envelope excludes that region)
+Envelope area: Env_cells += env_row_width_cells → EnvArea = Env_cells * cell_area
 
-Preventing “tradeoff vs overlap”
+Area B (“inside envelope but not occupied by blocks”)
+When overlaps are negligible: union area ≈ sum(block areas) = total_rect_area_
+AreaB = max(0, EnvArea - total_rect_area_)
 
-To ensure deadspace never fights the overlap constraint:
+Overlap gating (no trade-off with overlap)
 
-Compute and use the deadspace only when overlap is essentially zero.
+Dead-space constraint is applied only when:
 
-When overlap > eps: set AreaA/AreaB/DeadA/DeadB to 0 (or keep them as bbox defaults), and do not add any deadspace penalty.
+overlap_metric <= deadspace_overlap_threshold_
 
-This gives you a “two-phase” behavior: first remove overlap, then compact.
+Else:
 
-CHANGE 1 — Add new Metrics fields (REPLACE)
+AreaA = 0, AreaB = 0
 
-Find your class Metrics{ ... } and replace it with this (same names kept, just adding fields).
+polygon outputs are empty
 
-REPLACE this entire block:
+dead-space penalty is 0
+
+This removes overlap↔deadspace tradeoff entirely: overlap must be solved first.
+
+Polygons (on-demand)
+
+When slider requests polygons for iteration k:
+
+Build envelope mask from row segments (grid).
+
+Build block occupancy mask by rasterizing block rectangles into grid cells.
+
+Build:
+
+A_mask = bbox_mask & ~envelope_mask
+
+B_mask = envelope_mask & ~block_mask (only if overlap below threshold)
+
+Convert each mask into boundary polygons using boundary-edge stitching (very fast on small grids).
+
+Finite-step control: dead_cell_size_ controls polygon fidelity vs speed.
+
+C++ CHANGES (exact replace/insert)
+
+I’ll reference your pasted code exactly and give precise REPLACE / INSERT BETWEEN instructions.
+
+CHANGE 1 — Extend Metrics to include dead-space scalars
+REPLACE this entire class Metrics{ ... } block:
 class Metrics{
-    Metrics() : bbox_area(0.0), bbox_aspect(0.0), hpwl(0.0), overlap(0.0), boundary_violation(0.0), aspect_ratio_violation(0.0), augmented_objective(0.0), bbox_cx(0.0), bbox_cy(0.0), bbox_w(0.0), bbox_h(0.0), iteration_index(0) {}
+	Metrics() : bbox_area(0.0), bbox_aspect(0.0), hpwl(0.0), overlap(0.0), boundary_violation(0.0), aspect_ratio_violation(0.0), augmented_objective(0.0), bbox_cx(0.0), bbox_cy(0.0), bbox_w(0.0), bbox_h(0.0), iteration_index(0) {}
 
-    double bbox_area;
-    double bbox_aspect;
-    double hpwl;
-    double overlap;
-    double boundary_violation;
-    double aspect_ratio_violation;
-    double augmented_objective;
-    double bbox_cx, bbox_cy, bbox_w, bbox_h;
-    std::size_t iteration_index;
+	double bbox_area;
+	double bbox_aspect;
+	double hpwl;
+	double overlap;
+	double boundary_violation;
+	double aspect_ratio_violation;
+	double augmented_objective;
+	double bbox_cx, bbox_cy, bbox_w, bbox_h;
+	std::size_t iteration_index;
 };
 
 WITH this exact block:
 class Metrics{
 public:
-    Metrics()
-    : bbox_area(0.0), bbox_aspect(0.0), hpwl(0.0),
-      overlap(0.0), boundary_violation(0.0), aspect_ratio_violation(0.0),
-      augmented_objective(0.0),
-      bbox_cx(0.0), bbox_cy(0.0), bbox_w(0.0), bbox_h(0.0),
-      // dead-space segmentation
-      area_A(0.0), area_B(0.0), dead_A(0.0), dead_B(0.0),
-      iteration_index(0)
-    {}
+	Metrics()
+	: bbox_area(0.0),
+	  bbox_aspect(0.0),
+	  hpwl(0.0),
+	  overlap(0.0),
+	  boundary_violation(0.0),
+	  aspect_ratio_violation(0.0),
+	  deadspace_A(0.0),
+	  deadspace_B(0.0),
+	  augmented_objective(0.0),
+	  bbox_cx(0.0), bbox_cy(0.0), bbox_w(0.0), bbox_h(0.0),
+	  iteration_index(0)
+	{}
 
-    double bbox_area;
-    double bbox_aspect;
-    double hpwl;
+	double bbox_area;
+	double bbox_aspect;
+	double hpwl;
 
-    double overlap;
-    double boundary_violation;
-    double aspect_ratio_violation;
+	// constraint metrics
+	double overlap;
+	double boundary_violation;
+	double aspect_ratio_violation;
 
-    double augmented_objective;
+	// dead space metrics
+	double deadspace_A; // Area A
+	double deadspace_B; // Area B (the one you want to reduce)
 
-    double bbox_cx, bbox_cy, bbox_w, bbox_h;
+	double augmented_objective;
 
-    // --- Dead-space segmentation ---
-    // Area A: bbox_area - AreaB (between bbox and outer envelope)
-    // Area B: outer envelope area (∫ (top(x)-bottom(x)) dx)
-    // DeadA: AreaA (empty by definition)
-    // DeadB: AreaB - sum(block areas)  (only valid when overlap ~ 0)
-    double area_A, area_B;
-    double dead_A, dead_B;
+	// bbox info
+	double bbox_cx, bbox_cy, bbox_w, bbox_h;
 
-    std::size_t iteration_index;
+	std::size_t iteration_index;
 };
 
-CHANGE 2 — Add a fast DeadSpaceSegmenter class (INSERT)
-INSERT the following code immediately ABOVE:
-class LayoutEvaluator{
+CHANGE 2 — Add a new constraint config for dead-space (optional but recommended)
+In class LayoutConfig, INSERT one line.
 
-INSERT this exact code:
-class DeadSpaceSegmenter
+Find this exact block:
+
+	ConstraintConfig overlap_c;
+	ConstraintConfig aspect_c;
+	ConstraintConfig boundary_c;
+
+INSERT immediately BELOW ConstraintConfig boundary_c;:
+	ConstraintConfig deadspace_c; // uses deadspace_B as metric (gated by overlap threshold)
+
+CHANGE 3 — Add dead-space parameters (threshold + step size) to ExpectedParams
+REPLACE this block:
+class ExpectedParams{
+public:
+	ExpectedParams() : output_file("out.json"), overlap_buffer(0.0), aspect_ratio(1.0), num_threads_(1), canvas(0.0, 0.0) {}
+	std::string output_file;
+	double overlap_buffer;
+	double aspect_ratio;
+	std::size_t num_threads_;
+	Canvas canvas;
+};
+
+WITH this exact block:
+class ExpectedParams{
+public:
+	ExpectedParams()
+	: output_file("out.json"),
+	  overlap_buffer(0.0),
+	  aspect_ratio(1.0),
+	  num_threads_(1),
+	  canvas(0.0, 0.0),
+	  deadspace_overlap_threshold(1e-12), // only apply deadspace when overlap <= this
+	  deadspace_cell_size(0.0)            // 0 => auto (use cs_hint)
+	{}
+
+	std::string output_file;
+	double overlap_buffer;
+	double aspect_ratio;
+	std::size_t num_threads_;
+	Canvas canvas;
+
+	// Deadspace controls (finite-step method step size = deadspace_cell_size)
+	double deadspace_overlap_threshold;
+	double deadspace_cell_size;
+};
+
+
+✅ deadspace_cell_size is your finite-step control variable (Requirement #9).
+
+CHANGE 4 — Parse deadspace config keys in JsonIO::parse_config
+4A) Fix aspect norm/agg parsing (you already had this bug earlier)
+
+Find:
+
+cfg.overlap_c = parse_constraint(con.at("overlap"), true)
+cfg.aspect_c = parse_constraint(con.at("aspect_violation"), true)
+cfg.boundary_c = parse_constraint(con.at("boundary_violation"), true)
+
+REPLACE with:
+cfg.overlap_c  = parse_constraint(con.at("overlap"), true);
+cfg.aspect_c   = parse_constraint(con.at("aspect_violation"), false);
+cfg.boundary_c = parse_constraint(con.at("boundary_violation"), true);
+
+4B) Parse optional deadspace constraint
+
+INSERT this block immediately BELOW the boundary_violation line above:
+
+if (con.contains("deadspace"))
+{
+    cfg.deadspace_c = parse_constraint(con.at("deadspace"), false);
+}
+else
+{
+    cfg.deadspace_c.enabled = false;
+    cfg.deadspace_c.weight = 0.0;
+    cfg.deadspace_c.type = "simple_penalty";
+}
+
+4C) Parse expected_params deadspace keys
+
+Find this code area in parse_config (after you parse canvas/overlap_buffer/aspect_ratio/num_threads etc; you had ...)
+
+Add the following INSERT at the end of parsing expected_params (right after you set cfg.expected.canvas or similar):
+
+INSERT BETWEEN the line:
+
+...
+
+
+and the line:
+
+const json& o = jPars.at("optimizer");
+
+INSERT:
+const json& ep = jPars.at("expected_params");
+if (ep.contains("deadspace_overlap_threshold"))
+    cfg.expected.deadspace_overlap_threshold = ep.at("deadspace_overlap_threshold").get<double>();
+
+if (ep.contains("deadspace_cell_size"))
+    cfg.expected.deadspace_cell_size = ep.at("deadspace_cell_size").get<double>();
+
+CHANGE 5 — Add a fast deadspace calculator class (NEW FILE)
+
+Create a new header:
+
+NEW FILE: include/deadspace_fast.hpp
+#pragma once
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <vector>
+#include <cmath>
+
+class DeadSpaceFast
 {
 public:
-    DeadSpaceSegmenter()
-    : n_(0), active_count_(0), top_(nullptr), bot_(nullptr)
+    DeadSpaceFast()
+    : cell_(1.0), rows_(0), cols_(0), W_(0.0), H_(0.0)
     {}
 
-    void init(const std::size_t n)
+    void init(const double canvas_w, const double canvas_h, const double cell_size)
     {
-        n_ = n;
-        events_.resize(2 * n_);
-        active_.assign(n_, 0);
-        top_heap_.reserve(n_);
-        bot_heap_.reserve(n_);
+        W_ = canvas_w;
+        H_ = canvas_h;
+        cell_ = std::max(1e-9, cell_size);
+        cols_ = static_cast<std::int32_t>(std::ceil(W_ / cell_));
+        rows_ = static_cast<std::int32_t>(std::ceil(H_ / cell_));
+
+        row_min_.assign(rows_, kINF);
+        row_max_.assign(rows_, -1);
     }
 
-    // Computes AreaB = envelope area; AreaA = bbox_area - AreaB; DeadB = AreaB - total_area (only if overlap ~ 0).
-    // Inputs are arrays of rect edges for this iteration.
-    void compute(const double* L, const double* R, const double* B, const double* T,
-                 const double bbox_area,
-                 const double total_rect_area,
-                 const bool allow_deadspace, // typically (overlap <= eps)
-                 double& out_area_A,
-                 double& out_area_B,
-                 double& out_dead_A,
-                 double& out_dead_B)
+    double cell_size() const noexcept { return cell_; }
+
+    // Extremely fast scalar areas only (no polygon extraction here)
+    // Requires:
+    // - bbox (minx,miny,maxx,maxy)
+    // - block rectangles (left,right,bottom,top) from positions
+    // Produces:
+    // - areaA = bbox minus envelope
+    // - areaB = envelope minus sum_block_area (assuming no overlap)
+    template<typename BlockT>
+    void compute_areas_fast(const BlockT* blocks, const std::size_t n,
+                            const double bbox_minx, const double bbox_miny,
+                            const double bbox_maxx, const double bbox_maxy,
+                            const double sum_block_area,
+                            double& outA, double& outB) const
     {
-        // If deadspace is not allowed (e.g. overlap exists), keep it 0 to avoid tradeoff and extra cost.
-        if (!allow_deadspace || n_ == 0)
+        outA = 0.0;
+        outB = 0.0;
+
+        // clamp bbox to canvas
+        const double minx = std::max(0.0, bbox_minx);
+        const double miny = std::max(0.0, bbox_miny);
+        const double maxx = std::min(W_, bbox_maxx);
+        const double maxy = std::min(H_, bbox_maxy);
+
+        if (maxx <= minx || maxy <= miny) return;
+
+        const std::int32_t by0 = clamp_row(miny);
+        const std::int32_t by1 = clamp_row(maxy - 1e-12);
+        const std::int32_t bx0 = clamp_col(minx);
+        const std::int32_t bx1 = clamp_col(maxx - 1e-12);
+
+        if (by1 < by0 || bx1 < bx0) return;
+
+        // Reset only used rows
+        for (std::int32_t r = by0; r <= by1; ++r)
         {
-            out_area_A = 0.0;
-            out_area_B = 0.0;
-            out_dead_A = 0.0;
-            out_dead_B = 0.0;
-            return;
+            row_min_[r] = kINF;
+            row_max_[r] = -1;
         }
 
-        // bind pointers for heap comparisons
-        top_ = T;
-        bot_ = B;
-
-        // Build events (2 per rect)
-        for (std::size_t i = 0; i < n_; ++i)
+        // Build row-span envelope by scanning blocks
+        for (std::size_t i = 0; i < n; ++i)
         {
-            events_[2*i + 0] = Event{ L[i], i, 0 }; // end=0? no, start flag stored separately below
-            events_[2*i + 1] = Event{ R[i], i, 1 };
-            // We'll interpret: kind=0 -> start, kind=1 -> end (and sort end before start at same x)
-            events_[2*i + 0].kind = 0; // start at L
-            events_[2*i + 1].kind = 1; // end at R
-            active_[i] = 0;
-        }
+            const double btm = blocks[i].Bottom();
+            const double top = blocks[i].Top();
+            const double lft = blocks[i].Left();
+            const double rgt = blocks[i].Right();
 
-        // Sort by x; for same x process END before START to implement [L,R) activity.
-        std::sort(events_.begin(), events_.end(),
-                  [](const Event& a, const Event& b)
-                  {
-                      if (a.x < b.x) return true;
-                      if (a.x > b.x) return false;
-                      return a.kind > b.kind; // end(kind=1) before start(kind=0)
-                  });
+            // clamp block to bbox
+            const double cb = std::max(miny, btm);
+            const double ct = std::min(maxy, top);
+            if (ct <= cb) continue;
 
-        // reset heaps
-        top_heap_.clear();
-        bot_heap_.clear();
-        active_count_ = 0;
+            const double cl = std::max(minx, lft);
+            const double cr = std::min(maxx, rgt);
+            if (cr <= cl) continue;
 
-        double envelope_area = 0.0;
+            const std::int32_t r0 = clamp_row(cb);
+            const std::int32_t r1 = clamp_row(ct - 1e-12);
+            const std::int32_t c0 = clamp_col(cl);
+            const std::int32_t c1 = clamp_col(cr - 1e-12);
 
-        std::size_t k = 0;
-        while (k < events_.size())
-        {
-            const double x = events_[k].x;
-
-            // Apply all events at x (end first because of sorting)
-            while (k < events_.size() && events_[k].x == x)
+            for (std::int32_t r = r0; r <= r1; ++r)
             {
-                const std::size_t idx = events_[k].idx;
-                const unsigned char kind = events_[k].kind;
+                row_min_[r] = std::min(row_min_[r], c0);
+                row_max_[r] = std::max(row_max_[r], c1);
+            }
+        }
 
-                if (kind == 1)
+        const std::int32_t bbox_w_cells = (bx1 - bx0 + 1);
+        std::int64_t A_cells = 0;
+        std::int64_t Env_cells = 0;
+
+        for (std::int32_t r = by0; r <= by1; ++r)
+        {
+            if (row_max_[r] >= 0)
+            {
+                const std::int32_t l = std::max(bx0, row_min_[r]);
+                const std::int32_t u = std::min(bx1, row_max_[r]);
+                if (u >= l)
                 {
-                    // END at R: deactivate
-                    if (active_[idx])
-                    {
-                        active_[idx] = 0;
-                        --active_count_;
-                    }
+                    const std::int32_t env_w = (u - l + 1);
+                    Env_cells += env_w;
+                    A_cells += (bbox_w_cells - env_w);
                 }
                 else
                 {
-                    // START at L: activate
-                    if (!active_[idx])
-                    {
-                        active_[idx] = 1;
-                        ++active_count_;
-                        push_top_(idx);
-                        push_bot_(idx);
-                    }
+                    // row had blocks but after clamp none remain
+                    A_cells += bbox_w_cells;
                 }
-                ++k;
             }
-
-            if (k >= events_.size()) break;
-
-            const double next_x = events_[k].x;
-            const double dx = next_x - x;
-
-            if (dx > 0.0 && active_count_ > 0)
+            else
             {
-                // Clean invalid heap tops
-                clean_top_();
-                clean_bot_();
-
-                if (!top_heap_.empty() && !bot_heap_.empty())
-                {
-                    const double topv = top_[top_heap_.front()];
-                    const double botv = bot_[bot_heap_.front()];
-                    const double h = (topv > botv) ? (topv - botv) : 0.0;
-                    envelope_area += dx * h;
-                }
+                // no blocks in this row -> envelope empty -> entire bbox row is Area A
+                A_cells += bbox_w_cells;
             }
         }
 
-        // AreaB is the envelope
-        out_area_B = envelope_area;
+        const double cell_area = cell_ * cell_;
+        const double env_area = static_cast<double>(Env_cells) * cell_area;
+        outA = static_cast<double>(A_cells) * cell_area;
 
-        // AreaA is bbox outside the envelope
-        out_area_A = (bbox_area > envelope_area) ? (bbox_area - envelope_area) : 0.0;
-
-        // Dead space
-        out_dead_A = out_area_A;
-
-        const double deadB = envelope_area - total_rect_area;
-        out_dead_B = (deadB > 0.0) ? deadB : 0.0;
+        // Area B defined only when union area ~ sum_block_area (no overlaps)
+        outB = std::max(0.0, env_area - sum_block_area);
     }
 
 private:
-    class Event
+    static const std::int32_t kINF = 0x3fffffff;
+
+    std::int32_t clamp_row(const double y) const noexcept
     {
-    public:
-        double x;
-        std::size_t idx;
-        unsigned char kind; // 0=start, 1=end
-    };
-
-    std::size_t n_;
-    std::size_t active_count_;
-
-    std::vector<Event> events_;
-    std::vector<unsigned char> active_;
-
-    // heaps store indices; heap order depends on bound top_/bot_ pointers
-    std::vector<std::size_t> top_heap_; // max heap by top_
-    std::vector<std::size_t> bot_heap_; // min heap by bot_ (implemented via comparator)
-
-    const double* top_;
-    const double* bot_;
-
-    void push_top_(const std::size_t idx)
-    {
-        top_heap_.push_back(idx);
-        std::push_heap(top_heap_.begin(), top_heap_.end(),
-                       [this](std::size_t a, std::size_t b)
-                       {
-                           return top_[a] < top_[b]; // max heap
-                       });
+        std::int32_t r = static_cast<std::int32_t>(std::floor(y / cell_));
+        if (r < 0) r = 0;
+        if (r >= rows_) r = rows_ - 1;
+        return r;
     }
 
-    void push_bot_(const std::size_t idx)
+    std::int32_t clamp_col(const double x) const noexcept
     {
-        bot_heap_.push_back(idx);
-        std::push_heap(bot_heap_.begin(), bot_heap_.end(),
-                       [this](std::size_t a, std::size_t b)
-                       {
-                           return bot_[a] > bot_[b]; // min heap
-                       });
+        std::int32_t c = static_cast<std::int32_t>(std::floor(x / cell_));
+        if (c < 0) c = 0;
+        if (c >= cols_) c = cols_ - 1;
+        return c;
     }
 
-    void clean_top_()
-    {
-        while (!top_heap_.empty())
-        {
-            const std::size_t idx = top_heap_.front();
-            if (active_[idx]) break;
-            std::pop_heap(top_heap_.begin(), top_heap_.end(),
-                          [this](std::size_t a, std::size_t b)
-                          {
-                              return top_[a] < top_[b];
-                          });
-            top_heap_.pop_back();
-        }
-    }
+private:
+    double cell_;
+    std::int32_t rows_, cols_;
+    double W_, H_;
 
-    void clean_bot_()
-    {
-        while (!bot_heap_.empty())
-        {
-            const std::size_t idx = bot_heap_.front();
-            if (active_[idx]) break;
-            std::pop_heap(bot_heap_.begin(), bot_heap_.end(),
-                          [this](std::size_t a, std::size_t b)
-                          {
-                              return bot_[a] > bot_[b];
-                          });
-            bot_heap_.pop_back();
-        }
-    }
+    // mutable to allow compute_areas_fast to be const without allocations
+    mutable std::vector<std::int32_t> row_min_;
+    mutable std::vector<std::int32_t> row_max_;
 };
 
-CHANGE 3 — Add preallocated edge arrays + segmenter to LayoutEvaluator (INSERT)
 
-Inside class LayoutEvaluator private section, find this block:
+✅ This is the hot-path deadspace scalar calculator. No polygons. No BFS. No dynamic allocations per call.
 
-mutable std::vector<double> boundary_vals_;
-mutable Metrics last_metrics_;
-mutable OverlapGrid grid_;
-mutable BoundingBox bbox;
-mutable Metrics m;
+CHANGE 6 — Wire deadspace scalars into LayoutEvaluator
+6A) Include the header
 
-INSERT immediately ABOVE mutable std::vector<double> boundary_vals_;:
-// Preallocated rect edges for dead-space (no allocations per iteration)
-mutable std::vector<double> left_;
-mutable std::vector<double> right_;
-mutable std::vector<double> bottom_;
-mutable std::vector<double> top_;
+In the file where LayoutEvaluator is implemented, INSERT:
 
-// Dead-space segmenter (x-sweep outer envelope)
-mutable DeadSpaceSegmenter deadseg_;
+INSERT BELOW your includes (above class definitions):
 
-CHANGE 4 — Initialize dead-space resources in LayoutEvaluator::init() (INSERT)
+#include "deadspace_fast.hpp"
 
-In LayoutEvaluator::init(...), find this exact line:
+6B) Add members to LayoutEvaluator
+
+Find in LayoutEvaluator private section:
+
+	mutable OverlapGrid grid_;
+	mutable BoundingBox bbox;
+	mutable Metrics m;
+};
+
+REPLACE with:
+	mutable OverlapGrid grid_;
+	mutable BoundingBox bbox;
+	mutable Metrics m;
+
+	// Deadspace scalar calculator (hot-path)
+	mutable DeadSpaceFast dead_;
+	double dead_overlap_threshold_;
+};
+
+6C) Initialize in LayoutEvaluator::init
+
+Find this line inside init(...):
+
+const double cs_hint = std::max<double>(1.0, std::min(cfg_.expected.canvas.W(), cfg_.expected.canvas.H())/std::sqrt(std::max<std::size_t>(1,n_)));
+grid_.init(n_, cfg_.expected.canvas, cs_hint);
+
+REPLACE with:
+const double cs_hint =
+    std::max<double>(1.0,
+        std::min(cfg_.expected.canvas.W(), cfg_.expected.canvas.H()) /
+        std::sqrt(std::max<std::size_t>(1, n_)));
 
 grid_.init(n_, cfg_.expected.canvas, cs_hint);
 
+// Deadspace: step size control (finite-step variable)
+const double ds_cell =
+    (cfg_.expected.deadspace_cell_size > 0.0) ? cfg_.expected.deadspace_cell_size : cs_hint;
+
+dead_.init(cfg_.expected.canvas.W(), cfg_.expected.canvas.H(), ds_cell);
+dead_overlap_threshold_ = cfg_.expected.deadspace_overlap_threshold;
+
+CHANGE 7 — Call deadspace in compute_all() and store in Metrics
+
+Inside LayoutEvaluator::compute_all(...) you currently have a comment:
+
+// computation of overlap in the variable overlap_pen
+
+INSERT deadspace call immediately BELOW that line:
+double deadA = 0.0;
+double deadB = 0.0;
+
+// Gate deadspace to avoid overlap tradeoff
+if (overlap_pen <= dead_overlap_threshold_)
+{
+    // bbox already computed by bbox.expand_by_rect(...)
+    dead_.compute_areas_fast(cfg_.blocks.data(), n_,
+                             bbox.MinX(), bbox.MinY(), bbox.MaxX(), bbox.MaxY(),
+                             total_rect_area_,
+                             deadA, deadB);
+}
+else
+{
+    deadA = 0.0;
+    deadB = 0.0;
+}
+
+Add deadspace penalty term (only when overlap is small)
+
+Find your penalty block:
+
+double penalty = 0.0;
+if(cfg_.overlap_c.enabled) penalty += cfg_.overlap_c.weight * overlap_pen * overlap_pen;
+if(cfg_.boundary_c.enabled) penalty += cfg_.boundary_c.weight * boundary_agg * boundary_agg;
+if(cfg_.aspect_c.enabled) penalty += cfg_.aspect_c.weight * aspect_vi * aspect_vi;
+
+REPLACE it with:
+double penalty = 0.0;
+if(cfg_.overlap_c.enabled)   penalty += cfg_.overlap_c.weight   * overlap_pen  * overlap_pen;
+if(cfg_.boundary_c.enabled)  penalty += cfg_.boundary_c.weight  * boundary_agg * boundary_agg;
+if(cfg_.aspect_c.enabled)    penalty += cfg_.aspect_c.weight    * aspect_vi    * aspect_vi;
+
+// Deadspace constraint: ONLY when overlap small (no tradeoff with overlap)
+if (cfg_.deadspace_c.enabled && (overlap_pen <= dead_overlap_threshold_))
+    penalty += cfg_.deadspace_c.weight * deadB * deadB;
+
+Store in metrics
+
+Find:
+
+m.aspect_ratio_violation = aspect_vi;
+
 INSERT immediately BELOW it:
-left_.resize(n_);
-right_.resize(n_);
-bottom_.resize(n_);
-top_.resize(n_);
-deadseg_.init(n_);
+m.deadspace_A = deadA;
+m.deadspace_B = deadB;
 
-CHANGE 5 — Fix a bug in your HPWL extrema update (REPLACE)
+CHANGE 8 — Fix HPWL bug (you still have this in your snippet)
 
-Inside your compute_all() loop you currently have:
+In your loop you have:
 
 max_cx = std::min(max_cx, cx);
 max_cy = std::min(max_cy, cy);
@@ -340,79 +540,623 @@ max_cx = std::max(max_cx, cx);
 max_cy = std::max(max_cy, cy);
 
 
-(Without this, HPWL is wrong and compaction behavior will be unstable.)
+This directly affects your compaction behavior.
 
-CHANGE 6 — Capture edges per block (INSERT)
+Polygons for Area A and B (pybind-accessible, on-demand)
 
-Inside compute_all() loop, right after:
+You requested polygon coordinates accessible like bbox. To preserve optimization speed, we compute polygons only when requested (Panel slider), using the same dead_cell_size_.
 
-cfg_.blocks[i].set_position(x_, y_);
-bbox.expand_by_rect(cfg_.blocks[i]);
+CHANGE 9 — Add deadspace polygon API (NEW FILE)
 
-INSERT immediately BELOW that:
-// cache edges for dead-space segmentation
-left_[i]   = cfg_.blocks[i].Left();
-right_[i]  = cfg_.blocks[i].Right();
-bottom_[i] = cfg_.blocks[i].Bottom();
-top_[i]    = cfg_.blocks[i].Top();
+Create a new file:
 
-CHANGE 7 — Call dead-space computation inside compute_all() (INSERT)
+NEW FILE: include/deadspace_polys.hpp
 
-You must place the call after you have:
+This computes A/B polygons on-demand from a given iteration’s coordinates.
 
-bbox_area computed
+#pragma once
+#include <cstdint>
+#include <vector>
+#include <unordered_map>
+#include <cmath>
+#include <algorithm>
 
-overlap_pen computed (or at least overlap metric)
+class DeadSpacePolys
+{
+public:
+    DeadSpacePolys() : cell_(1.0), W_(0.0), H_(0.0), rows_(0), cols_(0) {}
 
-Find this comment in compute_all():
+    void init(const double canvas_w, const double canvas_h, const double cell_size)
+    {
+        W_ = canvas_w;
+        H_ = canvas_h;
+        cell_ = std::max(1e-9, cell_size);
+        cols_ = (std::int32_t)std::ceil(W_ / cell_);
+        rows_ = (std::int32_t)std::ceil(H_ / cell_);
+    }
 
-// computation of overlap in the variable overlap_pen
+    template<typename BlockT>
+    void compute_polygons_AB(const BlockT* blocks, const std::size_t n,
+                             const double bbox_minx, const double bbox_miny,
+                             const double bbox_maxx, const double bbox_maxy,
+                             std::vector<double>& A_xy, std::vector<std::uint32_t>& A_poly_off,
+                             std::vector<double>& B_xy, std::vector<std::uint32_t>& B_poly_off) const
+    {
+        A_xy.clear(); A_poly_off.clear();
+        B_xy.clear(); B_poly_off.clear();
+
+        const double minx = std::max(0.0, bbox_minx);
+        const double miny = std::max(0.0, bbox_miny);
+        const double maxx = std::min(W_, bbox_maxx);
+        const double maxy = std::min(H_, bbox_maxy);
+        if (maxx <= minx || maxy <= miny) return;
+
+        const std::int32_t by0 = clamp_row(miny);
+        const std::int32_t by1 = clamp_row(maxy - 1e-12);
+        const std::int32_t bx0 = clamp_col(minx);
+        const std::int32_t bx1 = clamp_col(maxx - 1e-12);
+        if (by1 < by0 || bx1 < bx0) return;
+
+        const std::int32_t sub_rows = by1 - by0 + 1;
+        const std::int32_t sub_cols = bx1 - bx0 + 1;
+
+        // Envelope row spans
+        std::vector<std::int32_t> row_min(sub_rows, 0x3fffffff);
+        std::vector<std::int32_t> row_max(sub_rows, -1);
+
+        // Occupancy mask for blocks in bbox region
+        std::vector<std::uint8_t> occ((std::size_t)sub_rows * (std::size_t)sub_cols, 0);
+
+        // Build row spans + occupancy
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const double btm = blocks[i].Bottom();
+            const double top = blocks[i].Top();
+            const double lft = blocks[i].Left();
+            const double rgt = blocks[i].Right();
+
+            const double cb = std::max(miny, btm);
+            const double ct = std::min(maxy, top);
+            if (ct <= cb) continue;
+            const double cl = std::max(minx, lft);
+            const double cr = std::min(maxx, rgt);
+            if (cr <= cl) continue;
+
+            const std::int32_t r0g = clamp_row(cb);
+            const std::int32_t r1g = clamp_row(ct - 1e-12);
+            const std::int32_t c0g = clamp_col(cl);
+            const std::int32_t c1g = clamp_col(cr - 1e-12);
+
+            const std::int32_t r0 = r0g - by0;
+            const std::int32_t r1 = r1g - by0;
+            const std::int32_t c0 = c0g - bx0;
+            const std::int32_t c1 = c1g - bx0;
+
+            for (std::int32_t r = r0; r <= r1; ++r)
+            {
+                row_min[r] = std::min(row_min[r], c0);
+                row_max[r] = std::max(row_max[r], c1);
+
+                // mark occupancy cells (raster)
+                const std::size_t base = (std::size_t)r * (std::size_t)sub_cols;
+                for (std::int32_t c = c0; c <= c1; ++c)
+                    occ[base + (std::size_t)c] = 1;
+            }
+        }
+
+        // Build envelope mask
+        std::vector<std::uint8_t> env((std::size_t)sub_rows * (std::size_t)sub_cols, 0);
+        for (std::int32_t r = 0; r < sub_rows; ++r)
+        {
+            if (row_max[r] >= 0)
+            {
+                const std::int32_t l = std::max(0, row_min[r]);
+                const std::int32_t u = std::min(sub_cols - 1, row_max[r]);
+                const std::size_t base = (std::size_t)r * (std::size_t)sub_cols;
+                for (std::int32_t c = l; c <= u; ++c)
+                    env[base + (std::size_t)c] = 1;
+            }
+        }
+
+        // A_mask = bbox_mask (all subgrid cells are inside bbox) minus envelope
+        std::vector<std::uint8_t> A((std::size_t)sub_rows * (std::size_t)sub_cols, 0);
+        for (std::size_t i = 0; i < A.size(); ++i) A[i] = (env[i] ? 0 : 1);
+
+        // B_mask = envelope minus blocks
+        std::vector<std::uint8_t> B((std::size_t)sub_rows * (std::size_t)sub_cols, 0);
+        for (std::size_t i = 0; i < B.size(); ++i) B[i] = (env[i] && !occ[i]) ? 1 : 0;
+
+        mask_to_polygons(A, sub_rows, sub_cols, bx0, by0, A_xy, A_poly_off);
+        mask_to_polygons(B, sub_rows, sub_cols, bx0, by0, B_xy, B_poly_off);
+    }
+
+private:
+    std::int32_t clamp_row(const double y) const noexcept
+    {
+        std::int32_t r = (std::int32_t)std::floor(y / cell_);
+        if (r < 0) r = 0;
+        if (r >= rows_) r = rows_ - 1;
+        return r;
+    }
+    std::int32_t clamp_col(const double x) const noexcept
+    {
+        std::int32_t c = (std::int32_t)std::floor(x / cell_);
+        if (c < 0) c = 0;
+        if (c >= cols_) c = cols_ - 1;
+        return c;
+    }
+
+    static std::uint64_t vid(const std::uint32_t x, const std::uint32_t y) noexcept
+    {
+        return (std::uint64_t(y) << 32) | std::uint64_t(x);
+    }
+
+    void mask_to_polygons(const std::vector<std::uint8_t>& mask,
+                          const std::int32_t R, const std::int32_t C,
+                          const std::int32_t bx0_global, const std::int32_t by0_global,
+                          std::vector<double>& out_xy,
+                          std::vector<std::uint32_t>& out_poly_off) const
+    {
+        out_poly_off.clear();
+        out_poly_off.push_back(0);
+
+        // boundary edges as directed map start->end
+        std::unordered_map<std::uint64_t, std::uint64_t> next;
+        next.reserve((std::size_t)R * (std::size_t)C * 2);
+
+        auto inside = [&](std::int32_t r, std::int32_t c)->bool{
+            return (r >= 0 && r < R && c >= 0 && c < C) ? (mask[(std::size_t)r*(std::size_t)C + (std::size_t)c] != 0) : false;
+        };
+
+        for (std::int32_t r = 0; r < R; ++r)
+        {
+            for (std::int32_t c = 0; c < C; ++c)
+            {
+                if (!inside(r,c)) continue;
+
+                const std::uint32_t x0 = (std::uint32_t)(c);
+                const std::uint32_t x1 = (std::uint32_t)(c + 1);
+                const std::uint32_t y0 = (std::uint32_t)(r);
+                const std::uint32_t y1 = (std::uint32_t)(r + 1);
+
+                // Clockwise orientation: inside on RIGHT
+                // top neighbor empty -> top edge: (x1,y1)->(x0,y1)
+                if (!inside(r+1, c))
+                    next[vid(x1,y1)] = vid(x0,y1);
+
+                // bottom neighbor empty -> bottom edge: (x0,y0)->(x1,y0)
+                if (!inside(r-1, c))
+                    next[vid(x0,y0)] = vid(x1,y0);
+
+                // left neighbor empty -> left edge: (x0,y0)->(x0,y1)
+                if (!inside(r, c-1))
+                    next[vid(x0,y0)] = vid(x0,y1);
+
+                // right neighbor empty -> right edge: (x1,y1)->(x1,y0)
+                if (!inside(r, c+1))
+                    next[vid(x1,y1)] = vid(x1,y0);
+            }
+        }
+
+        // trace loops
+        std::unordered_map<std::uint64_t, std::uint8_t> used;
+        used.reserve(next.size());
+
+        for (auto& kv : next)
+        {
+            const std::uint64_t start = kv.first;
+            if (used[start]) continue;
+
+            // follow until we return or break
+            std::uint64_t cur = start;
+            const std::uint32_t poly_start = (std::uint32_t)out_xy.size();
+
+            while (true)
+            {
+                used[cur] = 1;
+
+                const std::uint32_t lx = (std::uint32_t)(cur & 0xffffffffu);
+                const std::uint32_t ly = (std::uint32_t)(cur >> 32);
+
+                const double wx = (double)(bx0_global + (std::int32_t)lx) * cell_;
+                const double wy = (double)(by0_global + (std::int32_t)ly) * cell_;
+
+                out_xy.push_back(wx);
+                out_xy.push_back(wy);
+
+                auto it = next.find(cur);
+                if (it == next.end()) break;
+                const std::uint64_t nxt = it->second;
+                cur = nxt;
+
+                if (cur == start) break;
+                if (used[cur]) break;
+            }
+
+            // close polygon by repeating first vertex if at least 3 points
+            const std::uint32_t poly_end = (std::uint32_t)out_xy.size();
+            const std::uint32_t ncoords = poly_end - poly_start;
+            if (ncoords >= 6)
+            {
+                out_xy.push_back(out_xy[poly_start + 0]);
+                out_xy.push_back(out_xy[poly_start + 1]);
+                out_poly_off.push_back((std::uint32_t)out_xy.size());
+            }
+            else
+            {
+                // discard tiny degenerate
+                out_xy.resize(poly_start);
+            }
+        }
+
+        if (out_poly_off.size() == 1)
+            out_poly_off.push_back((std::uint32_t)out_xy.size());
+    }
+
+private:
+    double cell_;
+    double W_, H_;
+    std::int32_t rows_, cols_;
+};
 
 
-Immediately after whatever code computes overlap_pen, you will have something like:
+This is used by pybind getters for polygons.
 
-// computation of overlap in the variable overlap_pen
+CHANGE 10 — Add deadspace polygon getters to Placement (C++)
 
-INSERT immediately BELOW the code that sets overlap_pen:
-// --- Dead-space segmentation (Area A / Area B) ---
-// IMPORTANT: To avoid tradeoff vs overlap, compute deadspace only when overlap is essentially zero.
-const double overlap_eps = 1e-12;
-const bool allow_deadspace = (overlap_pen <= overlap_eps);
+You need access to:
 
-double area_A = 0.0, area_B = 0.0, dead_A = 0.0, dead_B = 0.0;
-deadseg_.compute(left_.data(), right_.data(), bottom_.data(), top_.data(),
-                 bbox_area,
-                 total_rect_area_,
-                 allow_deadspace,
-                 area_A, area_B, dead_A, dead_B);
+iteration coordinates stored in HistoryStore
 
-CHANGE 8 — Store the computed areas in Metrics (INSERT)
+bbox at that iteration (can recompute bbox from coords + block sizes)
 
-Near the end of compute_all(), you already assign:
+overlap metric at that iteration (from stored metrics) to gate polygons
 
-m.aspect_ratio_violation = aspect_vi;
+10A) Add required accessors to HistoryStore
 
-INSERT immediately BELOW that:
-m.area_A = area_A;
-m.area_B = area_B;
-m.dead_A = dead_A;
-m.dead_B = dead_B;
+In class HistoryStore, INSERT these methods in public: section (anywhere after push(...) is fine):
+
+INSERT BELOW:
+
+void push(const arma::mat& x, const Metrics& m){
 
 
-That satisfies: “provide both the areas in compute_all (call must be present here).”
+(and its closing brace)
 
-About adding dead-space to the objective without fighting overlap
+INSERT:
+std::size_t iter_count() const noexcept { return iter_metrics_.size(); }
 
-You didn’t ask to add a new JSON constraint yet, but if you later do, the safe pattern is:
+const Metrics& metrics_at(const std::size_t i) const { return iter_metrics_.at(i); }
 
-if (allow_deadspace)
-    penalty += w_deadspace * dead_B * dead_B;
+// Pointer to 2*n_ doubles (x0,y0,x1,y1,...)
+const double* coords_at(const std::size_t i) const
+{
+    return coords_.data() + (std::size_t)i * (2 * n_);
+}
+
+10B) Add a method in Placement to compute polygons for an iteration
+
+In class Placement, INSERT a public method:
+
+Find:
+
+class Placement{
+public:
+	void load(...)
+
+INSERT immediately BELOW public::
+// Returns polygons for Area A and Area B for a given iteration index.
+// Output format: flat xy array + poly offsets (start indices into xy).
+void deadspace_polygons_at(const std::size_t iter_idx,
+                           std::vector<double>& A_xy, std::vector<std::uint32_t>& A_off,
+                           std::vector<double>& B_xy, std::vector<std::uint32_t>& B_off) const
+{
+    A_xy.clear(); A_off.clear();
+    B_xy.clear(); B_off.clear();
+
+    if (iter_idx >= store_.iter_count()) return;
+
+    const Metrics& m = store_.metrics_at(iter_idx);
+    // gate: if overlap is meaningful, deadspace polygons are meaningless
+    if (m.overlap > evaluator_.dead_overlap_threshold_) return;
+
+    // reconstruct bbox quickly from coords + block sizes
+    BoundingBox bb;
+    bb.reset();
+
+    const double* xy = store_.coords_at(iter_idx);
+    for (std::size_t i = 0; i < cfg_.blocks.size(); ++i)
+    {
+        cfg_.blocks[i].set_position(xy[2*i+0], xy[2*i+1]);
+        bb.expand_by_rect(cfg_.blocks[i]);
+    }
+
+    // On-demand grid polygon extraction
+    evaluator_.compute_deadspace_polygons(bb.MinX(), bb.MinY(), bb.MaxX(), bb.MaxY(),
+                                         A_xy, A_off, B_xy, B_off);
+}
 
 
-This guarantees:
+✅ This requires LayoutEvaluator to expose compute_deadspace_polygons(...) and dead_overlap_threshold_ or an accessor.
 
-overlap removal is always prioritized (dead_B is ignored until overlap is gone),
+CHANGE 11 — Add polygon computation method in LayoutEvaluator (C++)
+11A) Include the polygon header
 
-then compaction is encouraged by reducing “inner holes” (dead_B).
+INSERT include where LayoutEvaluator is implemented:
 
-If you want, share the JSON schema you want for the new constraint, and I’ll give the exact parsing + penalty integration with zero runtime selection overhead (same approach as your other constraints).
+#include "deadspace_polys.hpp"
+
+11B) Add members to LayoutEvaluator
+
+In LayoutEvaluator private section, add:
+
+INSERT BELOW:
+
+mutable DeadSpaceFast dead_;
+double dead_overlap_threshold_;
+
+INSERT:
+mutable DeadSpacePolys dead_polys_;
+
+11C) Initialize in init()
+
+After:
+
+dead_.init(cfg_.expected.canvas.W(), cfg_.expected.canvas.H(), ds_cell);
+dead_overlap_threshold_ = cfg_.expected.deadspace_overlap_threshold;
+
+
+INSERT IMMEDIATELY BELOW:
+
+dead_polys_.init(cfg_.expected.canvas.W(), cfg_.expected.canvas.H(), ds_cell);
+
+11D) Add a public helper method
+
+In class LayoutEvaluator, INSERT this method in public section (after initial_point() is fine):
+
+void compute_deadspace_polygons(const double bbox_minx, const double bbox_miny,
+                                const double bbox_maxx, const double bbox_maxy,
+                                std::vector<double>& A_xy, std::vector<std::uint32_t>& A_off,
+                                std::vector<double>& B_xy, std::vector<std::uint32_t>& B_off) const
+{
+    dead_polys_.compute_polygons_AB(cfg_.blocks.data(), n_,
+                                    bbox_minx, bbox_miny, bbox_maxx, bbox_maxy,
+                                    A_xy, A_off, B_xy, B_off);
+}
+
+double dead_overlap_threshold() const noexcept { return dead_overlap_threshold_; }
+
+
+Now the Placement::deadspace_polygons_at(...) code can call:
+
+evaluator_.dead_overlap_threshold() instead of accessing the member directly.
+If you prefer that, then:
+
+REPLACE in Placement::deadspace_polygons_at:
+if (m.overlap > evaluator_.dead_overlap_threshold_) return;
+
+WITH:
+if (m.overlap > evaluator_.dead_overlap_threshold()) return;
+
+pybind11 interface updates (Metrics + polygon getters)
+
+You didn’t paste your pybind_module.cpp, so I’m giving you the exact bindings to add.
+
+CHANGE 12 — Add bindings (INSERT)
+
+In src/pybind_module.cpp (or your module file), locate where you already bind Placement / History / Metrics accessors.
+
+12A) Add deadspace metrics to your metrics dict / binding
+
+Where you build metrics dict, INSERT:
+
+d["deadspace_A"] = m.deadspace_A;
+d["deadspace_B"] = m.deadspace_B;
+
+12B) Expose deadspace polygon getter
+
+INSERT this binding on the Placement class:
+
+.def("deadspace_polygons_at",
+     [](const Placement& p, std::size_t iter_idx)
+     {
+         std::vector<double> A_xy, B_xy;
+         std::vector<std::uint32_t> A_off, B_off;
+         p.deadspace_polygons_at(iter_idx, A_xy, A_off, B_xy, B_off);
+
+         py::dict out;
+         out["A_xy"] = py::array_t<double>(A_xy.size(), A_xy.data()).attr("copy")();
+         out["A_off"] = py::array_t<std::uint32_t>(A_off.size(), A_off.data()).attr("copy")();
+         out["B_xy"] = py::array_t<double>(B_xy.size(), B_xy.data()).attr("copy")();
+         out["B_off"] = py::array_t<std::uint32_t>(B_off.size(), B_off.data()).attr("copy")();
+         return out;
+     })
+
+
+Note: This copies arrays once per slider event. That’s fine for UI. Your optimization runtime stays untouched.
+
+Python Panel app (plots blocks + bbox + deadspace A/B polygons)
+
+Save as: python/run_panel_deadspace.py
+
+import sys
+from pathlib import Path
+
+import panel as pn
+from bokeh.plotting import figure
+from bokeh.models import ColumnDataSource, Slider, Div
+
+pn.extension()
+
+# Ensure module import works in-place (adjust name to your built module)
+ROOT = Path(__file__).resolve().parents[1]
+BUILD_REL = ROOT / "build" / "Release"
+if BUILD_REL.exists():
+    sys.path.insert(0, str(BUILD_REL))
+
+import placement_engine_py as pe  # <-- change if your module name differs
+
+
+def _flatten_polys(xy, off):
+    """
+    xy: flat [x0,y0,x1,y1,...]
+    off: [start0, start1, ...] offsets into xy (in doubles, not points) - from C++
+    returns xs_list, ys_list for bokeh.patches
+    """
+    xs_list = []
+    ys_list = []
+    if xy is None or off is None or len(off) < 2:
+        return xs_list, ys_list
+
+    for i in range(len(off) - 1):
+        a = int(off[i])
+        b = int(off[i + 1])
+        seg = xy[a:b]
+        if len(seg) < 6:
+            continue
+        xs = seg[0::2].tolist()
+        ys = seg[1::2].tolist()
+        xs_list.append(xs)
+        ys_list.append(ys)
+    return xs_list, ys_list
+
+
+def make_app(jPars_path: str, jBlock_path: str):
+    # Run optimization
+    runner = pe.Runner()
+    runner.set_files(jPars_path, jBlock_path)  # adjust to your API
+    runner.execute()
+    pl = runner.plptr()
+
+    iters = pl.iter_count()
+    n = pl.num_blocks()
+
+    # Canvas
+    cfg = pl.config_dict()  # adjust to your API; else parse json in python
+    canvas_w = float(cfg["expected_params"]["canvas"]["width"])
+    canvas_h = float(cfg["expected_params"]["canvas"]["height"])
+
+    p = figure(
+        title="Blocks + BBox + Deadspace (A and B)",
+        x_range=(0, canvas_w),
+        y_range=(0, canvas_h),
+        width=900,
+        height=700,
+        match_aspect=True,
+        tools="pan,wheel_zoom,reset"
+    )
+
+    # Canvas boundary
+    canvas_src = ColumnDataSource(dict(cx=[canvas_w/2], cy=[canvas_h/2], w=[canvas_w], h=[canvas_h]))
+    p.rect(x="cx", y="cy", width="w", height="h", source=canvas_src, fill_alpha=0.0, line_width=3)
+
+    # Blocks source
+    rect_src = ColumnDataSource(dict(cx=[], cy=[], w=[], h=[]))
+    p.rect(x="cx", y="cy", width="w", height="h", source=rect_src, fill_alpha=0.25, line_width=2)
+
+    # BBox source
+    bbox_src = ColumnDataSource(dict(cx=[0.0], cy=[0.0], w=[0.0], h=[0.0]))
+    p.rect(x="cx", y="cy", width="w", height="h", source=bbox_src, fill_alpha=0.0, line_width=3)
+
+    # Deadspace A polygons (bbox - envelope): draw as patches
+    A_src = ColumnDataSource(dict(xs=[], ys=[]))
+    p.patches(xs="xs", ys="ys", source=A_src, fill_alpha=0.12, line_alpha=0.9)
+
+    # Deadspace B polygons (envelope - blocks): draw as patches
+    B_src = ColumnDataSource(dict(xs=[], ys=[]))
+    p.patches(xs="xs", ys="ys", source=B_src, fill_alpha=0.12, line_alpha=0.9)
+
+    info = Div(text="", width=900)
+
+    slider = Slider(start=0, end=max(0, iters - 1), value=0, step=1, title="Iteration")
+
+    # widths/heights constant
+    W = pl.block_widths()   # list/np array
+    H = pl.block_heights()
+
+    def update(i: int):
+        xy = pl.iter_xy(i)  # flat [x0,y0,x1,y1,...]
+        cx = [float(xy[2*k+0]) for k in range(n)]
+        cy = [float(xy[2*k+1]) for k in range(n)]
+        rect_src.data = dict(cx=cx, cy=cy, w=[float(W[k]) for k in range(n)], h=[float(H[k]) for k in range(n)])
+
+        m = pl.iter_metrics(i)
+        bbox_src.data = dict(cx=[m["bbox_cx"]], cy=[m["bbox_cy"]], w=[m["bbox_w"]], h=[m["bbox_h"]])
+
+        polys = pl.deadspace_polygons_at(i)
+        A_xy = polys["A_xy"]
+        A_off = polys["A_off"]
+        B_xy = polys["B_xy"]
+        B_off = polys["B_off"]
+
+        A_xs, A_ys = _flatten_polys(A_xy, A_off)
+        B_xs, B_ys = _flatten_polys(B_xy, B_off)
+        A_src.data = dict(xs=A_xs, ys=A_ys)
+        B_src.data = dict(xs=B_xs, ys=B_ys)
+
+        info.text = (
+            f"<b>iter={i}</b> | aug={m['augmented_objective']:.6g} | "
+            f"area={m['bbox_area']:.6g} | hpwl={m['hpwl']:.6g} | "
+            f"overlap={m['overlap']:.6g} | boundary={m['boundary_violation']:.6g} | "
+            f"aspect={m['aspect_ratio_violation']:.6g} | "
+            f"deadA={m.get('deadspace_A', 0.0):.6g} | deadB={m.get('deadspace_B', 0.0):.6g}"
+        )
+
+    update(0)
+
+    def _on_change(event):
+        update(int(event.new))
+
+    slider.on_change("value", _on_change)
+
+    return pn.Column(info, slider, p)
+
+
+def _get_args():
+    # panel serve script.py --args jPars.json jBlock.json
+    a = list(pn.state.argv) if pn.state.argv else []
+    if len(a) >= 2:
+        return a[0], a[1]
+    return "jPars.json", "jBlock.json"
+
+
+jpars, jblock = _get_args()
+app = make_app(jpars, jblock)
+app.servable()
+
+
+Run:
+
+panel serve python/run_panel_deadspace.py --show --args jPars.json jBlock.json
+
+Notes about “tight compaction” and objective design
+
+Even with bbox area in objective, you can get “dead corridors” because:
+
+bbox area stops improving once it’s limited by largest block dimension(s)
+
+optimizer has no incentive to reduce internal voids afterward
+
+Your new deadspace_B penalty fixes exactly that by pushing blocks to remove gaps after overlap is gone.
+
+Important: what you get and what you don’t (by design)
+
+✅ Hot-path stays fast:
+
+compute_all() adds a linear scan and a small row loop only.
+
+No polygon extraction in optimizer loop.
+
+✅ UI gets polygons:
+
+computed on-demand for the selected iteration
+
+✅ No overlap vs deadspace tradeoff:
+
+deadspace is strictly gated by overlap threshold
+
+⚠️ Polygon accuracy is grid-based (finite-step):
+
+controlled by expected_params.deadspace_cell_size
+
+smaller cell → more accurate polygons, more work per slider update (not per iteration)
