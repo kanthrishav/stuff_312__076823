@@ -1,0 +1,418 @@
+Below is an extremely fast dead-space segmentation approach that matches what you described and keeps the hot path (compute_all()) lean:
+
+We define an outer envelope inside the bounding box using a single x-sweep:
+
+At each x-interval, take top(x)=max(top_i) and bottom(x)=min(bottom_i) among blocks intersecting that x.
+
+The envelope area is: AreaB = ∫ (top(x) − bottom(x)) dx
+
+Then:
+
+AreaA = bbox_area − AreaB (space between bbox and outer envelope)
+
+If no overlap (or overlap is below a tiny epsilon), union area ≈ sum of block areas (constant), so:
+
+DeadB = AreaB − total_block_area
+
+DeadA = AreaA (by definition envelope excludes that region)
+
+Preventing “tradeoff vs overlap”
+
+To ensure deadspace never fights the overlap constraint:
+
+Compute and use the deadspace only when overlap is essentially zero.
+
+When overlap > eps: set AreaA/AreaB/DeadA/DeadB to 0 (or keep them as bbox defaults), and do not add any deadspace penalty.
+
+This gives you a “two-phase” behavior: first remove overlap, then compact.
+
+CHANGE 1 — Add new Metrics fields (REPLACE)
+
+Find your class Metrics{ ... } and replace it with this (same names kept, just adding fields).
+
+REPLACE this entire block:
+class Metrics{
+    Metrics() : bbox_area(0.0), bbox_aspect(0.0), hpwl(0.0), overlap(0.0), boundary_violation(0.0), aspect_ratio_violation(0.0), augmented_objective(0.0), bbox_cx(0.0), bbox_cy(0.0), bbox_w(0.0), bbox_h(0.0), iteration_index(0) {}
+
+    double bbox_area;
+    double bbox_aspect;
+    double hpwl;
+    double overlap;
+    double boundary_violation;
+    double aspect_ratio_violation;
+    double augmented_objective;
+    double bbox_cx, bbox_cy, bbox_w, bbox_h;
+    std::size_t iteration_index;
+};
+
+WITH this exact block:
+class Metrics{
+public:
+    Metrics()
+    : bbox_area(0.0), bbox_aspect(0.0), hpwl(0.0),
+      overlap(0.0), boundary_violation(0.0), aspect_ratio_violation(0.0),
+      augmented_objective(0.0),
+      bbox_cx(0.0), bbox_cy(0.0), bbox_w(0.0), bbox_h(0.0),
+      // dead-space segmentation
+      area_A(0.0), area_B(0.0), dead_A(0.0), dead_B(0.0),
+      iteration_index(0)
+    {}
+
+    double bbox_area;
+    double bbox_aspect;
+    double hpwl;
+
+    double overlap;
+    double boundary_violation;
+    double aspect_ratio_violation;
+
+    double augmented_objective;
+
+    double bbox_cx, bbox_cy, bbox_w, bbox_h;
+
+    // --- Dead-space segmentation ---
+    // Area A: bbox_area - AreaB (between bbox and outer envelope)
+    // Area B: outer envelope area (∫ (top(x)-bottom(x)) dx)
+    // DeadA: AreaA (empty by definition)
+    // DeadB: AreaB - sum(block areas)  (only valid when overlap ~ 0)
+    double area_A, area_B;
+    double dead_A, dead_B;
+
+    std::size_t iteration_index;
+};
+
+CHANGE 2 — Add a fast DeadSpaceSegmenter class (INSERT)
+INSERT the following code immediately ABOVE:
+class LayoutEvaluator{
+
+INSERT this exact code:
+class DeadSpaceSegmenter
+{
+public:
+    DeadSpaceSegmenter()
+    : n_(0), active_count_(0), top_(nullptr), bot_(nullptr)
+    {}
+
+    void init(const std::size_t n)
+    {
+        n_ = n;
+        events_.resize(2 * n_);
+        active_.assign(n_, 0);
+        top_heap_.reserve(n_);
+        bot_heap_.reserve(n_);
+    }
+
+    // Computes AreaB = envelope area; AreaA = bbox_area - AreaB; DeadB = AreaB - total_area (only if overlap ~ 0).
+    // Inputs are arrays of rect edges for this iteration.
+    void compute(const double* L, const double* R, const double* B, const double* T,
+                 const double bbox_area,
+                 const double total_rect_area,
+                 const bool allow_deadspace, // typically (overlap <= eps)
+                 double& out_area_A,
+                 double& out_area_B,
+                 double& out_dead_A,
+                 double& out_dead_B)
+    {
+        // If deadspace is not allowed (e.g. overlap exists), keep it 0 to avoid tradeoff and extra cost.
+        if (!allow_deadspace || n_ == 0)
+        {
+            out_area_A = 0.0;
+            out_area_B = 0.0;
+            out_dead_A = 0.0;
+            out_dead_B = 0.0;
+            return;
+        }
+
+        // bind pointers for heap comparisons
+        top_ = T;
+        bot_ = B;
+
+        // Build events (2 per rect)
+        for (std::size_t i = 0; i < n_; ++i)
+        {
+            events_[2*i + 0] = Event{ L[i], i, 0 }; // end=0? no, start flag stored separately below
+            events_[2*i + 1] = Event{ R[i], i, 1 };
+            // We'll interpret: kind=0 -> start, kind=1 -> end (and sort end before start at same x)
+            events_[2*i + 0].kind = 0; // start at L
+            events_[2*i + 1].kind = 1; // end at R
+            active_[i] = 0;
+        }
+
+        // Sort by x; for same x process END before START to implement [L,R) activity.
+        std::sort(events_.begin(), events_.end(),
+                  [](const Event& a, const Event& b)
+                  {
+                      if (a.x < b.x) return true;
+                      if (a.x > b.x) return false;
+                      return a.kind > b.kind; // end(kind=1) before start(kind=0)
+                  });
+
+        // reset heaps
+        top_heap_.clear();
+        bot_heap_.clear();
+        active_count_ = 0;
+
+        double envelope_area = 0.0;
+
+        std::size_t k = 0;
+        while (k < events_.size())
+        {
+            const double x = events_[k].x;
+
+            // Apply all events at x (end first because of sorting)
+            while (k < events_.size() && events_[k].x == x)
+            {
+                const std::size_t idx = events_[k].idx;
+                const unsigned char kind = events_[k].kind;
+
+                if (kind == 1)
+                {
+                    // END at R: deactivate
+                    if (active_[idx])
+                    {
+                        active_[idx] = 0;
+                        --active_count_;
+                    }
+                }
+                else
+                {
+                    // START at L: activate
+                    if (!active_[idx])
+                    {
+                        active_[idx] = 1;
+                        ++active_count_;
+                        push_top_(idx);
+                        push_bot_(idx);
+                    }
+                }
+                ++k;
+            }
+
+            if (k >= events_.size()) break;
+
+            const double next_x = events_[k].x;
+            const double dx = next_x - x;
+
+            if (dx > 0.0 && active_count_ > 0)
+            {
+                // Clean invalid heap tops
+                clean_top_();
+                clean_bot_();
+
+                if (!top_heap_.empty() && !bot_heap_.empty())
+                {
+                    const double topv = top_[top_heap_.front()];
+                    const double botv = bot_[bot_heap_.front()];
+                    const double h = (topv > botv) ? (topv - botv) : 0.0;
+                    envelope_area += dx * h;
+                }
+            }
+        }
+
+        // AreaB is the envelope
+        out_area_B = envelope_area;
+
+        // AreaA is bbox outside the envelope
+        out_area_A = (bbox_area > envelope_area) ? (bbox_area - envelope_area) : 0.0;
+
+        // Dead space
+        out_dead_A = out_area_A;
+
+        const double deadB = envelope_area - total_rect_area;
+        out_dead_B = (deadB > 0.0) ? deadB : 0.0;
+    }
+
+private:
+    class Event
+    {
+    public:
+        double x;
+        std::size_t idx;
+        unsigned char kind; // 0=start, 1=end
+    };
+
+    std::size_t n_;
+    std::size_t active_count_;
+
+    std::vector<Event> events_;
+    std::vector<unsigned char> active_;
+
+    // heaps store indices; heap order depends on bound top_/bot_ pointers
+    std::vector<std::size_t> top_heap_; // max heap by top_
+    std::vector<std::size_t> bot_heap_; // min heap by bot_ (implemented via comparator)
+
+    const double* top_;
+    const double* bot_;
+
+    void push_top_(const std::size_t idx)
+    {
+        top_heap_.push_back(idx);
+        std::push_heap(top_heap_.begin(), top_heap_.end(),
+                       [this](std::size_t a, std::size_t b)
+                       {
+                           return top_[a] < top_[b]; // max heap
+                       });
+    }
+
+    void push_bot_(const std::size_t idx)
+    {
+        bot_heap_.push_back(idx);
+        std::push_heap(bot_heap_.begin(), bot_heap_.end(),
+                       [this](std::size_t a, std::size_t b)
+                       {
+                           return bot_[a] > bot_[b]; // min heap
+                       });
+    }
+
+    void clean_top_()
+    {
+        while (!top_heap_.empty())
+        {
+            const std::size_t idx = top_heap_.front();
+            if (active_[idx]) break;
+            std::pop_heap(top_heap_.begin(), top_heap_.end(),
+                          [this](std::size_t a, std::size_t b)
+                          {
+                              return top_[a] < top_[b];
+                          });
+            top_heap_.pop_back();
+        }
+    }
+
+    void clean_bot_()
+    {
+        while (!bot_heap_.empty())
+        {
+            const std::size_t idx = bot_heap_.front();
+            if (active_[idx]) break;
+            std::pop_heap(bot_heap_.begin(), bot_heap_.end(),
+                          [this](std::size_t a, std::size_t b)
+                          {
+                              return bot_[a] > bot_[b];
+                          });
+            bot_heap_.pop_back();
+        }
+    }
+};
+
+CHANGE 3 — Add preallocated edge arrays + segmenter to LayoutEvaluator (INSERT)
+
+Inside class LayoutEvaluator private section, find this block:
+
+mutable std::vector<double> boundary_vals_;
+mutable Metrics last_metrics_;
+mutable OverlapGrid grid_;
+mutable BoundingBox bbox;
+mutable Metrics m;
+
+INSERT immediately ABOVE mutable std::vector<double> boundary_vals_;:
+// Preallocated rect edges for dead-space (no allocations per iteration)
+mutable std::vector<double> left_;
+mutable std::vector<double> right_;
+mutable std::vector<double> bottom_;
+mutable std::vector<double> top_;
+
+// Dead-space segmenter (x-sweep outer envelope)
+mutable DeadSpaceSegmenter deadseg_;
+
+CHANGE 4 — Initialize dead-space resources in LayoutEvaluator::init() (INSERT)
+
+In LayoutEvaluator::init(...), find this exact line:
+
+grid_.init(n_, cfg_.expected.canvas, cs_hint);
+
+INSERT immediately BELOW it:
+left_.resize(n_);
+right_.resize(n_);
+bottom_.resize(n_);
+top_.resize(n_);
+deadseg_.init(n_);
+
+CHANGE 5 — Fix a bug in your HPWL extrema update (REPLACE)
+
+Inside your compute_all() loop you currently have:
+
+max_cx = std::min(max_cx, cx);
+max_cy = std::min(max_cy, cy);
+
+REPLACE those two lines with:
+max_cx = std::max(max_cx, cx);
+max_cy = std::max(max_cy, cy);
+
+
+(Without this, HPWL is wrong and compaction behavior will be unstable.)
+
+CHANGE 6 — Capture edges per block (INSERT)
+
+Inside compute_all() loop, right after:
+
+cfg_.blocks[i].set_position(x_, y_);
+bbox.expand_by_rect(cfg_.blocks[i]);
+
+INSERT immediately BELOW that:
+// cache edges for dead-space segmentation
+left_[i]   = cfg_.blocks[i].Left();
+right_[i]  = cfg_.blocks[i].Right();
+bottom_[i] = cfg_.blocks[i].Bottom();
+top_[i]    = cfg_.blocks[i].Top();
+
+CHANGE 7 — Call dead-space computation inside compute_all() (INSERT)
+
+You must place the call after you have:
+
+bbox_area computed
+
+overlap_pen computed (or at least overlap metric)
+
+Find this comment in compute_all():
+
+// computation of overlap in the variable overlap_pen
+
+
+Immediately after whatever code computes overlap_pen, you will have something like:
+
+// computation of overlap in the variable overlap_pen
+
+INSERT immediately BELOW the code that sets overlap_pen:
+// --- Dead-space segmentation (Area A / Area B) ---
+// IMPORTANT: To avoid tradeoff vs overlap, compute deadspace only when overlap is essentially zero.
+const double overlap_eps = 1e-12;
+const bool allow_deadspace = (overlap_pen <= overlap_eps);
+
+double area_A = 0.0, area_B = 0.0, dead_A = 0.0, dead_B = 0.0;
+deadseg_.compute(left_.data(), right_.data(), bottom_.data(), top_.data(),
+                 bbox_area,
+                 total_rect_area_,
+                 allow_deadspace,
+                 area_A, area_B, dead_A, dead_B);
+
+CHANGE 8 — Store the computed areas in Metrics (INSERT)
+
+Near the end of compute_all(), you already assign:
+
+m.aspect_ratio_violation = aspect_vi;
+
+INSERT immediately BELOW that:
+m.area_A = area_A;
+m.area_B = area_B;
+m.dead_A = dead_A;
+m.dead_B = dead_B;
+
+
+That satisfies: “provide both the areas in compute_all (call must be present here).”
+
+About adding dead-space to the objective without fighting overlap
+
+You didn’t ask to add a new JSON constraint yet, but if you later do, the safe pattern is:
+
+if (allow_deadspace)
+    penalty += w_deadspace * dead_B * dead_B;
+
+
+This guarantees:
+
+overlap removal is always prioritized (dead_B is ignored until overlap is gone),
+
+then compaction is encouraged by reducing “inner holes” (dead_B).
+
+If you want, share the JSON schema you want for the new constraint, and I’ll give the exact parsing + penalty integration with zero runtime selection overhead (same approach as your other constraints).
