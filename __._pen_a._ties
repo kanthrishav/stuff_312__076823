@@ -1,0 +1,207 @@
+Below is a zero-overhead-in-compute_all() way to support 3 penalty types per constraint:
+
+"simple_penalty" → w * v² (what you have now)
+
+"barrier_penalty-exp" → w * (exp(k*v) - 1)
+
+"barrier_penalty-log" → w * log1p(k*v)
+
+✅ Key property: compute_all() does no string compares and no switch.
+Penalty selection is done once during parsing/config init by setting a function pointer inside each ConstraintConfig. In compute_all() it’s just penalty += cfg_.overlap_c.penalty(overlap_pen);.
+
+CHANGE 1 — Replace class ConstraintConfig (adds penalty function pointer + type selection)
+Replace this exact code block:
+class ConstraintConfig{
+public:
+	ConstraintConfig() : enabled(false), weight(0.0), normalization("no norm"), aggregation("sum") {}
+	bool enabled;
+	double weight;
+	std::string normalization;
+	std::string aggregation;
+	std::string type;
+};
+
+With this exact code block:
+class ConstraintConfig{
+public:
+  typedef double (*PenaltyFn)(double v, double w, double k);
+
+  ConstraintConfig()
+  : enabled(false),
+    weight(0.0),
+    normalization("no norm"),
+    aggregation("sum"),
+    type("simple_penalty"),
+    barrier_k(1.0),
+    penalty_fn_(&ConstraintConfig::SimplePenalty)
+  {}
+
+  bool enabled;
+  double weight;                 // parsed from "penalty_weight" (or "weight" fallback)
+  std::string normalization;
+  std::string aggregation;
+  std::string type;              // "simple_penalty" | "barrier_penalty-exp" | "barrier_penalty-log"
+
+  // Optional scaling for barrier penalties (default 1.0). If you don't want it, keep default.
+  double barrier_k;
+
+  // Set once during parsing/init. NEVER call in compute_all().
+  void SetPenaltyType(const std::string& t)
+  {
+    type = t;
+    if (t == "simple_penalty")        penalty_fn_ = &ConstraintConfig::SimplePenalty;
+    else if (t == "barrier_penalty-exp") penalty_fn_ = &ConstraintConfig::BarrierPenaltyExp;
+    else if (t == "barrier_penalty-log") penalty_fn_ = &ConstraintConfig::BarrierPenaltyLog;
+    else throw std::runtime_error("Unknown constraint penalty type: " + t);
+  }
+
+  // Fast: one indirect call, no selection/branching on type inside compute_all().
+  inline double penalty(const double v) const
+  {
+    return penalty_fn_(v, weight, barrier_k);
+  }
+
+private:
+  PenaltyFn penalty_fn_;
+
+  static double SimplePenalty(const double v, const double w, const double /*k*/)
+  {
+    return w * v * v;
+  }
+
+  static double BarrierPenaltyExp(const double v, const double w, const double k)
+  {
+    // 0 at v=0, grows rapidly. Clamp to prevent inf/NaNs.
+    double t = k * v;
+    if (t > 50.0) t = 50.0;
+    return w * (std::exp(t) - 1.0);
+  }
+
+  static double BarrierPenaltyLog(const double v, const double w, const double k)
+  {
+    // 0 at v=0, always finite; slower growth than exp.
+    const double t = std::max(0.0, k * v);
+    return w * std::log1p(t);
+  }
+};
+
+CHANGE 2 — Json parsing: Replace JsonIO::ParseConstraint(...) (proper parsing + penalty type selection)
+
+You didn’t paste your JsonIO code, so I’m giving an exact replace block for the function that parses a constraint node.
+
+Find your existing function that looks like (or is very close to) this:
+static ConstraintConfig ParseConstraint(const json& cnode)
+{
+  ConstraintConfig cc;
+  cc.enabled = ParseBoolString(cnode.at("switch").get<std::string>());
+  cc.weight = cnode.at("weight").get<double>();
+  cc.normalization = cnode.at("normalization").get<std::string>();
+  cc.aggregation = cnode.at("aggregation").get<std::string>();
+  return cc;
+}
+
+Replace that entire function with this exact function:
+static ConstraintConfig ParseConstraint(const json& cnode)
+{
+  ConstraintConfig cc;
+
+  // enabled can come as "enabled" or legacy "switch"
+  if (cnode.contains("enabled"))      cc.enabled = ParseBoolString(cnode.at("enabled").get<std::string>());
+  else if (cnode.contains("switch"))  cc.enabled = ParseBoolString(cnode.at("switch").get<std::string>());
+  else                                cc.enabled = false;
+
+  // penalty weight can come as "penalty_weight" or legacy "weight"
+  if (cnode.contains("penalty_weight")) cc.weight = cnode.at("penalty_weight").get<double>();
+  else if (cnode.contains("weight"))    cc.weight = cnode.at("weight").get<double>();
+  else                                  cc.weight = 0.0;
+
+  if (cnode.contains("normalization")) cc.normalization = cnode.at("normalization").get<std::string>();
+  else                                 cc.normalization = "no norm";
+
+  if (cnode.contains("aggregation"))   cc.aggregation = cnode.at("aggregation").get<std::string>();
+  else                                 cc.aggregation = "sum";
+
+  // penalty type
+  std::string t = "simple_penalty";
+  if (cnode.contains("type")) t = cnode.at("type").get<std::string>();
+  cc.SetPenaltyType(t);
+
+  // optional parameter for barrier scaling
+  if (cnode.contains("barrier_k")) cc.barrier_k = cnode.at("barrier_k").get<double>();
+
+  return cc;
+}
+
+
+✅ This correctly parses your jPars format:
+
+"type" : "simple_penalty",
+"penalty_weight" : 100.0
+
+
+…and supports the two new types.
+
+CHANGE 3 — Replace penalty composition inside LayoutEvaluator::compute_all(...)
+Find this exact block in compute_all():
+double penalty = 0.0;
+if(cfg_.overlap_c.enabled) penalty += cfg_.overlap_c.weight * overlap_pen * overlap_pen;
+if(cfg_.boundary_c.enabled) penalty += cfg_.boundary_c.weight * boundary_agg * boundary_agg;
+if(cfg_.aspect_c.enabled) penalty += cfg_.aspect_c.weight * aspect_vi * aspect_vi;
+
+Replace it with this exact block:
+double penalty = 0.0;
+
+// No selection here. Type is pre-bound via function pointer in ConstraintConfig.
+if (cfg_.overlap_c.enabled)   penalty += cfg_.overlap_c.penalty(overlap_pen);
+if (cfg_.boundary_c.enabled)  penalty += cfg_.boundary_c.penalty(boundary_agg);
+if (cfg_.aspect_c.enabled)    penalty += cfg_.aspect_c.penalty(aspect_vi);
+
+
+That’s the whole point: compute_all() stays fast and clean.
+
+CHANGE 4 — Ensure parsing calls your updated ParseConstraint
+
+Wherever you parse constraints, you should already have something like:
+
+cfg.overlap_c  = ParseConstraint(c.at("overlap"));
+cfg.aspect_c   = ParseConstraint(c.at("aspect_violation"));
+cfg.boundary_c = ParseConstraint(c.at("boundary_violation"));
+
+
+If your current JsonIO uses different names, keep your existing mapping, but ensure each one calls the new ParseConstraint.
+
+No other changes are needed.
+
+How to use in JSON (examples)
+Existing behavior (same as now)
+"type": "simple_penalty"
+
+Exponential barrier
+"type": "barrier_penalty-exp",
+"barrier_k": 2.0
+
+Log barrier (soft barrier)
+"type": "barrier_penalty-log",
+"barrier_k": 5.0
+
+
+If you omit barrier_k, it defaults to 1.0.
+
+Why this meets your “NO overhead / extremely fast” requirement
+
+No string compares, no switch, no std::function, no virtual calls inside compute_all().
+
+Each constraint penalty is exactly one indirect call (3 calls max per evaluation), which is negligible compared to overlap/bbox calculations.
+
+All selection happens once during parsing/config init.
+
+
+
+
+
+
+
+
+
+
+
