@@ -866,6 +866,228 @@ mutation constants → optimizers["DE"]["differential_weight"] (or your chosen m
 
 
 
+You’re right on both counts:
+
+ensmallen Adam will not work unless the function type passed to it provides a compatible Gradient(...) API. Even if it compiles, if the optimizer never calls your IterationCallback or the gradient is wrong, it will look broken.
+
+GA will “look broken” if it doesn’t call your IterationCallback every generation with an arma::mat&, and it must honor your stop criterion.
+
+Below is the exact fix to apply to the code I gave in the previous response:
+
+Do NOT use ensmallen’s Adam at all.
+
+Implement Adam-SPSA manually (2 objective evals per iteration, independent of dimension) and call your callback each iteration.
+
+Keep GA as your custom wrapper, but make it strictly callback-driven and fix the common gotchas (temporary refs, seeding, and optional clamping).
+
+1) Fix ADAM: replace the ensmallen Adam call with a manual Adam-SPSA loop
+Where to change
+
+FILE: the .cpp where Placement::execute() is implemented (the same file you edited for the optimizer switch-case).
+LOCATION: inside Placement::execute() in the section where you currently have:
+
+the struct AdamSeparableObjective { ... } (if you copied it)
+
+case OptimizerKind::ADAM: { ... ens::Adam opt(...); opt.Optimize(...); }
+
+1.1 Remove (or ignore) the AdamSeparableObjective struct
+
+DELETE the whole struct AdamSeparableObjective { ... }; block you added previously.
+
+1.2 Insert a manual Adam-SPSA runner lambda (exact insertion)
+
+INSERT this lambda inside Placement::execute() (right before the switch (cfg_.optimizer.active) line, next to your run_ga lambda):
+
+  // --- ADAM (SPSA-gradient) manual loop ---
+  auto run_adam_spsa = [&](const AdamParams& p) {
+    struct DummyOpt {} dummy;
+
+    const arma::uword dim = x.n_elem;
+    arma::mat m(dim, 1, arma::fill::zeros);
+    arma::mat v(dim, 1, arma::fill::zeros);
+    arma::mat g(dim, 1, arma::fill::zeros);
+
+    // Record initial point as iteration 0 (so plotting always has something).
+    {
+      arma::mat x0 = x; // stable lvalue for callback
+      if (cb.StepTaken(dummy, obj, x0)) { x = x0; return; }
+    }
+
+    for (std::size_t t = 1; t <= p.maxIterations; ++t) {
+      // SPSA-style gradient estimate: 2 evals per iteration
+      const double ck = p.grad_perturb / std::pow(double(t), p.grad_gamma);
+
+      arma::mat delta(dim, 1);
+      delta.randu();
+      delta.transform([](double u) { return (u < 0.5) ? -1.0 : 1.0; });
+
+      arma::mat xp = x + ck * delta;
+      arma::mat xm = x - ck * delta;
+
+      const double fp = obj.Evaluate(xp);
+      const double fm = obj.Evaluate(xm);
+
+      const double scale = (fp - fm) / (2.0 * ck);
+
+      // g(i) = scale / delta(i)  (delta(i) is ±1)
+      for (arma::uword i = 0; i < dim; ++i) g(i, 0) = scale / delta(i, 0);
+
+      if (p.grad_noise > 0.0) {
+        arma::mat n(dim, 1);
+        n.randn();
+        g += p.grad_noise * n;
+      }
+
+      // Adam update
+      m = p.beta1 * m + (1.0 - p.beta1) * g;
+      v = p.beta2 * v + (1.0 - p.beta2) * arma::square(g);
+
+      const double b1t = 1.0 - std::pow(p.beta1, double(t));
+      const double b2t = 1.0 - std::pow(p.beta2, double(t));
+      arma::mat mhat = m / b1t;
+      arma::mat vhat = v / b2t;
+
+      x -= p.stepSize * (mhat / (arma::sqrt(vhat) + p.eps));
+
+      // IMPORTANT: callback each iteration with a stable arma::mat lvalue
+      arma::mat xt = x;
+      const bool stop = cb.StepTaken(dummy, obj, xt);
+      x = xt;
+      if (stop) break;
+
+      // Optional tolerance stop (rarely used; keep it cheap)
+      if (p.tolerance > 0.0) {
+        // if change is tiny, stop
+        if (arma::norm(p.stepSize * (mhat / (arma::sqrt(vhat) + p.eps))) < p.tolerance) break;
+      }
+    }
+  };
+
+
+This is fast (2 objective evals/iter, no O(dim) finite-diff loop) and guarantees your IterationCallback is called each iteration.
+
+1.3 Replace your ADAM switch-case (exact replacement)
+
+Find your current:
+
+case OptimizerKind::ADAM: {
+  const auto& p = cfg_.optimizer.adam;
+  AdamSeparableObjective sobj(&obj);
+  ...
+  ens::Adam opt(...);
+  opt.Optimize(sobj, x, cb);
+  break;
+}
+
+
+REPLACE that entire case with:
+
+case OptimizerKind::ADAM: {
+  run_adam_spsa(cfg_.optimizer.adam);
+  break;
+}
+
+
+That’s it for ADAM.
+
+2) Fix GA: ensure callback, stable arma::mat&, and stop criterion are honored
+
+Your GA wrapper in my earlier message already attempted to call cb.StepTaken(), but the common “looks broken” problems are:
+
+Passing a temporary/subview to StepTaken()
+
+Never recording the initial point
+
+Using clamping/bounds that are wrong for your coordinate scale (e.g., [0,1])
+
+Using inconsistent RNGs (std::rand() vs arma rng)
+
+Below is the exact GA patch.
+
+Where to change
+
+Same file, inside Placement::execute(), in the run_ga lambda.
+
+2.1 Make GA call callback on the initial point (exact insertion)
+
+At the top of your run_ga lambda (before population init or right after), INSERT:
+
+    struct DummyOpt {} dummy;
+
+    // Record initial point as iteration 0.
+    {
+      arma::mat x0 = x;
+      if (cb.StepTaken(dummy, obj, x0)) { x = x0; return; }
+    }
+
+2.2 Ensure StepTaken gets a stable arma::mat lvalue (exact replacement)
+
+Find where you currently do something like:
+
+arma::mat best = pop.col(order(0));
+const bool stop = cb.StepTaken(dummy, obj, best);
+x = best;
+
+
+Keep the idea but make it strictly stable like this:
+
+arma::mat best = pop.col(order(0));   // owning matrix (NOT a subview)
+const bool stop = cb.StepTaken(dummy, obj, best);
+x = best;                             // keep x in sync with best
+if (stop) break;
+
+
+If you were passing pop.col(order(0)) directly into StepTaken(...), STOP—that can bind to a temporary/subview and behave badly. Always pass an owning arma::mat.
+
+2.3 Remove coordinate clamping unless you truly mean it (exact removal)
+
+If your GA has:
+
+clamp01_inplace(child, p.lowerBound, p.upperBound);
+
+
+and/or clamps every candidate, DELETE those clamp calls unless your bounds are correct for your coordinate domain.
+
+For rectangle center coordinates, clamping to [0,1] or [0, some] often makes GA appear “stuck” or “broken”.
+
+So inside GA, do not clamp unless you have correct bounds.
+Minimum patch: remove these lines wherever they occur:
+
+clamp01_inplace(col, ...)
+
+clamp01_inplace(child, ...)
+
+(You can reintroduce bounds later, but only with correct ranges.)
+
+2.4 Remove std::rand() usage (exact replacement)
+
+If you used:
+
+std::rand() % int(p.populationSize)
+
+
+REPLACE with Armadillo RNG (already seeded by arma_rng::set_seed() at the top of execute):
+
+arma::uword idx = arma::randi<arma::uword>(arma::distr_param(0, arma::uword(p.populationSize - 1)));
+
+
+Use this in tournament selection too.
+
+3) Why this fixes “Adam/GA broken” behavior
+
+Adam now truly has a gradient (SPSA-based) and does not rely on ensmallen’s gradient discovery or separable-function machinery.
+
+Callback is called at a controlled cadence (exactly once per iteration / generation), always with an owning arma::mat lvalue, so HistoryStore fills correctly.
+
+Stop criterion is honored because you break immediately if cb.StepTaken(...) returns true.
+
+GA no longer “freezes” due to accidental clamping to an unrealistic domain.
+
+
+
+
+
+
 
 
 
