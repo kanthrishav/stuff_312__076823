@@ -648,3 +648,213 @@ Selection overhead is negligible: config parsing sets OptimizerKind active once;
 Your existing early-stop mechanism still works: IterationCallback terminates only when stopping_criteria == "target_objective" and objective <= value.
 
 Max-iter shouldn’t “random stop” anymore: most premature stops come from tolerance-like termination in optimizers. In the JSON above I defaulted tolerances to 0.0 to avoid convergence-based early termination when you want strict iteration caps.
+
+
+
+
+
+
+
+
+Below are the only pybind_module.cpp changes you need to reflect the new OptimizerConfig (with common_pars, per-optimizer param structs, and active enum). No other parts of your bindings need to change.
+
+1) pybind_module.cpp changes
+Change A — add a tiny enum→string helper (INSERT)
+
+WHERE to insert: right after namespace py = pybind11;
+
+// ---- OptimizerKind -> string (for Python) ----
+static const char* optimizer_kind_to_cstr(OptimizerKind k) noexcept {
+  switch (k) {
+    case OptimizerKind::DE:   return "DE";
+    case OptimizerKind::SA:   return "SA";
+    case OptimizerKind::GA:   return "GA";
+    case OptimizerKind::ADAM: return "ADAM";
+    case OptimizerKind::CNE:  return "CNE";
+    case OptimizerKind::PSO:  return "PSO";
+    case OptimizerKind::SPSA: return "SPSA";
+    default: return "UNKNOWN";
+  }
+}
+
+Change B — update the optimizer_params() binding (REPLACE ONLY that binding)
+
+WHERE to replace: replace your current .def("optimizer_params", [](const Runner& r)->py::dict { ... }) block (the one that returns algorithm, max_iter, pop_size, etc.) with this new one:
+
+// optimizer_params(): return dict (small, cheap) -- updated for new OptimizerConfig schema
+.def("optimizer_params",
+  [](const Runner& r) -> py::dict {
+    const auto& opt = r.placement().config().optimizer;
+
+    py::dict root;
+
+    // active optimizer (already resolved during JSON parse; O(1) selection at runtime)
+    root["active"] = optimizer_kind_to_cstr(opt.active);
+
+    // common_pars
+    py::dict common;
+    common["seed"] = opt.common.seed;
+    common["stopping_criteria"] = opt.common.stopping_criteria;
+    common["stopping_criteria_value"] = opt.common.stopping_criteria_value;
+    root["common_pars"] = common;
+
+    // optimizers (include switches + params; tiny dict, not hot-path)
+    py::dict opts;
+
+    { // DE
+      py::dict d;
+      d["switch"] = opt.de.sw;
+      d["popsize"] = opt.de.popsize;
+      d["maxgen"] = opt.de.maxgen;
+      d["crossover_rate"] = opt.de.crossover_rate;
+      d["differential_weight"] = opt.de.differential_weight;
+      d["tolerance"] = opt.de.tolerance;
+      opts["DE"] = d;
+    }
+    { // SA
+      py::dict d;
+      d["switch"] = opt.sa.sw;
+      d["cooling_lambda"] = opt.sa.cooling_lambda;
+      d["maxIterations"] = opt.sa.maxIterations;
+      d["initT"] = opt.sa.initT;
+      d["initMoves"] = opt.sa.initMoves;
+      d["moveCtrlSweep"] = opt.sa.moveCtrlSweep;
+      d["tolerance"] = opt.sa.tolerance;
+      d["maxToleranceSweep"] = opt.sa.maxToleranceSweep;
+      d["maxMoveCoef"] = opt.sa.maxMoveCoef;
+      d["initMoveCoef"] = opt.sa.initMoveCoef;
+      d["gain"] = opt.sa.gain;
+      opts["SA"] = d;
+    }
+    { // GA
+      py::dict d;
+      d["switch"] = opt.ga.sw;
+      d["populationSize"] = opt.ga.populationSize;
+      d["maxGenerations"] = opt.ga.maxGenerations;
+      d["elitePercent"] = opt.ga.elitePercent;
+      d["tournamentK"] = opt.ga.tournamentK;
+      d["crossoverRate"] = opt.ga.crossoverRate;
+      d["mutationProb"] = opt.ga.mutationProb;
+      d["mutationSigma"] = opt.ga.mutationSigma;
+      d["lowerBound"] = opt.ga.lowerBound;
+      d["upperBound"] = opt.ga.upperBound;
+      opts["GA"] = d;
+    }
+    { // ADAM
+      py::dict d;
+      d["switch"] = opt.adam.sw;
+      d["stepSize"] = opt.adam.stepSize;
+      d["batchSize"] = opt.adam.batchSize;
+      d["beta1"] = opt.adam.beta1;
+      d["beta2"] = opt.adam.beta2;
+      d["eps"] = opt.adam.eps;
+      d["maxIterations"] = opt.adam.maxIterations;
+      d["tolerance"] = opt.adam.tolerance;
+      d["shuffle"] = opt.adam.shuffle;
+
+      // gradient estimator knobs
+      d["grad_perturb"] = opt.adam.grad_perturb;
+      d["grad_noise"] = opt.adam.grad_noise;
+      d["grad_gamma"] = opt.adam.grad_gamma;
+      opts["ADAM"] = d;
+    }
+    { // CNE
+      py::dict d;
+      d["switch"] = opt.cne.sw;
+      d["populationSize"] = opt.cne.populationSize;
+      d["maxGenerations"] = opt.cne.maxGenerations;
+      d["mutationProb"] = opt.cne.mutationProb;
+      d["mutationSize"] = opt.cne.mutationSize;
+      d["selectPercent"] = opt.cne.selectPercent;
+      d["tolerance"] = opt.cne.tolerance;
+      opts["CNE"] = d;
+    }
+    { // PSO
+      py::dict d;
+      d["switch"] = opt.pso.sw;
+      d["numParticles"] = opt.pso.numParticles;
+      d["maxIterations"] = opt.pso.maxIterations;
+      d["inertiaWeight"] = opt.pso.inertiaWeight;
+      d["cognitiveCoefficient"] = opt.pso.cognitiveCoefficient;
+      d["socialCoefficient"] = opt.pso.socialCoefficient;
+      d["maxVelocity"] = opt.pso.maxVelocity;
+      d["lowerBound"] = opt.pso.lowerBound;
+      d["upperBound"] = opt.pso.upperBound;
+      d["tolerance"] = opt.pso.tolerance;
+      opts["PSO"] = d;
+    }
+    { // SPSA
+      py::dict d;
+      d["switch"] = opt.spsa.sw;
+      d["stepSize"] = opt.spsa.stepSize;
+      d["batchSize"] = opt.spsa.batchSize;
+      d["maxIterations"] = opt.spsa.maxIterations;
+      d["tolerance"] = opt.spsa.tolerance;
+      d["alpha"] = opt.spsa.alpha;
+      d["gamma"] = opt.spsa.gamma;
+      d["perturb"] = opt.spsa.perturb;
+      d["noise"] = opt.spsa.noise;
+      opts["SPSA"] = d;
+    }
+
+    root["optimizers"] = opts;
+    return root;
+  },
+  "Optimizer parameters (new schema): {active, common_pars, optimizers{DE,SA,GA,ADAM,CNE,PSO,SPSA}}."
+)
+
+
+That’s it for pybind changes.
+
+2) Impact on your Python interface/scripts
+What changes
+
+Your Python call runner.optimizer_params() still exists, but the returned dict format changes:
+
+Before (old):
+
+p = runner.optimizer_params()
+p["algorithm"]
+p["max_iter"]
+p["pop_size"]
+p["mutation_min"]
+...
+
+
+After (new):
+
+p = runner.optimizer_params()
+
+p["active"]                       # "DE" / "SA" / "GA" / ...
+p["common_pars"]["seed"]
+p["common_pars"]["stopping_criteria"]
+p["common_pars"]["stopping_criteria_value"]
+
+p["optimizers"]["DE"]["switch"]   # bool
+p["optimizers"]["DE"]["popsize"]
+p["optimizers"]["DE"]["maxgen"]
+...
+
+What does NOT change
+
+All your zero-copy arrays stay exactly the same (coords_history(), metrics_history(), widths(), heights(), etc.).
+
+Your execution path in Python stays the same: you still point Runner.jPars_file/jBlock_file (or json-string API) and call execute().
+
+Practical update you must do in your Panel app
+
+Anywhere you read optimizer fields from optimizer_params() (e.g., for UI display), update lookups:
+
+replace p["algorithm"] → p["active"]
+
+replace p["seed"] → p["common_pars"]["seed"]
+
+replace DE params mapping:
+
+max_iter → optimizers["DE"]["maxgen"]
+
+pop_size → optimizers["DE"]["popsize"]
+
+recombination → optimizers["DE"]["crossover_rate"]
+
+mutation constants → optimizers["DE"]["differential_weight"] (or your chosen mapping)
