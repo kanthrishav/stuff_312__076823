@@ -1,0 +1,608 @@
+What you want is a parallel Cartesian sweep over varList (mixed-radix combinations across block variant counts), with:
+
+No shared state between runs (each run uses its own Placement instance/state),
+
+No locks (work distribution via a single atomic counter; each worker writes to its own result slot),
+
+Fast access from Python (zero-copy NumPy views for summary arrays + a way to re-run any chosen combination to get full history through the existing Runner API),
+
+Per-run runtime + error/log message.
+
+There’s one unavoidable reality:
+If you literally have 1000 blocks with up to 50 variants each, the total combinations is astronomically large (50^1000). No system can “run all combinations”. So the API must support:
+
+exhaustive when feasible, else
+
+bounded run count (max_runs) or a sampling/heuristic mode.
+
+Below is a concrete implementation that is still “all combinations” when total_combinations <= max_runs (or when max_runs==0 and total fits a safe bound), but won’t let you accidentally request an impossible sweep.
+
+1) C++: Add a sweep result container (new header)
+NEW FILE: include/sweep_results.h
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+#include <vector>
+#include <string>
+#include <array>
+#include <limits>
+#include <algorithm>
+
+#include "data_classes.h"  // Metrics
+
+class SweepResults {
+public:
+  SweepResults(std::vector<std::size_t> radices, std::uint64_t runs)
+    : radices_(std::move(radices)),
+      combo_index_(runs, 0),
+      runtime_s_(runs, 0.0),
+      best_obj_(runs, std::numeric_limits<double>::infinity()),
+      status_(runs, 0),
+      best_metrics_(runs),
+      msg_(runs) {}
+
+  std::size_t num_blocks() const noexcept { return radices_.size(); }
+  std::uint64_t num_runs() const noexcept { return static_cast<std::uint64_t>(best_obj_.size()); }
+
+  const std::vector<std::size_t>& radices() const noexcept { return radices_; }
+  const std::vector<std::uint64_t>& combo_indices() const noexcept { return combo_index_; }
+  const std::vector<double>& runtimes_s() const noexcept { return runtime_s_; }
+  const std::vector<double>& best_objectives() const noexcept { return best_obj_; }
+  const std::vector<std::uint32_t>& status_codes() const noexcept { return status_; }
+  const std::vector<Metrics>& best_metrics_buffer() const noexcept { return best_metrics_; }
+
+  // 0=OK, 1=ERR
+  void set_ok(std::uint64_t run_i, std::uint64_t combo_i, double rt_s, const Metrics& bm) {
+    combo_index_[run_i] = combo_i;
+    runtime_s_[run_i]   = rt_s;
+    best_obj_[run_i]    = bm.augmented_objective;
+    status_[run_i]      = 0;
+    best_metrics_[run_i]= bm;
+    set_msg_(run_i, "");
+  }
+
+  void set_err(std::uint64_t run_i, std::uint64_t combo_i, const std::string& msg) {
+    combo_index_[run_i] = combo_i;
+    runtime_s_[run_i]   = 0.0;
+    best_obj_[run_i]    = std::numeric_limits<double>::infinity();
+    status_[run_i]      = 1;
+    best_metrics_[run_i]= Metrics{};
+    set_msg_(run_i, msg);
+  }
+
+  std::string message(std::size_t run_i) const {
+    if (run_i >= msg_.size()) return "run_i out of range";
+    const auto& a = msg_[run_i];
+    return std::string(a.data());
+  }
+
+  // Decode mixed-radix combo_index -> varList (size = num_blocks)
+  std::vector<int> decode_varlist(std::uint64_t combo) const {
+    std::vector<int> v(radices_.size(), 0);
+    for (std::size_t i = 0; i < radices_.size(); ++i) {
+      const std::size_t base = radices_[i];
+      if (base == 0) { v[i] = 0; continue; }
+      v[i] = static_cast<int>(combo % static_cast<std::uint64_t>(base));
+      combo /= static_cast<std::uint64_t>(base);
+    }
+    return v;
+  }
+
+  void finalize_best() {
+    best_run_ = 0;
+    best_obj_overall_ = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i < best_obj_.size(); ++i) {
+      if (status_[i] == 0 && best_obj_[i] < best_obj_overall_) {
+        best_obj_overall_ = best_obj_[i];
+        best_run_ = static_cast<std::uint64_t>(i);
+      }
+    }
+  }
+
+  std::uint64_t best_run_index() const noexcept { return best_run_; }
+  std::uint64_t best_combo_index() const noexcept {
+    if (best_run_ >= combo_index_.size()) return 0;
+    return combo_index_[best_run_];
+  }
+  double best_objective() const noexcept { return best_obj_overall_; }
+  Metrics best_overall_metrics() const noexcept {
+    if (best_run_ >= best_metrics_.size()) return Metrics{};
+    return best_metrics_[best_run_];
+  }
+
+private:
+  void set_msg_(std::uint64_t run_i, const std::string& s) {
+    auto& a = msg_[run_i];
+    a.fill('\0');
+    // truncate to fit
+    const std::size_t n = std::min<std::size_t>(a.size() - 1, s.size());
+    std::memcpy(a.data(), s.data(), n);
+    a[n] = '\0';
+  }
+
+  std::vector<std::size_t> radices_;
+
+  std::vector<std::uint64_t> combo_index_;
+  std::vector<double> runtime_s_;
+  std::vector<double> best_obj_;
+  std::vector<std::uint32_t> status_;
+  std::vector<Metrics> best_metrics_;
+  std::vector<std::array<char, 192>> msg_;
+
+  std::uint64_t best_run_{0};
+  double best_obj_overall_{std::numeric_limits<double>::infinity()};
+};
+
+
+Note: this assumes Metrics{} is valid (i.e., Metrics is a struct or a class with a public default constructor). Your working pybind already implies it is.
+
+2) C++: Runner changes (new sweep method + run-by-combo replay)
+
+You asked “all access via Runner only” → perfect: we keep it that way.
+
+FILE: include/runner.h
+INSERT (near the top includes)
+#include <memory>
+#include <cstdint>
+#include "sweep_results.h"
+
+INSERT inside class Runner public: section (after execute() is a good spot)
+  // Run using an explicit varList (no file writes). Uses already-loaded JSONs if present.
+  void execute_with_varlist(const std::vector<int>& varList);
+
+  // Run a specific mixed-radix combo index (decoded using jBlock variant counts).
+  void execute_combo_index(std::uint64_t combo_index);
+
+  // Parallel sweep. If max_runs==0 => try exhaustive (but will refuse if infeasible).
+  std::shared_ptr<SweepResults> sweep_all_combinations(std::size_t max_workers,
+                                                       std::uint64_t max_runs = 0);
+
+  std::shared_ptr<SweepResults> last_sweep() const { return last_sweep_; }
+
+INSERT inside class Runner private: section
+  // Cached JSON for sweep/replay (loaded once)
+  json jPars_cache_;
+  json jBlock_cache_;
+  bool inputs_loaded_{false};
+
+  // Variant count per block key, in the SAME order your parsing expects.
+  std::vector<std::size_t> radices_;
+
+  std::shared_ptr<SweepResults> last_sweep_;
+
+
+If Runner currently doesn’t have json in scope in the header, include your json header (nlohmann/json.hpp) or forward declare your json alias accordingly.
+
+FILE: src/runner.cpp
+INSERT helper(s) at top of file (after includes)
+#include <thread>
+#include <atomic>
+#include <limits>
+#include <stdexcept>
+
+static bool mul_overflow_u64(std::uint64_t a, std::uint64_t b, std::uint64_t& out) {
+  if (a == 0 || b == 0) { out = 0; return false; }
+  if (a > (std::numeric_limits<std::uint64_t>::max() / b)) return true;
+  out = a * b;
+  return false;
+}
+
+static void decode_mixed_radix(std::uint64_t combo,
+                              const std::vector<std::size_t>& radices,
+                              std::vector<int>& varList_out)
+{
+  varList_out.assign(radices.size(), 0);
+  for (std::size_t i = 0; i < radices.size(); ++i) {
+    const std::size_t base = radices[i];
+    if (base == 0) { varList_out[i] = 0; continue; }
+    varList_out[i] = static_cast<int>(combo % static_cast<std::uint64_t>(base));
+    combo /= static_cast<std::uint64_t>(base);
+  }
+}
+
+INSERT a small internal loader inside Runner (or fold into existing execute())
+
+Somewhere in Runner::execute() you already load json from file. We reuse that logic:
+
+void Runner::ensure_inputs_loaded_() {
+  if (inputs_loaded_) return;
+
+  jPars_cache_  = JsonIO::load(jPars_file);
+  jBlock_cache_ = JsonIO::load(jBlock_file);
+
+  // IMPORTANT: this order MUST match the order used by your parse_blocks().
+  // If parse_blocks iterates jBlock.items() in insertion order, this matches.
+  // If parse_blocks sorts keys, you must sort here too.
+  radices_.clear();
+  radices_.reserve(jBlock_cache_.size());
+  for (auto it = jBlock_cache_.begin(); it != jBlock_cache_.end(); ++it) {
+    if (!it.value().is_array()) {
+      throw std::runtime_error("jBlock key '" + it.key() + "' is not an array of variants");
+    }
+    radices_.push_back(it.value().size());
+  }
+
+  inputs_loaded_ = true;
+}
+
+
+If you don’t want a private helper, you can inline this into each new method.
+But the helper keeps it fast: load once.
+
+Now implement the requested methods
+REPLACE your current Runner::execute() body with this (keeps existing behavior)
+void Runner::execute() {
+  ensure_inputs_loaded_();
+
+  // Use varList from jPars
+  std::vector<int> varList = jPars_cache_.at("varList").get<std::vector<int>>();
+
+  // Your current logic:
+  // place.load(jPars, jBlock, varList) or place.load(jPars, jQgen, varList)
+  // Use whatever your working code does.
+  place.load(jPars_cache_, jBlock_cache_, varList);
+  place.execute();
+}
+
+INSERT new execute_with_varlist
+void Runner::execute_with_varlist(const std::vector<int>& varList_in) {
+  ensure_inputs_loaded_();
+  std::vector<int> varList = varList_in;  // your load() takes non-const ref in your code
+  place.load(jPars_cache_, jBlock_cache_, varList);
+  place.execute();
+}
+
+INSERT new execute_combo_index
+void Runner::execute_combo_index(std::uint64_t combo_index) {
+  ensure_inputs_loaded_();
+  std::vector<int> varList;
+  decode_mixed_radix(combo_index, radices_, varList);
+  execute_with_varlist(varList);
+}
+
+INSERT new sweep_all_combinations
+std::shared_ptr<SweepResults> Runner::sweep_all_combinations(std::size_t max_workers,
+                                                             std::uint64_t max_runs)
+{
+  ensure_inputs_loaded_();
+
+  if (radices_.empty()) {
+    throw std::runtime_error("sweep_all_combinations: no blocks in jBlock");
+  }
+
+  // Compute total combinations (uint64). Refuse overflow.
+  std::uint64_t total = 1;
+  for (std::size_t r : radices_) {
+    std::uint64_t tmp = 0;
+    if (mul_overflow_u64(total, static_cast<std::uint64_t>(r), tmp)) {
+      throw std::runtime_error("Total combinations overflow uint64 (problem is too large). "
+                               "Use max_runs to cap the sweep.");
+    }
+    total = tmp;
+  }
+
+  // Decide how many to run
+  std::uint64_t runs = total;
+  if (max_runs > 0) runs = std::min<std::uint64_t>(total, max_runs);
+
+  // Refuse accidental impossible requests when max_runs==0 (exhaustive)
+  // (adjust threshold if you want)
+  constexpr std::uint64_t HARD_EXHAUSTIVE_CAP = 50'000'000ULL;
+  if (max_runs == 0 && total > HARD_EXHAUSTIVE_CAP) {
+    throw std::runtime_error("Exhaustive sweep requested but total combinations is too large (" +
+                             std::to_string(total) +
+                             "). Provide max_runs to cap the sweep.");
+  }
+
+  const std::size_t hw = std::max<std::size_t>(1, std::thread::hardware_concurrency());
+  const std::size_t nthreads = std::max<std::size_t>(1, std::min(max_workers, hw));
+
+  auto results = std::make_shared<SweepResults>(radices_, runs);
+
+  std::atomic<std::uint64_t> next{0};
+
+  // IMPORTANT PERFORMANCE NOTE:
+  // This sweep is designed to store ONLY per-run BEST summary.
+  // If your Placement always stores full history, that can dominate runtime/memory.
+  // (See optional HistoryStore change below.)
+  auto worker = [&]() {
+    Placement local_place;              // thread-local, reused
+    std::vector<int> varList;           // reused buffer
+    for (;;) {
+      const std::uint64_t run_i = next.fetch_add(1, std::memory_order_relaxed);
+      if (run_i >= runs) break;
+
+      const std::uint64_t combo_i = run_i;  // first runs combinations
+      decode_mixed_radix(combo_i, radices_, varList);
+
+      try {
+        // load + run
+        local_place.load(jPars_cache_, jBlock_cache_, varList);
+
+        // OPTIONAL: make sweep faster by disabling full history storage
+        // (requires the HistoryStore patch in section 3)
+        // local_place.history_mutable().set_keep_history(false);
+
+        local_place.execute();
+
+        const auto& hs = local_place.history();
+        results->set_ok(run_i, combo_i, local_place.runtime_seconds(), hs.best_metrics());
+      }
+      catch (const std::exception& e) {
+        results->set_err(run_i, combo_i, e.what());
+      }
+      catch (...) {
+        results->set_err(run_i, combo_i, "Unknown exception");
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(nthreads);
+  for (std::size_t t = 0; t < nthreads; ++t) threads.emplace_back(worker);
+  for (auto& th : threads) th.join();
+
+  results->finalize_best();
+  last_sweep_ = results;
+  return results;
+}
+
+3) Strongly recommended: disable full history during sweep (biggest speed win)
+
+Your single-run API needs full history.
+But sweep mode does not need per-iteration buffers for every combination—only best summary per run. Otherwise, history push/copies can dominate, especially with 10k+ iterations.
+
+FILE: include/history_store.h
+INSERT into class HistoryStore private:
+bool keep_history_{true};
+std::size_t iter_count_{0};
+
+INSERT into class HistoryStore public:
+void set_keep_history(bool b) noexcept { keep_history_ = b; }
+bool keep_history() const noexcept { return keep_history_; }
+std::size_t iterations() const noexcept {
+  return keep_history_ ? iter_metrics_.size() : iter_count_;
+}
+
+MODIFY init(n) (add iter_count_ = 0; and guard clears)
+void init(const std::size_t n){
+  n_ = n;
+  iter_count_ = 0;
+
+  if (keep_history_) {
+    iter_metrics_.clear();
+    coords_.clear();
+  }
+
+  best_coords_.assign(2*n_, 0.0);
+  best_metrics_ = Metrics();
+  best_obj_ = std::numeric_limits<double>::infinity();
+  best_index_ = 0;
+}
+
+MODIFY push(...) (do not append if keep_history_==false)
+void push(const arma::mat& x, const Metrics& m){
+  const double* p = x.memptr();
+  const std::size_t this_iter = iter_count_;
+  ++iter_count_;
+
+  if (keep_history_) {
+    iter_metrics_.push_back(m);
+    coords_.insert(coords_.end(), p, p+(2*n_));
+  }
+
+  if(m.augmented_objective < best_obj_){
+    best_obj_ = m.augmented_objective;
+    best_metrics_ = m;
+    best_index_ = keep_history_ ? (iter_metrics_.size() - 1) : this_iter;
+    std::copy(p, p+(2*n_), best_coords_.begin());
+  }
+}
+
+FILE: include/placement.h (or wherever Placement is declared)
+INSERT a non-const accessor
+HistoryStore& history_mutable() { return store_; }
+
+
+…and ensure you already have:
+
+const HistoryStore& history() const { return store_; }
+double runtime_seconds() const { return runtime_s_; }  // or whatever name you use
+
+
+Then in Runner::sweep_all_combinations() you can uncomment:
+
+local_place.history_mutable().set_keep_history(false);
+
+
+This is the single best way to keep sweep scalable.
+
+4) pybind changes: expose sweep results + sweep runner methods
+
+You already have Metrics dtype working and make_array_view_metrics() implemented.
+
+FILE: src/pybind_module.cpp
+(A) INSERT include near the other includes
+#include "sweep_results.h"
+
+(B) INSERT these helpers near your existing make_array_view_double(...)
+template <typename T>
+static py::array make_array_view_1d(
+    const py::object& base,
+    T* ptr,
+    py::ssize_t n)
+{
+  py::buffer_info info(
+      ptr,
+      sizeof(T),
+      py::format_descriptor<T>::format(),
+      1,
+      std::vector<py::ssize_t>{n},
+      std::vector<py::ssize_t>{static_cast<py::ssize_t>(sizeof(T))}
+  );
+  return py::array(info, base);
+}
+
+(C) ADD a binding for SweepResults before the Runner binding
+
+Insert inside PYBIND11_MODULE(...) right after your PYBIND11_NUMPY_DTYPE(Metrics, ...) registration:
+
+  py::class_<SweepResults, std::shared_ptr<SweepResults>>(m, "SweepResults")
+    .def("num_blocks", &SweepResults::num_blocks)
+    .def("num_runs", &SweepResults::num_runs)
+    .def("best_run_index", &SweepResults::best_run_index)
+    .def("best_combo_index", &SweepResults::best_combo_index)
+    .def("best_objective", &SweepResults::best_objective)
+    .def("best_overall_metrics", &SweepResults::best_overall_metrics)
+    .def("decode_varlist", &SweepResults::decode_varlist)
+    .def("message", &SweepResults::message)
+
+    .def("radices", [](SweepResults& s) {
+        py::object base = py::cast(&s, py::return_value_policy::reference);
+        const auto& v = s.radices();
+        // expose as int64 for simplicity
+        return make_array_view_1d<std::int64_t>(
+            base,
+            reinterpret_cast<std::int64_t*>(const_cast<std::size_t*>(v.data())),
+            static_cast<py::ssize_t>(v.size())
+        );
+    })
+
+    .def("combo_indices", [](SweepResults& s) {
+        py::object base = py::cast(&s, py::return_value_policy::reference);
+        const auto& v = s.combo_indices();
+        return make_array_view_1d<std::uint64_t>(
+            base,
+            const_cast<std::uint64_t*>(v.data()),
+            static_cast<py::ssize_t>(v.size())
+        );
+    })
+
+    .def("runtimes_s", [](SweepResults& s) {
+        py::object base = py::cast(&s, py::return_value_policy::reference);
+        const auto& v = s.runtimes_s();
+        return make_array_view_1d<double>(
+            base,
+            const_cast<double*>(v.data()),
+            static_cast<py::ssize_t>(v.size())
+        );
+    })
+
+    .def("best_objectives", [](SweepResults& s) {
+        py::object base = py::cast(&s, py::return_value_policy::reference);
+        const auto& v = s.best_objectives();
+        return make_array_view_1d<double>(
+            base,
+            const_cast<double*>(v.data()),
+            static_cast<py::ssize_t>(v.size())
+        );
+    })
+
+    .def("status_codes", [](SweepResults& s) {
+        py::object base = py::cast(&s, py::return_value_policy::reference);
+        const auto& v = s.status_codes();
+        return make_array_view_1d<std::uint32_t>(
+            base,
+            const_cast<std::uint32_t*>(v.data()),
+            static_cast<py::ssize_t>(v.size())
+        );
+    })
+
+    .def("best_metrics", [](SweepResults& s) {
+        py::object base = py::cast(&s, py::return_value_policy::reference);
+        const auto& buf = s.best_metrics_buffer();
+        Metrics* ptr = const_cast<Metrics*>(buf.data());
+        auto arr = make_array_view_metrics(base, ptr, static_cast<py::ssize_t>(buf.size()));
+        arr.attr("flags").attr("writeable") = false;
+        return arr;
+    })
+  ;
+
+
+If the radices() reinterpret_cast feels too ugly: expose radices() as a Python list[int] instead (copy, but tiny). For correctness and portability, that’s safer.
+
+(D) ADD new Runner bindings (add to your existing Runner chain)
+
+Insert into your py::class_<Runner>(...) chain:
+
+    .def("execute_with_varlist",
+      [](Runner& r, const std::vector<int>& varList) {
+        py::gil_scoped_release release;
+        r.execute_with_varlist(varList);
+      },
+      py::arg("varList"),
+      "Run one optimization using an explicit varList (no file writes)."
+    )
+
+    .def("execute_combo_index",
+      [](Runner& r, std::uint64_t combo_index) {
+        py::gil_scoped_release release;
+        r.execute_combo_index(combo_index);
+      },
+      py::arg("combo_index"),
+      "Run one optimization for a given mixed-radix combo index."
+    )
+
+    .def("sweep_all_combinations",
+      [](Runner& r, std::size_t max_workers, std::uint64_t max_runs) {
+        py::gil_scoped_release release;
+        return r.sweep_all_combinations(max_workers, max_runs);
+      },
+      py::arg("max_workers"),
+      py::arg("max_runs") = 0,
+      "Parallel sweep over combinations. If max_runs==0, tries exhaustive (refuses if infeasible)."
+    )
+
+    .def("last_sweep", &Runner::last_sweep,
+      "Return the last SweepResults object (or None if no sweep)."
+    )
+
+5) Python: how to use it
+import numpy as np
+import placement_engine_py as pe
+
+r = pe.Runner()
+r.jPars_file  = "jsonPar.json"
+r.jBlock_file = "jsonBlock.json"
+
+# Run a single run normally (current API)
+r.execute()
+coords = r.coords_history()
+metrics = r.metrics_history()
+
+# Sweep
+sweep = r.sweep_all_combinations(max_workers=8, max_runs=5000)  # cap
+objs = sweep.best_objectives()          # zero-copy view
+best_run = sweep.best_run_index()
+best_combo = sweep.best_combo_index()
+print("best objective:", sweep.best_objective(), "best combo:", best_combo)
+
+# Replay best combo to get full per-iteration history through existing Runner API
+r.execute_combo_index(best_combo)
+coords_best = r.coords_history()
+metrics_best = r.metrics_history()
+
+6) Performance notes that matter for your “10 ms” goal
+
+Disable full history during sweep (Section 3).
+Otherwise every run allocates/grows vectors for 10k iterations.
+
+Avoid oversubscription: if your evaluator uses threads (expected_params.num_threads > 1), and you also run many combinations in parallel, performance collapses. For sweep:
+
+set expected_params.num_threads = 1 (in the jPars you pass to sweep runs).
+
+BLAS threads: if Armadillo is linked to OpenBLAS/MKL, force it single-thread during sweep:
+
+OMP_NUM_THREADS=1, MKL_NUM_THREADS=1, OPENBLAS_NUM_THREADS=1.
+
+One critical correctness check (block order)
+
+The sweep decoding assumes varList index i corresponds to the i-th block key iteration order.
+Your parse_blocks() must use the exact same ordering as Runner uses to build radices_.
+
+If parse_blocks() iterates for (auto& it : jBlock.items()) (insertion order), keep Runner’s radices_ extraction as shown.
+
+If parse_blocks() sorts keys, you must sort keys in ensure_inputs_loaded_() the same way.
+
+If you paste your actual parse_blocks() loop, I can make the ordering 100% bulletproof.
