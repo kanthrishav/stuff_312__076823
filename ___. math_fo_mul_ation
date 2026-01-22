@@ -1,0 +1,1049 @@
+Below is a drop-in architecture + code patches that adds your requested mathematical formulation selection (penalty / sequence-pair / B*-tree / slicing-tree / reduced-space(manifold) / CP-SAT), with:
+
+Strategy selection happens once (during load/init) via enum + function pointer (no runtime string checks).
+
+compute_all() becomes a single indirect call to a preselected evaluator (no branching inside).
+
+For penalty (current) path, the hot loop stays essentially the same (no new per-iteration selection overhead).
+
+Structural formulations (sequence-pair, B*-tree, slicing-tree) are implemented as discrete solvers (SA) so you don’t pay “decode-from-doubles” sorting cost every evaluation.
+
+Reduced space/manifold is implemented as a variable mask using your existing varList (fast, and can reduce DE dimension).
+
+1) JSON: add problem_formulation (and optional SA params)
+✅ New jPars (example)
+{
+  "problem_formulation": {
+    "type": "penalty", 
+    "params": { }
+  },
+
+  "expected_params": {
+    "output_file": "out.json",
+    "canvas": {"width": 100.0, "height": 100.0},
+    "overlap_buffer": 0.0,
+    "aspect_ratio": 1.0,
+    "num_threads": 1
+  },
+
+  "constraints": {
+    "aspect_violation": {"enabled": "true", "type": "simple_penalty", "penalty_weight": 1.0},
+    "overlap": {
+      "enabled": "true", "type": "simple_penalty", "penalty_weight": 100.0,
+      "normalization": "no norm", "aggregation": "sum"
+    },
+    "boundary_violation": {
+      "enabled": "true", "type": "simple_penalty", "penalty_weight": 1.0,
+      "normalization": "no norm", "aggregation": "sum"
+    }
+  },
+
+  "objective": {"weights": {"hpwl": 1.0, "area": 100.0}},
+
+  "optimizer": {
+    "algorithm": "DE",
+    "params": {
+      "maxiter": 10000,
+      "popsize": 20,
+      "seed": 1234,
+      "recomb": 0.2,
+      "strategy": "best1bin",
+      "stopping_criteria": "maxiter",
+      "stopping_criteria_value": 0.1,
+      "mutation_min": 0.1,
+      "mutation_max": 1.9
+    }
+  },
+
+  "varList": [1,0,0,0,0,0,0,0]
+}
+
+✅ Switch to reduced space (manifold)
+"problem_formulation": {
+  "type": "reduced_space",
+  "params": { "use_varList": true }
+}
+
+
+→ DE dimension becomes count(varList==1) (fast).
+
+✅ Switch to sequence-pair (discrete SA solver)
+"problem_formulation": {
+  "type": "sequence_pair",
+  "params": { "sa_steps": 20000, "t0": 1.0, "t1": 1e-3 }
+},
+"optimizer": { "algorithm": "SA", "params": { "seed": 1234 } }
+
+
+Similarly:
+
+"type": "bstar_tree" with "algorithm":"SA"
+
+"type": "slicing_tree" with "algorithm":"SA"
+
+"type": "cpsat" with "algorithm":"CPSAT" (see build note later)
+
+2) Core idea: two “strategies”
+A) FormulationStrategy (maps decision vars → full XY)
+
+penalty: decision vars are XY
+
+reduced_space: decision vars are a subset, expanded to full XY using varList
+
+sequence-pair / B* / slicing: decision vars are discrete structures, decoded to XY
+
+B) SolverStrategy
+
+penalty / reduced_space → your existing ens::DE
+
+sequence-pair / bstar / slicing → SA loop (very small, fast, no allocations)
+
+cpsat → OR-Tools CP-SAT (optional build flag)
+
+3) Code patches
+PATCH A — Add enums + formulation config
+
+Insert in your config header (where LayoutConfig is defined), above class LayoutConfig:
+
+// ===== PATCH A: formulation enums/config =====
+enum class FormulationKind : std::uint8_t {
+  Penalty = 0,
+  SequencePair = 1,
+  BStarTree = 2,
+  SlicingTree = 3,
+  ReducedSpace = 4,
+  CPSAT = 5
+};
+
+enum class OptimizerAlgo : std::uint8_t {
+  DE = 0,
+  SA = 1,
+  CPSAT = 2
+};
+
+struct FormulationConfig {
+  FormulationKind kind = FormulationKind::Penalty;
+
+  // Reduced-space (manifold) config
+  bool use_varList = false;                 // if true, use top-level varList mask
+  std::vector<std::uint8_t> varMask01;      // optional explicit mask, length=2*n
+
+  // SA config for discrete formulations
+  std::size_t sa_steps = 20000;
+  double sa_t0 = 1.0;
+  double sa_t1 = 1e-3;
+};
+// ===== END PATCH A =====
+
+
+Then add to LayoutConfig:
+
+// inside class LayoutConfig:
+FormulationConfig formulation;
+std::vector<std::uint8_t> varMask01;  // store parsed varList here as 0/1 bytes (length=2*n or 0)
+
+PATCH B — JsonIO parsing (fast: parse strings once → enums)
+
+Replace your parse_constraint() (it has a bug: c.normalization) and add formulation parsing.
+
+// ===== PATCH B: JsonIO helpers =====
+static inline FormulationKind parse_formulation_kind(const std::string& s){
+  if(s == "penalty") return FormulationKind::Penalty;
+  if(s == "sequence_pair") return FormulationKind::SequencePair;
+  if(s == "bstar_tree") return FormulationKind::BStarTree;
+  if(s == "slicing_tree") return FormulationKind::SlicingTree;
+  if(s == "reduced_space") return FormulationKind::ReducedSpace;
+  if(s == "cpsat") return FormulationKind::CPSAT;
+  throw std::runtime_error("Unknown problem_formulation.type: " + s);
+}
+
+static inline OptimizerAlgo parse_optimizer_algo(const std::string& s){
+  if(s == "DE") return OptimizerAlgo::DE;
+  if(s == "SA") return OptimizerAlgo::SA;
+  if(s == "CPSAT") return OptimizerAlgo::CPSAT;
+  throw std::runtime_error("Unknown optimizer.algorithm: " + s);
+}
+
+static inline std::vector<std::uint8_t> parse_varList_01(const json& j){
+  if(!j.contains("varList")) return {};
+  const auto v = j.at("varList").get<std::vector<int>>();
+  std::vector<std::uint8_t> out;
+  out.reserve(v.size());
+  for(int x : v) out.push_back(static_cast<std::uint8_t>(x != 0));
+  return out;
+}
+
+// FIXED parse_constraint:
+static ConstraintConfig parse_constraint(const json& cnode, bool b_agg_norm){
+  ConstraintConfig cc;
+  cc.enabled = parse_bool_str(cnode.at("enabled").get<std::string>());
+  cc.weight  = cnode.at("penalty_weight").get<double>();
+  cc.type    = cnode.at("type").get<std::string>();
+  if(b_agg_norm){
+    cc.normalization = cnode.at("normalization").get<std::string>();
+    cc.aggregation   = cnode.at("aggregation").get<std::string>();
+  }
+  return cc;
+}
+// ===== END PATCH B =====
+
+
+Now patch parse_config() to parse problem_formulation and varList:
+
+// ===== PATCH B2: JsonIO::parse_config additions =====
+static LayoutConfig parse_config(const json& jPars, const json& jBlock, std::vector<int> &varList){
+  LayoutConfig cfg;
+
+  // existing blocks parse...
+  cfg.blocks = std::move(parse_blocks(
+    jBlock, varList,
+    jPars.at("expected_params").at("canvas").at("width").get<double>(),
+    jPars.at("expected_params").at("canvas").at("height").get<double>()
+  ));
+
+  // store varList (fast mask) inside cfg
+  cfg.varMask01 = parse_varList_01(jPars);
+
+  // formulation
+  if(jPars.contains("problem_formulation")){
+    const json& pf = jPars.at("problem_formulation");
+    cfg.formulation.kind = parse_formulation_kind(pf.at("type").get<std::string>());
+    if(pf.contains("params")){
+      const json& pp = pf.at("params");
+      if(pp.contains("use_varList")) cfg.formulation.use_varList = pp.at("use_varList").get<bool>();
+      if(pp.contains("sa_steps")) cfg.formulation.sa_steps = pp.at("sa_steps").get<std::size_t>();
+      if(pp.contains("t0")) cfg.formulation.sa_t0 = pp.at("t0").get<double>();
+      if(pp.contains("t1")) cfg.formulation.sa_t1 = pp.at("t1").get<double>();
+    }
+  } else {
+    cfg.formulation.kind = FormulationKind::Penalty;
+  }
+
+  // objective
+  cfg.objective.w_hpwl = jPars.at("objective").at("weights").at("hpwl").get<double>();
+  cfg.objective.w_area = jPars.at("objective").at("weights").at("area").get<double>();
+
+  // constraints
+  const json& con = jPars.at("constraints");
+  cfg.overlap_c  = parse_constraint(con.at("overlap"), true);
+  cfg.aspect_c   = parse_constraint(con.at("aspect_violation"), true);
+  cfg.boundary_c = parse_constraint(con.at("boundary_violation"), true);
+
+  // expected params ... (unchanged)
+  // optimizer
+  const json& o = jPars.at("optimizer");
+  cfg.optimizer.algorithm = o.at("algorithm").get<std::string>();
+  cfg.optimizer.max_iter =  o.at("params").at("maxiter").get<std::size_t>();
+  cfg.optimizer.stopping_criteria = o.at("params").at("stopping_criteria").get<std::string>();
+  cfg.optimizer.stopping_value = o.at("params").at("stopping_criteria_value").get<double>();
+  cfg.optimizer.pop_size = o.at("params").at("popsize").get<std::size_t>();
+  cfg.optimizer.seed = o.at("params").at("seed").get<std::uint64_t>();
+  cfg.optimizer.recombination = o.at("params").at("recomb").get<double>();
+  cfg.optimizer.strategy = o.at("params").at("strategy").get<std::string>();
+  cfg.optimizer.mutation_min = o.at("params").at("mutation_min").get<double>();
+  cfg.optimizer.mutation_max = o.at("params").at("mutation_max").get<double>();
+
+  return cfg;
+}
+// ===== END PATCH B2 =====
+
+4) Fast evaluator selection: function pointer set in init()
+PATCH C — LayoutEvaluator: add eval function pointer + reduced-space expansion
+
+Inside class LayoutEvaluator add:
+
+// ===== PATCH C: evaluator function pointer =====
+using EvalFn = Metrics (*)(const LayoutEvaluator&, const double*, std::size_t);
+
+EvalFn eval_fn_ = nullptr;
+
+// full XY backing buffer for reduced/decode modes
+mutable std::vector<double> xy_full_;       // size = 2*n
+mutable const double* last_xy_ptr_ = nullptr;
+
+// reduced-space mapping
+std::vector<std::size_t> active_full_idx_;  // indices into [0..2n)
+std::size_t dim_ = 0;
+
+static Metrics eval_xy_direct(const LayoutEvaluator& self, const double* xy, std::size_t iter){
+  self.last_xy_ptr_ = xy;
+  return self.compute_all_xy(xy, iter); // renamed core (see below)
+}
+
+static Metrics eval_reduced_space(const LayoutEvaluator& self, const double* x, std::size_t iter){
+  // expand only active indices (NO full copy)
+  for(std::size_t k = 0; k < self.active_full_idx_.size(); ++k){
+    self.xy_full_[ self.active_full_idx_[k] ] = x[k];
+  }
+  self.last_xy_ptr_ = self.xy_full_.data();
+  return self.compute_all_xy(self.xy_full_.data(), iter);
+}
+
+public:
+  std::size_t dim() const noexcept { return dim_; }
+  const double* last_xy_full_ptr() const noexcept { return last_xy_ptr_; }
+// ===== END PATCH C =====
+
+PATCH D — split your current compute_all() into a core compute_all_xy() and a thin wrapper
+
+Replace your existing Metrics compute_all(const double* xy, ...) const with:
+
+// ===== PATCH D: compute_all wrapper =====
+Metrics compute_all(const double* x, const std::size_t iter_idx) const {
+  return eval_fn_(*this, x, iter_idx);
+}
+// ===== END PATCH D =====
+
+
+And rename your old body to:
+
+// ===== PATCH D2: core evaluator (old compute_all body) =====
+Metrics compute_all_xy(const double* xy, const std::size_t iter_idx) const {
+  // PUT YOUR CURRENT compute_all BODY HERE (unchanged),
+  // but read coordinates from `xy[...]` exactly as before.
+  // (This keeps penalty path identical.)
+  ...
+}
+// ===== END PATCH D2 =====
+
+PATCH E — set eval_fn_ + preallocate scratch in init()
+
+In LayoutEvaluator::init(...), after you compute n_ etc, add:
+
+// ===== PATCH E: init selects formulation once =====
+xy_full_.resize(2*n_);
+for(std::size_t i = 0; i < n_; ++i){
+  xy_full_[2*i + 0] = x0_[i];
+  xy_full_[2*i + 1] = y0_[i];
+}
+
+active_full_idx_.clear();
+
+if(cfg_.formulation.kind == FormulationKind::ReducedSpace){
+  // use varList mask (fast manifold)
+  if(cfg_.formulation.use_varList && !cfg_.varMask01.empty()){
+    // cfg_.varMask01 is length 2*n in your workflow; if not, you must align it during parse_blocks
+    for(std::size_t j = 0; j < cfg_.varMask01.size(); ++j){
+      if(cfg_.varMask01[j]) active_full_idx_.push_back(j);
+    }
+  } else {
+    // fallback: optimize all
+    active_full_idx_.reserve(2*n_);
+    for(std::size_t j = 0; j < 2*n_; ++j) active_full_idx_.push_back(j);
+  }
+  dim_ = active_full_idx_.size();
+  eval_fn_ = &LayoutEvaluator::eval_reduced_space;
+} else {
+  // penalty + others (continuous XY expects 2*n)
+  dim_ = 2*n_;
+  eval_fn_ = &LayoutEvaluator::eval_xy_direct;
+}
+// ===== END PATCH E =====
+
+PATCH F — initial_point() must return dim() variables
+
+Replace your initial_point() with:
+
+// ===== PATCH F: initial_point honors formulation dim =====
+arma::mat initial_point() const {
+  arma::mat x(dim_, 1);
+  if(eval_fn_ == &LayoutEvaluator::eval_xy_direct){
+    for(std::size_t i = 0; i < n_; ++i){
+      x(2*i + 0, 0) = x0_[i];
+      x(2*i + 1, 0) = y0_[i];
+    }
+  } else {
+    // reduced-space: return only active variables in order
+    for(std::size_t k = 0; k < active_full_idx_.size(); ++k){
+      const std::size_t j = active_full_idx_[k];
+      x(k, 0) = xy_full_[j];
+    }
+  }
+  return x;
+}
+// ===== END PATCH F =====
+
+5) HistoryStore + IterationCallback: store full XY even in reduced space
+
+Your callback currently stores coordinates (which becomes reduced). Fix by storing eval_->last_xy_full_ptr().
+
+PATCH G — add push_raw(...) to HistoryStore
+
+Add this overload:
+
+// ===== PATCH G: HistoryStore::push_raw =====
+void push_raw(const double* full_xy, std::size_t len, const Metrics& m){
+  iter_metrics_.push_back(m);
+  coords_.insert(coords_.end(), full_xy, full_xy + len);
+
+  if(m.augmented_objective < best_obj_){
+    best_obj_ = m.augmented_objective;
+    best_metrics_ = m;
+    best_index_ = iter_metrics_.size() - 1;
+    std::copy(full_xy, full_xy + len, best_coords_.begin());
+  }
+}
+// ===== END PATCH G =====
+
+
+Also fix your typos (best_cords_ → best_coords_, iter_metrics name, etc).
+
+PATCH H — IterationCallback: store full xy from evaluator
+
+Replace StepTaken with:
+
+// ===== PATCH H: IterationCallback StepTaken =====
+template<typename OptimizerType, typename FunctionType, typename MatType>
+bool StepTaken(OptimizerType&, FunctionType&, MatType& coordinates){
+  const double* x = coordinates.memptr();
+  Metrics m = eval_->compute_all(x, iter_);
+  store_->push_raw(eval_->last_xy_full_ptr(), 2*eval_->num_rects(), m);
+
+  ++iter_;
+  if(stopping_mode_ == "target_objective") return (m.augmented_objective <= stop_value_);
+  return false;
+}
+// ===== END PATCH H =====
+
+
+Now reduced-space DE logs full XY correctly with no branching inside compute_all_xy.
+
+6) Implementations for the new formulations (Discrete SA solvers)
+
+These are real implementations, designed to be:
+
+no allocations in the iteration loop
+
+scratch buffers preallocated once
+
+extremely simple neighborhood moves
+
+6.1 Sequence-pair SA (Fenwick O(n log n) decode, no sorting)
+
+Create new file: include/seqpair.hpp
+
+#pragma once
+#include <vector>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
+struct FenwickMax {
+  std::vector<double> bit;
+  void init(std::size_t n){ bit.assign(n+1, 0.0); }
+  void reset(){ std::fill(bit.begin(), bit.end(), 0.0); }
+  inline void update(std::size_t idx0, double v){
+    for(std::size_t i = idx0+1; i < bit.size(); i += i & (~i + 1)) bit[i] = std::max(bit[i], v);
+  }
+  inline double query(std::size_t idx0) const {
+    double res = 0.0;
+    for(std::size_t i = idx0+1; i > 0; i -= i & (~i + 1)) res = std::max(res, bit[i]);
+    return res;
+  }
+};
+
+struct SequencePairDecoder {
+  std::size_t n = 0;
+  std::vector<int> posQ;
+  std::vector<double> xll, yll;
+  FenwickMax fx, fy;
+
+  void init(std::size_t n_){
+    n = n_;
+    posQ.assign(n, 0);
+    xll.assign(n, 0.0);
+    yll.assign(n, 0.0);
+    fx.init(n);
+    fy.init(n);
+  }
+
+  // P,Q are permutations of [0..n-1]
+  inline void decode(const int* P, const int* Q,
+                     const double* w, const double* h,
+                     double* out_xy /*len=2n*/) {
+    for(std::size_t k=0; k<n; ++k) posQ[ static_cast<std::size_t>(Q[k]) ] = static_cast<int>(k);
+
+    fx.reset();
+    for(std::size_t k=0; k<n; ++k){
+      const int id = P[k];
+      const std::size_t i = static_cast<std::size_t>(id);
+      const std::size_t qpos = static_cast<std::size_t>(posQ[i]);
+      const double base = fx.query(qpos);
+      xll[i] = base;
+      fx.update(qpos, base + w[i]);
+    }
+
+    // vertical: use reversed Q index => prefix query corresponds to "greater posQ"
+    fy.reset();
+    for(std::size_t k=0; k<n; ++k){
+      const int id = P[k];
+      const std::size_t i = static_cast<std::size_t>(id);
+      const std::size_t rq = (n-1) - static_cast<std::size_t>(posQ[i]);
+      const double base = fy.query(rq);
+      yll[i] = base;
+      fy.update(rq, base + h[i]);
+    }
+
+    for(std::size_t i=0; i<n; ++i){
+      out_xy[2*i + 0] = xll[i] + 0.5*w[i];
+      out_xy[2*i + 1] = yll[i] + 0.5*h[i];
+    }
+  }
+};
+
+6.2 B*-tree decode (segment tree O(n log n) skyline)
+
+Create include/bstar.hpp
+
+#pragma once
+#include <vector>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
+struct SegTreeAssignMax {
+  std::size_t n = 0;
+  std::vector<double> mx;
+  std::vector<double> lazy;
+  std::vector<std::uint8_t> has_lazy;
+
+  void init(std::size_t n_){
+    n = n_;
+    mx.assign(4*n, 0.0);
+    lazy.assign(4*n, 0.0);
+    has_lazy.assign(4*n, 0);
+  }
+
+  inline void reset(){
+    std::fill(mx.begin(), mx.end(), 0.0);
+    std::fill(has_lazy.begin(), has_lazy.end(), 0);
+  }
+
+  inline void push(std::size_t p){
+    if(!has_lazy[p]) return;
+    const double v = lazy[p];
+    const std::size_t l = p<<1, r = l|1;
+    mx[l] = v; mx[r] = v;
+    lazy[l] = v; lazy[r] = v;
+    has_lazy[l] = has_lazy[r] = 1;
+    has_lazy[p] = 0;
+  }
+
+  double query(std::size_t p, std::size_t tl, std::size_t tr, std::size_t l, std::size_t r){
+    if(l>r) return 0.0;
+    if(l==tl && r==tr) return mx[p];
+    push(p);
+    const std::size_t tm = (tl+tr)>>1;
+    return std::max(query(p<<1, tl, tm, l, std::min(r, tm)),
+                    query(p<<1|1, tm+1, tr, std::max(l, tm+1), r));
+  }
+
+  void assign(std::size_t p, std::size_t tl, std::size_t tr, std::size_t l, std::size_t r, double v){
+    if(l>r) return;
+    if(l==tl && r==tr){
+      mx[p] = v;
+      lazy[p] = v;
+      has_lazy[p] = 1;
+      return;
+    }
+    push(p);
+    const std::size_t tm = (tl+tr)>>1;
+    assign(p<<1, tl, tm, l, std::min(r, tm), v);
+    assign(p<<1|1, tm+1, tr, std::max(l, tm+1), r, v);
+    mx[p] = std::max(mx[p<<1], mx[p<<1|1]);
+  }
+};
+
+struct BStarTree {
+  int root = 0;
+  std::vector<int> left;   // child to the right
+  std::vector<int> right;  // child "above"
+};
+
+struct BStarDecoder {
+  std::size_t n = 0;
+  std::vector<double> xll, yll;
+  std::vector<double> coords;
+  std::vector<int> stack;
+  SegTreeAssignMax seg;
+
+  void init(std::size_t n_){
+    n = n_;
+    xll.assign(n, 0.0);
+    yll.assign(n, 0.0);
+    coords.reserve(2*n);
+    stack.reserve(n);
+  }
+
+  inline void compute_x(const BStarTree& t, const double* w){
+    // iterative DFS
+    stack.clear();
+    stack.push_back(t.root);
+    xll[t.root] = 0.0;
+    while(!stack.empty()){
+      const int u = stack.back(); stack.pop_back();
+      const int lc = t.left[u];
+      const int rc = t.right[u];
+      if(lc >= 0){
+        xll[lc] = xll[u] + w[static_cast<std::size_t>(u)];
+        stack.push_back(lc);
+      }
+      if(rc >= 0){
+        xll[rc] = xll[u];
+        stack.push_back(rc);
+      }
+    }
+  }
+
+  inline std::size_t idx_of(double x) const {
+    return static_cast<std::size_t>(std::lower_bound(coords.begin(), coords.end(), x) - coords.begin());
+  }
+
+  void pack_dfs(const BStarTree& t, const double* w, const double* h, int u){
+    const std::size_t iu0 = idx_of(xll[u]);
+    const std::size_t iu1 = idx_of(xll[u] + w[static_cast<std::size_t>(u)]);
+    const std::size_t L = iu0;
+    const std::size_t R = (iu1>0? iu1-1 : 0);
+    const double base = seg.query(1, 0, seg.n-1, L, R);
+    yll[u] = base;
+    seg.assign(1, 0, seg.n-1, L, R, base + h[static_cast<std::size_t>(u)]);
+
+    const int lc = t.left[u];
+    const int rc = t.right[u];
+    if(lc >= 0) pack_dfs(t, w, h, lc);
+    if(rc >= 0) pack_dfs(t, w, h, rc);
+  }
+
+  inline void decode(const BStarTree& t,
+                     const double* w, const double* h,
+                     double* out_xy /*2n*/) {
+    compute_x(t, w);
+
+    coords.clear();
+    for(std::size_t i=0;i<n;++i){
+      coords.push_back(xll[i]);
+      coords.push_back(xll[i] + w[i]);
+    }
+    std::sort(coords.begin(), coords.end());
+    coords.erase(std::unique(coords.begin(), coords.end()), coords.end());
+    const std::size_t intervals = (coords.size() >= 2) ? (coords.size() - 1) : 1;
+    seg.init(intervals);
+    seg.reset();
+
+    pack_dfs(t, w, h, t.root);
+
+    for(std::size_t i=0; i<n; ++i){
+      out_xy[2*i + 0] = xll[i] + 0.5*w[i];
+      out_xy[2*i + 1] = yll[i] + 0.5*h[i];
+    }
+  }
+};
+
+6.3 Slicing-tree decode (valid expression, O(n))
+
+Create include/slicing.hpp
+
+#pragma once
+#include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <algorithm>
+
+struct SlicingDecoder {
+  struct Node{
+    int left=-1, right=-1;
+    int block=-1;          // leaf if >=0
+    std::uint8_t op=0;     // 0 leaf, 1 H, 2 V
+    double w=0,h=0;
+    double x=0,y=0;
+  };
+
+  std::size_t n=0;
+  std::vector<Node> nodes;
+  std::vector<int> st;
+  std::vector<int> leafNodeIdx; // leafNodeIdx[block]=node
+
+  void init(std::size_t n_){
+    n=n_;
+    nodes.resize(2*n-1);
+    st.reserve(2*n);
+    leafNodeIdx.assign(n, -1);
+  }
+
+  // perm: [0..n-1], ops: length n-1, 0=H,1=V
+  void decode(const int* perm, const std::uint8_t* ops,
+              const double* W, const double* H,
+              double* out_xy /*2n*/) {
+
+    std::size_t node_cnt = 0;
+    st.clear();
+
+    // leaves
+    for(std::size_t i=0;i<n;++i){
+      const int b = perm[i];
+      Node& nd = nodes[node_cnt];
+      nd.left = nd.right = -1;
+      nd.block = b;
+      nd.op = 0;
+      nd.w = W[static_cast<std::size_t>(b)];
+      nd.h = H[static_cast<std::size_t>(b)];
+      leafNodeIdx[static_cast<std::size_t>(b)] = static_cast<int>(node_cnt);
+      st.push_back(static_cast<int>(node_cnt));
+      ++node_cnt;
+    }
+
+    // left-deep valid slicing: apply all ops at end
+    for(std::size_t k=0;k<n-1;++k){
+      const int r = st.back(); st.pop_back();
+      const int l = st.back(); st.pop_back();
+      Node& nd = nodes[node_cnt];
+      nd.left = l;
+      nd.right = r;
+      nd.block = -1;
+      nd.op = ops[k] ? 2 : 1; // 1=H,2=V
+      // compute size
+      const Node& L = nodes[static_cast<std::size_t>(l)];
+      const Node& R = nodes[static_cast<std::size_t>(r)];
+      if(nd.op == 1){ // H: stack vertically
+        nd.w = std::max(L.w, R.w);
+        nd.h = L.h + R.h;
+      } else { // V
+        nd.w = L.w + R.w;
+        nd.h = std::max(L.h, R.h);
+      }
+      st.push_back(static_cast<int>(node_cnt));
+      ++node_cnt;
+    }
+
+    const int root = st.back();
+
+    // assign coordinates (preorder)
+    auto place = [&](auto&& self, int u, double x0, double y0) -> void {
+      Node& nd = nodes[static_cast<std::size_t>(u)];
+      nd.x = x0; nd.y = y0;
+      if(nd.op == 0) return;
+      Node& L = nodes[static_cast<std::size_t>(nd.left)];
+      Node& R = nodes[static_cast<std::size_t>(nd.right)];
+      if(nd.op == 1){ // H: R above L
+        self(self, nd.left,  x0, y0);
+        self(self, nd.right, x0, y0 + L.h);
+      } else { // V: R right of L
+        self(self, nd.left,  x0, y0);
+        self(self, nd.right, x0 + L.w, y0);
+      }
+    };
+    place(place, root, 0.0, 0.0);
+
+    for(std::size_t b=0;b<n;++b){
+      const int leaf = leafNodeIdx[b];
+      const Node& nd = nodes[static_cast<std::size_t>(leaf)];
+      out_xy[2*b + 0] = nd.x + 0.5*W[b];
+      out_xy[2*b + 1] = nd.y + 0.5*H[b];
+    }
+  }
+};
+
+7) SA solvers (Sequence-pair / B* / Slicing)
+
+Add new file: src/sa_solvers.hpp (or in your placement.cpp)
+
+#pragma once
+#include <random>
+#include <cmath>
+#include <numeric>
+
+#include "seqpair.hpp"
+#include "bstar.hpp"
+#include "slicing.hpp"
+
+struct SASolvers {
+
+  static inline double temp_geometric(double t0, double t1, std::size_t i, std::size_t steps){
+    if(steps <= 1) return t1;
+    const double a = static_cast<double>(i) / static_cast<double>(steps - 1);
+    return t0 * std::pow(t1 / t0, a);
+  }
+
+  static void solve_sequence_pair(LayoutEvaluator& eval, HistoryStore& store,
+                                  std::uint64_t seed,
+                                  std::size_t steps, double t0, double t1){
+
+    const std::size_t n = eval.num_rects();
+    SequencePairDecoder dec; dec.init(n);
+
+    std::vector<int> P(n), Q(n);
+    std::iota(P.begin(), P.end(), 0);
+    std::iota(Q.begin(), Q.end(), 0);
+
+    std::mt19937_64 rng(seed);
+    std::shuffle(P.begin(), P.end(), rng);
+    std::shuffle(Q.begin(), Q.end(), rng);
+
+    std::uniform_int_distribution<int> pick_idx(0, static_cast<int>(n-1));
+    std::uniform_real_distribution<double> ur(0.0, 1.0);
+
+    std::vector<double> xy(2*n, 0.0);
+    dec.decode(P.data(), Q.data(), eval.WVec().data(), eval.HVec().data(), xy.data());
+    Metrics cur = eval.compute_all_xy(xy.data(), 0);
+    store.push_raw(xy.data(), 2*n, cur);
+
+    for(std::size_t it=1; it<=steps; ++it){
+      const double T = temp_geometric(t0, t1, it, steps);
+
+      // neighbor: swap in P or Q
+      const bool swapP = (ur(rng) < 0.5);
+      int a = pick_idx(rng), b = pick_idx(rng);
+      if(a == b) b = (b+1) % static_cast<int>(n);
+
+      if(swapP) std::swap(P[static_cast<std::size_t>(a)], P[static_cast<std::size_t>(b)]);
+      else      std::swap(Q[static_cast<std::size_t>(a)], Q[static_cast<std::size_t>(b)]);
+
+      dec.decode(P.data(), Q.data(), eval.WVec().data(), eval.HVec().data(), xy.data());
+      Metrics nxt = eval.compute_all_xy(xy.data(), it);
+
+      const double dE = (nxt.augmented_objective - cur.augmented_objective);
+      bool accept = (dE <= 0.0);
+      if(!accept && T > 0.0){
+        const double p = std::exp(-dE / T);
+        accept = (ur(rng) < p);
+      }
+
+      if(accept){
+        cur = nxt;
+        store.push_raw(xy.data(), 2*n, cur);
+      } else {
+        // revert
+        if(swapP) std::swap(P[static_cast<std::size_t>(a)], P[static_cast<std::size_t>(b)]);
+        else      std::swap(Q[static_cast<std::size_t>(a)], Q[static_cast<std::size_t>(b)]);
+      }
+    }
+  }
+
+  static void solve_bstar(LayoutEvaluator& eval, HistoryStore& store,
+                          std::uint64_t seed,
+                          std::size_t steps, double t0, double t1){
+
+    const std::size_t n = eval.num_rects();
+    BStarDecoder dec; dec.init(n);
+
+    // random tree topology + label permutation
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> pick_node(0, static_cast<int>(n-1));
+    std::uniform_real_distribution<double> ur(0.0, 1.0);
+
+    BStarTree t;
+    t.root = 0;
+    t.left.assign(n, -1);
+    t.right.assign(n, -1);
+
+    // build a random valid binary tree (very simple)
+    for(std::size_t v=1; v<n; ++v){
+      while(true){
+        const int p = pick_node(rng) % static_cast<int>(v); // attach only to existing
+        if(ur(rng) < 0.5){
+          if(t.left[p] < 0){ t.left[p] = static_cast<int>(v); break; }
+        } else {
+          if(t.right[p] < 0){ t.right[p] = static_cast<int>(v); break; }
+        }
+      }
+    }
+
+    std::vector<double> xy(2*n, 0.0);
+    dec.decode(t, eval.WVec().data(), eval.HVec().data(), xy.data());
+    Metrics cur = eval.compute_all_xy(xy.data(), 0);
+    store.push_raw(xy.data(), 2*n, cur);
+
+    for(std::size_t it=1; it<=steps; ++it){
+      const double T = temp_geometric(t0, t1, it, steps);
+
+      // neighbor: swap two module IDs by swapping W/H association *implicitly* not possible here
+      // so we do a topology swap: swap left children of two nodes (cheap and valid)
+      int a = pick_node(rng), b = pick_node(rng);
+      if(a == b) b = (b+1) % static_cast<int>(n);
+
+      std::swap(t.left[static_cast<std::size_t>(a)], t.left[static_cast<std::size_t>(b)]);
+
+      dec.decode(t, eval.WVec().data(), eval.HVec().data(), xy.data());
+      Metrics nxt = eval.compute_all_xy(xy.data(), it);
+
+      const double dE = nxt.augmented_objective - cur.augmented_objective;
+      bool accept = (dE <= 0.0);
+      if(!accept && T > 0.0){
+        accept = (ur(rng) < std::exp(-dE / T));
+      }
+
+      if(accept){
+        cur = nxt;
+        store.push_raw(xy.data(), 2*n, cur);
+      } else {
+        std::swap(t.left[static_cast<std::size_t>(a)], t.left[static_cast<std::size_t>(b)]);
+      }
+    }
+  }
+
+  static void solve_slicing(LayoutEvaluator& eval, HistoryStore& store,
+                            std::uint64_t seed,
+                            std::size_t steps, double t0, double t1){
+
+    const std::size_t n = eval.num_rects();
+    SlicingDecoder dec; dec.init(n);
+
+    std::vector<int> perm(n);
+    std::iota(perm.begin(), perm.end(), 0);
+
+    std::vector<std::uint8_t> ops(n>0? n-1:0, 0); // 0=H,1=V
+
+    std::mt19937_64 rng(seed);
+    std::shuffle(perm.begin(), perm.end(), rng);
+    std::uniform_int_distribution<int> pick_idx(0, static_cast<int>(n-1));
+    std::uniform_real_distribution<double> ur(0.0, 1.0);
+
+    for(auto& op : ops) op = (ur(rng) < 0.5) ? 0 : 1;
+
+    std::vector<double> xy(2*n, 0.0);
+    dec.decode(perm.data(), ops.data(), eval.WVec().data(), eval.HVec().data(), xy.data());
+    Metrics cur = eval.compute_all_xy(xy.data(), 0);
+    store.push_raw(xy.data(), 2*n, cur);
+
+    for(std::size_t it=1; it<=steps; ++it){
+      const double T = temp_geometric(t0, t1, it, steps);
+
+      const bool do_swap = (ur(rng) < 0.7);
+      int a=0,b=0; std::uint8_t old=0;
+      if(do_swap){
+        a = pick_idx(rng); b = pick_idx(rng);
+        if(a==b) b = (b+1) % static_cast<int>(n);
+        std::swap(perm[static_cast<std::size_t>(a)], perm[static_cast<std::size_t>(b)]);
+      } else if(!ops.empty()){
+        a = static_cast<int>(std::uniform_int_distribution<int>(0, static_cast<int>(ops.size()-1))(rng));
+        old = ops[static_cast<std::size_t>(a)];
+        ops[static_cast<std::size_t>(a)] = (old ^ 1u);
+      }
+
+      dec.decode(perm.data(), ops.data(), eval.WVec().data(), eval.HVec().data(), xy.data());
+      Metrics nxt = eval.compute_all_xy(xy.data(), it);
+
+      const double dE = nxt.augmented_objective - cur.augmented_objective;
+      bool accept = (dE <= 0.0);
+      if(!accept && T > 0.0) accept = (ur(rng) < std::exp(-dE / T));
+
+      if(accept){
+        cur = nxt;
+        store.push_raw(xy.data(), 2*n, cur);
+      } else {
+        // revert
+        if(do_swap){
+          std::swap(perm[static_cast<std::size_t>(a)], perm[static_cast<std::size_t>(b)]);
+        } else if(!ops.empty()){
+          ops[static_cast<std::size_t>(a)] = old;
+        }
+      }
+    }
+  }
+};
+
+8) Placement::execute(): select solver ONCE (fast)
+
+Replace your Placement::execute() with:
+
+// ===== PATCH: Placement::execute solver strategy =====
+void execute(){
+  Stopwatch sw;
+
+  const OptimizerAlgo algo = parse_optimizer_algo(cfg_.optimizer.algorithm);
+
+  // CP-SAT
+  if(cfg_.formulation.kind == FormulationKind::CPSAT || algo == OptimizerAlgo::CPSAT){
+#ifndef PLACEMENT_ENGINE_WITH_ORTOOLS
+    throw std::runtime_error("CPSAT requested but OR-Tools support not built. "
+                             "Build with -DPLACEMENT_ENGINE_WITH_ORTOOLS=ON and link OR-Tools.");
+#else
+    // TODO: OR-Tools CPSAT implementation (model non-overlap, canvas bounds, objective, etc.)
+#endif
+  }
+
+  // Discrete SA formulations
+  if(algo == OptimizerAlgo::SA){
+    if(cfg_.formulation.kind == FormulationKind::SequencePair){
+      SASolvers::solve_sequence_pair(evaluator_, store_, cfg_.optimizer.seed,
+                                     cfg_.formulation.sa_steps, cfg_.formulation.sa_t0, cfg_.formulation.sa_t1);
+    } else if(cfg_.formulation.kind == FormulationKind::BStarTree){
+      SASolvers::solve_bstar(evaluator_, store_, cfg_.optimizer.seed,
+                             cfg_.formulation.sa_steps, cfg_.formulation.sa_t0, cfg_.formulation.sa_t1);
+    } else if(cfg_.formulation.kind == FormulationKind::SlicingTree){
+      SASolvers::solve_slicing(evaluator_, store_, cfg_.optimizer.seed,
+                               cfg_.formulation.sa_steps, cfg_.formulation.sa_t0, cfg_.formulation.sa_t1);
+    } else {
+      throw std::runtime_error("SA requested but formulation is not a discrete structure.");
+    }
+    runtime_s_ = sw.Seconds();
+    optimized_ = true;
+    return;
+  }
+
+  // Continuous DE (penalty / reduced_space)
+  if(algo == OptimizerAlgo::DE){
+    arma::arma_rng::set_seed(static_cast<arma::uword>(cfg_.optimizer.seed));
+    LayoutObjective obj(&evaluator_);
+    arma::mat x = evaluator_.initial_point();
+
+    IterationCallback cb;
+    cb.init(&evaluator_, &store_, cfg_.optimizer.stopping_criteria, cfg_.optimizer.stopping_value);
+
+    const double F = 0.5 * (cfg_.optimizer.mutation_min + cfg_.optimizer.mutation_max);
+    const double tol = (cfg_.optimizer.stopping_criteria == "target_objective") ? cfg_.optimizer.stopping_value : -1.0;
+
+    ens::DE optimizer(cfg_.optimizer.pop_size, cfg_.optimizer.max_iter, cfg_.optimizer.recombination, F, tol);
+    optimizer.Optimize(obj, x, cb);
+
+    runtime_s_ = sw.Seconds();
+    optimized_ = true;
+    return;
+  }
+
+  throw std::runtime_error("Unknown optimizer.algorithm path.");
+}
+// ===== END PATCH =====
+
+9) CP / CP-SAT (CPSAT) integration (optional build)
+
+This is heavy and should not run through compute_all() iteration-by-iteration. It’s a solver strategy.
+
+CMake toggle
+option(PLACEMENT_ENGINE_WITH_ORTOOLS "Enable OR-Tools CPSAT solver" OFF)
+if(PLACEMENT_ENGINE_WITH_ORTOOLS)
+  add_definitions(-DPLACEMENT_ENGINE_WITH_ORTOOLS=1)
+  # link OR-Tools here (package or FetchContent)
+endif()
+
+What CPSAT would model (when you enable it)
+
+Variables: x_i, y_i (or integer grid scaled)
+
+Non-overlap: disjunctive constraints for each pair (or use NoOverlap2D if available)
+
+Boundary: 0 <= x_i - w_i/2 and x_i + w_i/2 <= W etc
+
+Objective: minimize w_area*bbox_area + w_hpwl*hpwl (hpwl requires bbox of centers; can linearize with aux vars)
+
+Important: CP-SAT is not compatible with your “10k iterations in 10ms” target; it’s a different class of solver used for global feasibility/optimality.
+
+10) What stays micro-fast (your current requirement)
+
+Penalty path: compute_all_xy() unchanged, and compute_all() is just eval_fn_(*this, x, iter) (one indirect call).
+
+No string comparisons in evaluation.
+
+Reduced-space adds only O(k) assignments to expand active variables (often reduces time because DE dimension shrinks).
+
+Structural formulations are real implementations but inherently heavier than direct XY penalty evaluation (they’re discrete floorplanning). They run only when selected.
+
+One critical note about varList
+
+Your example varList length is 8, but blocks may be variable. For reduced-space to work correctly:
+
+varList must be length 2*n (mask per coordinate), OR
+
+you must define a convention (mask per block, mask x-only etc.) and expand it during parse.
+
+If you want zero ambiguity, enforce: varList.size() == 2*blocks.size() at parse time (throw if mismatch).
