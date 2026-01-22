@@ -1,207 +1,270 @@
-Below is a zero-overhead-in-compute_all() way to support 3 penalty types per constraint:
+Got it. The key to keeping compute_all() as fast as it is now is:
 
-"simple_penalty" → w * v² (what you have now)
+Parse the constraint type once in JsonIO
 
-"barrier_penalty-exp" → w * (exp(k*v) - 1)
+Convert it to a pre-selected function pointer (or enum→function pointer) stored in ConstraintConfig
 
-"barrier_penalty-log" → w * log1p(k*v)
+In compute_all() do zero string compares / zero switching, just:
 
-✅ Key property: compute_all() does no string compares and no switch.
-Penalty selection is done once during parsing/config init by setting a function pointer inside each ConstraintConfig. In compute_all() it’s just penalty += cfg_.overlap_c.penalty(overlap_pen);.
+compute metric (overlap/boundary/aspect)
 
-CHANGE 1 — Replace class ConstraintConfig (adds penalty function pointer + type selection)
-Replace this exact code block:
+penalty += weight * penalty_fn(metric)
+
+Below are the exact code blocks to replace / exact insert locations based on the snippets you pasted.
+
+CHANGE 1 — Add penalty type + penalty functions (INSERT)
+
+File: where ConstraintConfig is defined (same header/cc)
+
+INSERT this code immediately ABOVE:
 class ConstraintConfig{
-public:
-	ConstraintConfig() : enabled(false), weight(0.0), normalization("no norm"), aggregation("sum") {}
-	bool enabled;
-	double weight;
-	std::string normalization;
-	std::string aggregation;
-	std::string type;
+
+INSERT:
+enum class PenaltyType : std::uint8_t
+{
+    SIMPLE_PENALTY = 0,          // weight * (v^2)
+    BARRIER_PENALTY_EXP = 1,     // weight * (exp(v) - 1)
+    BARRIER_PENALTY_LOG = 2      // weight * log(1 + v)
 };
 
-With this exact code block:
+class PenaltyFns
+{
+public:
+    static double SimpleSquare(const double v) noexcept
+    {
+        return v * v;
+    }
+
+    static double BarrierExp(const double v) noexcept
+    {
+        // 0 at v=0, grows fast; expm1 is stable for small v
+        return std::expm1(v);
+    }
+
+    static double BarrierLog(const double v) noexcept
+    {
+        // 0 at v=0; slower growth than exp
+        return std::log1p(v);
+    }
+};
+
+CHANGE 2 — Update ConstraintConfig to store a preselected penalty function (REPLACE)
+REPLACE this entire block:
 class ConstraintConfig{
 public:
-  typedef double (*PenaltyFn)(double v, double w, double k);
+    ConstraintConfig() : enabled(false), weight(0.0), normalization("no norm"), aggregation("sum") {}
+    bool enabled;
+    double weight;
+    std::string normalization;
+    std::string aggregation;
+    std::string type;
+};
 
-  ConstraintConfig()
-  : enabled(false),
-    weight(0.0),
-    normalization("no norm"),
-    aggregation("sum"),
-    type("simple_penalty"),
-    barrier_k(1.0),
-    penalty_fn_(&ConstraintConfig::SimplePenalty)
-  {}
+WITH this exact block:
+class ConstraintConfig{
+public:
+    ConstraintConfig()
+        : enabled(false),
+          weight(0.0),
+          normalization("no norm"),
+          aggregation("sum"),
+          type("simple_penalty"),
+          penalty_type(PenaltyType::SIMPLE_PENALTY),
+          penalty_fn(&PenaltyFns::SimpleSquare)
+    {}
 
-  bool enabled;
-  double weight;                 // parsed from "penalty_weight" (or "weight" fallback)
-  std::string normalization;
-  std::string aggregation;
-  std::string type;              // "simple_penalty" | "barrier_penalty-exp" | "barrier_penalty-log"
+    bool enabled;
+    double weight;
+    std::string normalization;
+    std::string aggregation;
 
-  // Optional scaling for barrier penalties (default 1.0). If you don't want it, keep default.
-  double barrier_k;
+    // Parsed from JSON
+    std::string type;
 
-  // Set once during parsing/init. NEVER call in compute_all().
-  void SetPenaltyType(const std::string& t)
-  {
-    type = t;
-    if (t == "simple_penalty")        penalty_fn_ = &ConstraintConfig::SimplePenalty;
-    else if (t == "barrier_penalty-exp") penalty_fn_ = &ConstraintConfig::BarrierPenaltyExp;
-    else if (t == "barrier_penalty-log") penalty_fn_ = &ConstraintConfig::BarrierPenaltyLog;
-    else throw std::runtime_error("Unknown constraint penalty type: " + t);
-  }
+    // Pre-decided at parse-time: NO selection needed in compute_all()
+    PenaltyType penalty_type;
+    double (*penalty_fn)(double);
+};
 
-  // Fast: one indirect call, no selection/branching on type inside compute_all().
-  inline double penalty(const double v) const
-  {
-    return penalty_fn_(v, weight, barrier_k);
-  }
+CHANGE 3 — Fix parsing: parse type and bind penalty_fn once (REPLACE)
+
+In your JsonIO class:
+
+REPLACE this entire function:
+static ConstraintConfig parse_constraint(const json& cnode, bool b_agg_norm){
+    ConstraintConfig cc;
+    cc.enabled = parse_bool_str(cnode.at("enabled").get<std::string>());
+    cc.weight = cnode.at("penalty_weight").get<double>();
+    cc.type = cnode.at("type").get<std::string>();
+    if(b_agg_norm){
+        c.normalization = cnode.at("normalization").get<std::string>();
+        cc.aggregation = cnode.at("aggregation").get<std::string>();
+    }
+    return cc;
+}
+
+WITH this exact function:
+static ConstraintConfig parse_constraint(const json& cnode, const bool b_agg_norm)
+{
+    ConstraintConfig cc;
+
+    cc.enabled = parse_bool_str(cnode.at("enabled").get<std::string>());
+    cc.weight  = cnode.at("penalty_weight").get<double>();
+
+    // type is required
+    cc.type = cnode.at("type").get<std::string>();
+
+    // Bind penalty function ONCE (no string compares in compute_all)
+    if (cc.type == "simple_penalty")
+    {
+        cc.penalty_type = PenaltyType::SIMPLE_PENALTY;
+        cc.penalty_fn   = &PenaltyFns::SimpleSquare;
+    }
+    else if (cc.type == "barrier_penalty-exp")
+    {
+        cc.penalty_type = PenaltyType::BARRIER_PENALTY_EXP;
+        cc.penalty_fn   = &PenaltyFns::BarrierExp;
+    }
+    else if (cc.type == "barrier_penalty-log")
+    {
+        cc.penalty_type = PenaltyType::BARRIER_PENALTY_LOG;
+        cc.penalty_fn   = &PenaltyFns::BarrierLog;
+    }
+    else
+    {
+        throw std::runtime_error(
+            "Invalid constraint type: " + cc.type +
+            ". Allowed: simple_penalty | barrier_penalty-exp | barrier_penalty-log");
+    }
+
+    // normalization/aggregation only for per-rect / per-pair constraints
+    if (b_agg_norm)
+    {
+        if (cnode.contains("normalization"))
+            cc.normalization = cnode.at("normalization").get<std::string>();
+        if (cnode.contains("aggregation"))
+            cc.aggregation = cnode.at("aggregation").get<std::string>();
+    }
+
+    return cc;
+}
+
+CHANGE 4 — Fix parse_config: aspect_violation must NOT require norm/agg (REPLACE 3 lines)
+
+In JsonIO::parse_config, you currently have:
+
+REPLACE these 3 lines:
+cfg.overlap_c = parse_constraint(con.at("overlap"), true)
+cfg.aspect_c = parse_constraint(con.at("aspect_violation"), true)
+cfg.boundary_c = parse_constraint(con.at("boundary_violation"), true)
+
+WITH these 3 lines:
+cfg.overlap_c  = parse_constraint(con.at("overlap"), true);
+cfg.aspect_c   = parse_constraint(con.at("aspect_violation"), false);
+cfg.boundary_c = parse_constraint(con.at("boundary_violation"), true);
+
+
+(Aspect has no normalization/aggregation keys in your config, so passing true was wrong and will either crash or force you to add unused keys.)
+
+CHANGE 5 — Pre-bind penalty fns inside LayoutEvaluator (NO selection in compute_all)
+5A) Add members to LayoutEvaluator (INSERT)
+
+In class LayoutEvaluator private section, find:
 
 private:
-  PenaltyFn penalty_fn_;
+    LayoutConfig cfg_;
+    mutable HistoryStore store_;
+    std::size_t n_;
 
-  static double SimplePenalty(const double v, const double w, const double /*k*/)
-  {
-    return w * v * v;
-  }
+INSERT immediately BELOW std::size_t n_;:
+    // Prebound penalty functions (no branching in compute_all)
+    double (*overlap_penalty_fn_)(double);
+    double (*boundary_penalty_fn_)(double);
+    double (*aspect_penalty_fn_)(double);
 
-  static double BarrierPenaltyExp(const double v, const double w, const double k)
-  {
-    // 0 at v=0, grows rapidly. Clamp to prevent inf/NaNs.
-    double t = k * v;
-    if (t > 50.0) t = 50.0;
-    return w * (std::exp(t) - 1.0);
-  }
+5B) Bind them once in init() (INSERT)
 
-  static double BarrierPenaltyLog(const double v, const double w, const double k)
-  {
-    // 0 at v=0, always finite; slower growth than exp.
-    const double t = std::max(0.0, k * v);
-    return w * std::log1p(t);
-  }
-};
+In LayoutEvaluator::init(...), find this exact line:
 
-CHANGE 2 — Json parsing: Replace JsonIO::ParseConstraint(...) (proper parsing + penalty type selection)
+cfg_ = cfg;
 
-You didn’t paste your JsonIO code, so I’m giving an exact replace block for the function that parses a constraint node.
+INSERT immediately BELOW that line:
+overlap_penalty_fn_  = cfg_.overlap_c.penalty_fn;
+boundary_penalty_fn_ = cfg_.boundary_c.penalty_fn;
+aspect_penalty_fn_   = cfg_.aspect_c.penalty_fn;
 
-Find your existing function that looks like (or is very close to) this:
-static ConstraintConfig ParseConstraint(const json& cnode)
-{
-  ConstraintConfig cc;
-  cc.enabled = ParseBoolString(cnode.at("switch").get<std::string>());
-  cc.weight = cnode.at("weight").get<double>();
-  cc.normalization = cnode.at("normalization").get<std::string>();
-  cc.aggregation = cnode.at("aggregation").get<std::string>();
-  return cc;
-}
+CHANGE 6 — Use the prebound penalty fns in compute_all() (REPLACE penalty block)
 
-Replace that entire function with this exact function:
-static ConstraintConfig ParseConstraint(const json& cnode)
-{
-  ConstraintConfig cc;
+In LayoutEvaluator::compute_all(...), you currently have:
 
-  // enabled can come as "enabled" or legacy "switch"
-  if (cnode.contains("enabled"))      cc.enabled = ParseBoolString(cnode.at("enabled").get<std::string>());
-  else if (cnode.contains("switch"))  cc.enabled = ParseBoolString(cnode.at("switch").get<std::string>());
-  else                                cc.enabled = false;
-
-  // penalty weight can come as "penalty_weight" or legacy "weight"
-  if (cnode.contains("penalty_weight")) cc.weight = cnode.at("penalty_weight").get<double>();
-  else if (cnode.contains("weight"))    cc.weight = cnode.at("weight").get<double>();
-  else                                  cc.weight = 0.0;
-
-  if (cnode.contains("normalization")) cc.normalization = cnode.at("normalization").get<std::string>();
-  else                                 cc.normalization = "no norm";
-
-  if (cnode.contains("aggregation"))   cc.aggregation = cnode.at("aggregation").get<std::string>();
-  else                                 cc.aggregation = "sum";
-
-  // penalty type
-  std::string t = "simple_penalty";
-  if (cnode.contains("type")) t = cnode.at("type").get<std::string>();
-  cc.SetPenaltyType(t);
-
-  // optional parameter for barrier scaling
-  if (cnode.contains("barrier_k")) cc.barrier_k = cnode.at("barrier_k").get<double>();
-
-  return cc;
-}
-
-
-✅ This correctly parses your jPars format:
-
-"type" : "simple_penalty",
-"penalty_weight" : 100.0
-
-
-…and supports the two new types.
-
-CHANGE 3 — Replace penalty composition inside LayoutEvaluator::compute_all(...)
-Find this exact block in compute_all():
+REPLACE this exact block:
 double penalty = 0.0;
 if(cfg_.overlap_c.enabled) penalty += cfg_.overlap_c.weight * overlap_pen * overlap_pen;
 if(cfg_.boundary_c.enabled) penalty += cfg_.boundary_c.weight * boundary_agg * boundary_agg;
 if(cfg_.aspect_c.enabled) penalty += cfg_.aspect_c.weight * aspect_vi * aspect_vi;
 
-Replace it with this exact block:
+WITH this exact block:
 double penalty = 0.0;
 
-// No selection here. Type is pre-bound via function pointer in ConstraintConfig.
-if (cfg_.overlap_c.enabled)   penalty += cfg_.overlap_c.penalty(overlap_pen);
-if (cfg_.boundary_c.enabled)  penalty += cfg_.boundary_c.penalty(boundary_agg);
-if (cfg_.aspect_c.enabled)    penalty += cfg_.aspect_c.penalty(aspect_vi);
+// NO type selection here; penalty_fn_* already fixed at parse/init time.
+if (cfg_.overlap_c.enabled)
+    penalty += cfg_.overlap_c.weight * overlap_penalty_fn_(overlap_pen);
+
+if (cfg_.boundary_c.enabled)
+    penalty += cfg_.boundary_c.weight * boundary_penalty_fn_(boundary_agg);
+
+if (cfg_.aspect_c.enabled)
+    penalty += cfg_.aspect_c.weight * aspect_penalty_fn_(aspect_vi);
 
 
-That’s the whole point: compute_all() stays fast and clean.
+✅ Result:
 
-CHANGE 4 — Ensure parsing calls your updated ParseConstraint
+simple_penalty behaves exactly like before (square).
 
-Wherever you parse constraints, you should already have something like:
+barrier types add exp/log penalties with no runtime decision overhead.
 
-cfg.overlap_c  = ParseConstraint(c.at("overlap"));
-cfg.aspect_c   = ParseConstraint(c.at("aspect_violation"));
-cfg.boundary_c = ParseConstraint(c.at("boundary_violation"));
+CHANGE 7 — Fix a critical HPWL bug in your loop (REPLACE 2 lines)
 
+In your loop inside compute_all() you have:
 
-If your current JsonIO uses different names, keep your existing mapping, but ensure each one calls the new ParseConstraint.
-
-No other changes are needed.
-
-How to use in JSON (examples)
-Existing behavior (same as now)
-"type": "simple_penalty"
-
-Exponential barrier
-"type": "barrier_penalty-exp",
-"barrier_k": 2.0
-
-Log barrier (soft barrier)
-"type": "barrier_penalty-log",
-"barrier_k": 5.0
+max_cx = std::min(max_cx, cx);
+max_cy = std::min(max_cy, cy);
 
 
-If you omit barrier_k, it defaults to 1.0.
+That is wrong (max should use std::max), and it will completely break HPWL.
 
-Why this meets your “NO overhead / extremely fast” requirement
+REPLACE those 2 lines with:
+max_cx = std::max(max_cx, cx);
+max_cy = std::max(max_cy, cy);
 
-No string compares, no switch, no std::function, no virtual calls inside compute_all().
+Notes on “barrier” definitions
 
-Each constraint penalty is exactly one indirect call (3 calls max per evaluation), which is negligible compared to overlap/bbox calculations.
+Because your config does not provide extra parameters (like barrier scale, epsilon, feasible margin), the above uses fast, safe defaults:
 
-All selection happens once during parsing/config init.
+barrier_penalty-exp: expm1(v)
+
+barrier_penalty-log: log1p(v)
+
+Both are:
+
+monotonic increasing for v ≥ 0
+
+exactly 0 at v = 0
+
+cheap (only 3 calls per iteration max)
+
+If you later want per-constraint tuning (e.g., barrier_scale), we can add a double barrier_scale; to ConstraintConfig and still avoid branches in compute_all() (but we’d need a different mechanism than a plain function pointer—still doable fast).
+
+Also fix your config key mismatch (important)
+
+Your config uses:
+
+"stopping_criteria": "maxiter"
 
 
+but your callback checks:
+
+if(stopping_mode_ == "target_objective")
 
 
-
-
-
-
-
-
-
+So "maxiter" is fine, but make sure you are consistent elsewhere (some earlier code used "max_iter").
