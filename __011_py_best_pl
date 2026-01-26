@@ -1,0 +1,330 @@
+1) python/_dash.py — make top row 30% params + 55% canvas + 15% best-select
+1.1 Replace the width fraction constants (and add the 15% column constant)
+
+File: python/_dash.py
+Replace this exact block (lines 10–13):
+
+PARAM_SECTION_WIDTH_FRACTION = 0.32
+LIVE_SECTION_WIDTH_FRACTION = 0.68
+LIVE_SECTION_WIDTH_FRACTION_LOWER = 1.0
+PARAM_PANEL_FONT_SIZE = "8pt"
+
+
+With this:
+
+PARAM_SECTION_WIDTH_FRACTION = 0.30
+LIVE_SECTION_WIDTH_FRACTION = 0.55
+BEST_SELECTION_SECTION_WIDTH_FRACTION = 0.15
+LIVE_SECTION_WIDTH_FRACTION_LOWER = 1.0
+PARAM_PANEL_FONT_SIZE = "8pt"
+
+1.2 Insert CSS for the new 15% “best selection” column
+
+File: python/_dash.py (inside DASHBOARD_CSS = f""" ... """)
+Insert the following block immediately below this exact block (lines 75–81):
+
+.live-section{{
+	width: {LIVE_SECTION_WIDTH_FRACTION*100:.1f}vw;
+	overflow-y: visible;
+	padding: 4px;
+	box-sizing: border-box;
+	background-color: {UI_BG_COLOR};
+}}
+
+
+Insert:
+
+.best-selection-section{{
+	width: {BEST_SELECTION_SECTION_WIDTH_FRACTION*100:.1f}vw;
+	overflow-y: auto;
+	overflow-x: hidden;
+	padding: 4px;
+	box-sizing: border-box;
+	background-color: {UI_PANEL_BG_COLOR};
+	color: {UI_TEXT_COLOR};
+	font-size: {PARAM_PANEL_FONT_SIZE};
+}}
+
+
+(Do not remove or reorder other CSS blocks.)
+
+1.3 Import the runner + selection enums (reusing the existing engine instance)
+
+File: python/_dash.py
+Replace these exact lines (45–46):
+
+from optim_manager import OptimizationManager
+from input_placement import InputPlacementManager
+
+
+With:
+
+from optim_manager import OptimizationManager, runner
+from input_placement import InputPlacementManager
+
+import placement_engine_py as pe
+
+
+This ensures the selection panel uses the same runner instance as the rest of the dashboard (no duplicate engine state).
+
+1.4 Insert the best-selection panel widgets + callback (updates canvas + axes + slider + metrics text)
+
+File: python/_dash.py
+Insert the following code block immediately below this exact line (line 916):
+
+save_html_button = pn.widgets.Button(name="Save HTML", button_type="primary", width=60, styles={"color" : UI_TEXT_COLOR})
+
+
+And immediately above this exact line (line 918):
+
+status_text = pn.Column(manager.status_text, manager.elapsed_time_text, sizing_mode="stretch_width", css_classes=["param-row"])
+
+
+INSERT:
+
+# -----------------------------
+# Best placement selection panel (C++ SelectionProgram)
+# -----------------------------
+_best_metric_name_to_enum = {
+	"augmented_objective": pe.Metric.augmented_objective,
+	"bbox_area": pe.Metric.bbox_area,
+	"hpwl": pe.Metric.hpwl,
+	"overlap": pe.Metric.overlap,
+	"boundary_violation": pe.Metric.boundary_violation,
+	"aspect_ratio_violation": pe.Metric.aspect_ratio_violation,
+	"dead_space_area": pe.Metric.dead_space_area,
+	"symmetry_violation": pe.Metric.symmetry_violation,
+}
+
+_best_compare_name_to_enum = {
+	"<=": pe.CompareOp.less_equal,
+	"<": pe.CompareOp.less,
+	">=": pe.CompareOp.greater_equal,
+	">": pe.CompareOp.greater,
+	"==": pe.CompareOp.equal,
+	"!=": pe.CompareOp.not_equal,
+}
+
+_best_objective_name_to_enum = {
+	"arg_min": pe.ObjectiveOp.arg_min,
+	"arg_max": pe.ObjectiveOp.arg_max,
+}
+
+best_sel_title = pn.pane.Markdown("**Best Placement Selection**", styles={"color": UI_TEXT_COLOR})
+
+best_obj_metric = pn.widgets.Select(
+	name="Objective",
+	options=list(_best_metric_name_to_enum.keys()),
+	value="augmented_objective",
+	width=160,
+	styles={"color": UI_TEXT_COLOR},
+)
+best_obj_op = pn.widgets.Select(
+	name="Op",
+	options=list(_best_objective_name_to_enum.keys()),
+	value="arg_min",
+	width=90,
+	styles={"color": UI_TEXT_COLOR},
+)
+best_tie_eps = pn.widgets.FloatInput(
+	name="tie_eps",
+	value=0.0,
+	step=1e-6,
+	width=100,
+	styles={"color": UI_TEXT_COLOR},
+)
+
+# Common constraint filters (fast path, no dynamic builder to keep UI compact + fast)
+best_en_overlap = pn.widgets.Checkbox(name="Require overlap <= eps", value=True)
+best_eps_overlap = pn.widgets.FloatInput(name="eps", value=1e-3, step=1e-3, width=100, styles={"color": UI_TEXT_COLOR})
+
+best_en_boundary = pn.widgets.Checkbox(name="Require boundary <= eps", value=False)
+best_eps_boundary = pn.widgets.FloatInput(name="eps", value=0.0, step=1e-3, width=100, styles={"color": UI_TEXT_COLOR})
+
+best_en_aspect = pn.widgets.Checkbox(name="Require aspect_violation <= eps", value=False)
+best_eps_aspect = pn.widgets.FloatInput(name="eps", value=0.0, step=1e-3, width=100, styles={"color": UI_TEXT_COLOR})
+
+best_en_sym = pn.widgets.Checkbox(name="Require symmetry <= eps", value=False)
+best_eps_sym = pn.widgets.FloatInput(name="eps", value=0.0, step=1e-3, width=100, styles={"color": UI_TEXT_COLOR})
+
+best_en_dead = pn.widgets.Checkbox(name="Require dead_space <= eps", value=False)
+best_eps_dead = pn.widgets.FloatInput(name="eps", value=0.0, step=1e-3, width=100, styles={"color": UI_TEXT_COLOR})
+
+best_select_btn = pn.widgets.Button(name="Select Best", button_type="primary", width=160, styles={"color": UI_TEXT_COLOR})
+
+best_selected_metrics = pn.pane.Markdown(
+	"Selected metrics will appear here.",
+	styles={"color": UI_TEXT_COLOR, "font-size": PARAM_PANEL_FONT_SIZE, "font-family": UI_FONT_FAMILY},
+)
+
+def _best_build_program() -> pe.SelectionProgram:
+	pr = pe.SelectionProgram()
+	pr.clear()
+	pr.clear_objectives()
+
+	obj_m = _best_metric_name_to_enum[best_obj_metric.value]
+	obj_op = _best_objective_name_to_enum[best_obj_op.value]
+	pr.add_objective(obj_m, obj_op, float(best_tie_eps.value))
+
+	# Add enabled filters (single AND-clause)
+	if bool(best_en_overlap.value):
+		pr.add_filter(pe.Metric.overlap, pe.CompareOp.less_equal, float(best_eps_overlap.value), 0.0)
+	if bool(best_en_boundary.value):
+		pr.add_filter(pe.Metric.boundary_violation, pe.CompareOp.less_equal, float(best_eps_boundary.value), 0.0)
+	if bool(best_en_aspect.value):
+		pr.add_filter(pe.Metric.aspect_ratio_violation, pe.CompareOp.less_equal, float(best_eps_aspect.value), 0.0)
+	if bool(best_en_sym.value):
+		pr.add_filter(pe.Metric.symmetry_violation, pe.CompareOp.less_equal, float(best_eps_sym.value), 0.0)
+	if bool(best_en_dead.value):
+		pr.add_filter(pe.Metric.dead_space_area, pe.CompareOp.less_equal, float(best_eps_dead.value), 0.0)
+
+	# If nothing matches, fall back to engine "best_index" (C++ global best)
+	pr.fallback_policy = pe.FallbackPolicy.use_best_index
+	return pr
+
+def _best_center_canvas_from_metrics(mrec: Any) -> None:
+	# Center view on bbox; keep padding so placement is clearly visible.
+	cx = float(mrec["bbox_cx"])
+	cy = float(mrec["bbox_cy"])
+	bw = float(mrec["bbox_w"])
+	bh = float(mrec["bbox_h"])
+
+	pad = float(main_tab_canvas_buffer) + 0.15 * max(bw, bh, 1.0)
+	half_x = max(0.6 * bw, 1.0) + pad
+	half_y = max(0.6 * bh, 1.0) + pad
+
+	canvas_fig.x_range.start = cx - half_x
+	canvas_fig.x_range.end = cx + half_x
+	canvas_fig.y_range.start = cy - half_y
+	canvas_fig.y_range.end = cy + half_y
+
+def _best_render_metrics_text(idx: int, mrec: Any) -> None:
+	best_selected_metrics.object = (
+		f"**Selected Best Placement**\n\n"
+		f"- history_index: `{idx}`\n"
+		f"- bbox_area: `{float(mrec['bbox_area']):.6g}`\n"
+		f"- hpwl: `{float(mrec['hpwl']):.6g}`\n"
+		f"- overlap: `{float(mrec['overlap']):.6g}`\n"
+		f"- aspect_ratio_violation: `{float(mrec['aspect_ratio_violation']):.6g}`\n"
+		f"- boundary_violation: `{float(mrec['boundary_violation']):.6g}`\n"
+	)
+
+def on_best_select_click(event) -> None:
+	try:
+		# Ensure history is loaded (needed for slider/canvas updates)
+		if manager.run_coords is None or manager.run_W is None:
+			manager._update_optim_values()
+
+		pr = _best_build_program()
+		idx = int(runner.select_best_index(pr))
+
+		# Update slider first (drives main-canvas update via existing watcher)
+		manager.iter_slider.value = idx
+
+		# Center axes and render metrics from C++ metrics history (fast, zero-copy)
+		mh = runner.metrics_history()
+		mrec = mh[idx]
+		_best_center_canvas_from_metrics(mrec)
+		_best_render_metrics_text(idx, mrec)
+
+		manager._update_status(f"idle (selected best index = {idx})")
+	except Exception as e:
+		manager._update_status(f"idle (best-select failed: {e})")
+
+best_select_btn.on_click(on_best_select_click)
+
+best_selection_right = pn.Column(
+	best_sel_title,
+	pn.Row(best_obj_metric, best_obj_op, best_tie_eps, css_classes=["param-row"]),
+	pn.pane.Markdown("**Filters**", styles={"color": UI_TEXT_COLOR}),
+	pn.Row(best_en_overlap, best_eps_overlap, css_classes=["param-row"]),
+	pn.Row(best_en_boundary, best_eps_boundary, css_classes=["param-row"]),
+	pn.Row(best_en_aspect, best_eps_aspect, css_classes=["param-row"]),
+	pn.Row(best_en_sym, best_eps_sym, css_classes=["param-row"]),
+	pn.Row(best_en_dead, best_eps_dead, css_classes=["param-row"]),
+	pn.Row(best_select_btn, css_classes=["param-row"]),
+	pn.Row(best_selected_metrics, css_classes=["param-row"]),
+	css_classes=["best-selection-section"],
+)
+
+
+This satisfies:
+
+(2) Metrics text at bottom of selection panel (bbox area, hpwl, overlap, aspect ratio violation, boundary violation).
+
+(3) Canvas updates via existing slider watcher, and axes are centered on bbox immediately.
+
+(4) Slider instantly jumps to the best placement index.
+
+1.5 Apply the 30% width class to the existing parameter column and add the new 15% column to the top row
+
+File: python/_dash.py
+
+1.5.1 Change only the css_classes line at the end of parameters_left
+
+Replace this exact line (line 949):
+
+	css_classes=["param-row"],
+
+
+With:
+
+	css_classes=["parameters-section", "param-row"],
+
+1.5.2 Replace the top = ... row to include the new right column
+
+Replace this exact line (line 954):
+
+top = pn.Column(pn.Row(parameters_left, live_updates_right, css_classes=["screen_section"]))
+
+
+With:
+
+top = pn.Column(pn.Row(parameters_left, live_updates_right, best_selection_right, css_classes=["screen_section"]))
+
+
+This preserves the rest of your existing tab composition (bottom_1, bottom_2, logs tab, etc.) while adding the requested 3-column split.
+
+2) C++ root-cause fix — best selection can be wrong due to restrictive best_index_ tracking
+2.1 cpp/include/history_store.h — fix global “best_index” tracking (don’t require overlap==0)
+
+File: cpp/include/history_store.h
+Function: void push(...)
+Replace this exact block (lines 74–79):
+
+		if(m.augmented_objective < best_obj_ && m.overlap == 0.0 && m.bbox_Area > 0.0) {
+			best_obj_ = m.augmented_objective;
+			best_metrics_ = m;
+			best_index_ = iter_count_;
+			std::memcpy(best_coords_.data(), p, sizeof(double) * (2*n_));
+		}
+
+
+With this:
+
+		// Track global best by augmented objective (penalties already include constraint costs).
+		// Feasibility-only selection (e.g., "no overlap") must be enforced via SelectionProgram filters.
+		if(m.augmented_objective < best_obj_ && m.bbox_area > 0.0) {
+			best_obj_ = m.augmented_objective;
+			best_metrics_ = m;
+			best_index_ = iter_count_;
+			std::memcpy(best_coords_.data(), p, sizeof(double) * (2*n_));
+		}
+
+
+Why this is the root cause: your Python/UI selection uses SelectionProgram and may fall back to best_index; if best_index_ is only updated when overlap == 0.0, then in many runs it stays at 0 or points to a non-representative solution even though your penalties already incorporate overlap/boundary/aspect/symmetry/deadspace.
+
+2.2 cpp/include/data_classes.h — initialize iteration_index to prevent garbage values shown in UI/telemetry
+
+File: cpp/include/data_classes.h
+Replace this exact line (line 26):
+
+	std::size_t iteration_index;
+
+
+With:
+
+	std::size_t iteration_index = 0;
+
+
+This prevents undefined iteration indices from leaking into metrics displays and selection diagnostics.
