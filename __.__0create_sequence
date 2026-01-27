@@ -1,0 +1,107 @@
+std::vector<std::vector<int>> make_vectors(
+    int inner_len,
+    const std::vector<int>& max_vals,
+    std::size_t outer_len = 0)
+{
+    if (inner_len <= 0) return {};
+    const std::size_t N = static_cast<std::size_t>(inner_len);
+    if (max_vals.size() < N) return {};
+
+    // Copy & sanitize maxima (inclusive), compute global max.
+    std::vector<int> maxv;
+    maxv.reserve(N);
+    int global_max = 0;
+    for (std::size_t i = 0; i < N; ++i) {
+        int mv = max_vals[i];
+        if (mv < 0) mv = 0;
+        maxv.push_back(mv);
+        global_max = std::max(global_max, mv);
+    }
+
+    std::vector<std::vector<int>> out;
+    if (outer_len) {
+        out.reserve(outer_len);
+    } else {
+        // Reserve only if the full product is not absurdly large (avoid huge allocations).
+        constexpr std::size_t kReserveCap = 10'000'000;
+        std::size_t prod = 1;
+        bool ok = true;
+        for (int mv : maxv) {
+            const std::size_t factor = static_cast<std::size_t>(mv) + 1u;
+            if (factor == 0u || prod > kReserveCap / factor) { ok = false; break; }
+            prod *= factor;
+        }
+        if (ok) out.reserve(prod);
+    }
+
+    std::vector<int> cur(N, 0);
+    std::size_t produced = 0;
+
+    struct Gen {
+        const std::vector<int>& maxv;
+        std::vector<int>& cur;
+        std::vector<std::vector<int>>& out;
+        std::size_t limit;        // 0 => unlimited
+        std::size_t& produced;
+
+        inline bool stop() const noexcept { return limit && produced >= limit; }
+
+        inline void emit() {
+            out.emplace_back(cur); // copies cur (required by vector<vector<int>>)
+            ++produced;
+        }
+
+        // Emit all combinations for dims [idx..] with each dim <= min(maxv[dim], cap),
+        // in plain lexicographic order.
+        void full_lex(std::size_t idx, int cap) {
+            if (stop()) return;
+            const std::size_t N = maxv.size();
+            if (idx == N) { emit(); return; }
+
+            const int hi = std::min(maxv[idx], cap);
+            for (int v = 0; v <= hi; ++v) {
+                if (stop()) break;
+                cur[idx] = v;
+                full_lex(idx + 1, cap);
+            }
+        }
+
+        // Emit shell "m" for dims [idx..], i.e., max among these dims == m,
+        // using the ordering described above.
+        void shell(std::size_t idx, int m) {
+            if (stop()) return;
+            const std::size_t N = maxv.size();
+
+            // Last dimension: only one way to hit max==m here.
+            if (idx + 1 == N) {
+                if (m <= maxv[idx]) {
+                    cur[idx] = m;
+                    emit();
+                }
+                return;
+            }
+
+            // Prefix part: cur[idx] in [0..m-1], remaining dims must hit m somewhere.
+            int hi_prefix = -1;
+            if (m > 0) hi_prefix = std::min(maxv[idx], m - 1);
+            for (int v = 0; v <= hi_prefix; ++v) {
+                if (stop()) break;
+                cur[idx] = v;
+                shell(idx + 1, m);
+            }
+
+            // Plane part: cur[idx] = m, remaining dims can be anything <= m (lex order).
+            if (m <= maxv[idx]) {
+                cur[idx] = m;
+                full_lex(idx + 1, m);
+            }
+        }
+    } gen{maxv, cur, out, outer_len, produced};
+
+    for (int m = 0; m <= global_max; ++m) {
+        if (gen.stop()) break;
+        gen.shell(0, m);
+    }
+
+    return out;
+}
