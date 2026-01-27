@@ -1,0 +1,1209 @@
+1) C++: cpp/include/parallel_exploration_runner.h
+1.1 Insert #include <mutex>
+
+FILE: cpp/include/parallel_exploration_runner.h
+INSERT below this exact line:
+
+#include <memory>
+
+
+INSERT THIS LINE:
+
+#include <mutex>
+
+1.2 Add new public API + Top-K retention members
+
+FILE: cpp/include/parallel_exploration_runner.h
+Find this exact block (it exists exactly like this in your file):
+
+  const RunMonitor& monitor(std::size_t run_id) const { return mon_[run_id]; }
+
+ private:
+  // Inputs
+  std::string jPars_file_;
+
+
+INSERT the following block between those two lines (i.e., after monitor() and before private:):
+
+  // ---- Memory policy / lightweight accessors ----
+  // Full history is only retained for the current top-K runs (by best_bbox_area rule).
+  // For all runs, final placement + final metrics are retained.
+  std::size_t history_keep_top_k() const noexcept { return history_keep_top_k_; }
+  std::size_t num_blocks() const noexcept { return num_blocks_; }
+
+  // True if the run still has its full Runner/History retained.
+  bool run_has_history(std::size_t run_id) const;
+
+  // Current top runs that have history retained (sorted best -> worst). Size <= history_keep_top_k().
+  std::vector<std::size_t> top_history_run_ids() const;
+
+  // Convenience: top best run ids (best -> worst), truncated to k.
+  std::vector<std::size_t> top_best_run_ids(std::size_t k) const;
+
+  // Final placement for a run (always retained once completed):
+  // returns pointer to internal flat buffer [num_blocks x 2], row-major (x,y per block).
+  const double* run_final_coords_data(std::size_t run_id) const;
+
+  // Final and best-per-run metrics (always retained once completed):
+  const Metrics& run_final_metrics(std::size_t run_id) const;
+  const Metrics& run_best_metrics(std::size_t run_id) const;
+
+1.3 Add new private members
+
+FILE: cpp/include/parallel_exploration_runner.h
+Find this exact tail section (it exists exactly like this in your file):
+
+  // Monitors
+  std::vector<RunMonitor> mon_;
+  std::size_t planned_runs_ = 0;
+
+  // Results
+  std::vector<std::unique_ptr<Runner>> results_;
+
+  // Worker threads
+  std::vector<std::thread> workers_;
+  std::atomic<bool> started_{false};
+};
+
+
+REPLACE THAT ENTIRE BLOCK with the following (same content + your new members):
+
+  // Monitors
+  std::vector<RunMonitor> mon_;
+  std::size_t planned_runs_ = 0;
+
+  // Results (full history is retained only for current top-K runs; others are nullptr)
+  std::vector<std::unique_ptr<Runner>> results_;
+
+  // ---- Lightweight retained storage (ALL runs; prevents RAM blow-up) ----
+  std::size_t num_blocks_ = 0;
+  std::size_t history_keep_top_k_ = 10;
+
+  // For every run_id: retain final placement coords (last iteration) and final metrics.
+  // Layout: final_coords_flat_[run_id * (2*num_blocks_) + 2*i + {0,1}] = {x_i, y_i}
+  std::vector<double> final_coords_flat_;
+  std::vector<Metrics> final_metrics_;
+  std::vector<Metrics> best_metrics_;
+
+  struct TopEntry
+  {
+    std::size_t run_id = 0;
+    double best_bbox_area = std::numeric_limits<double>::infinity();
+    std::size_t best_iter = static_cast<std::size_t>(-1);
+  };
+
+  mutable std::mutex top_mu_;
+  std::vector<TopEntry> top_history_; // sorted best->worst, size <= history_keep_top_k_
+
+  // Worker threads
+  std::vector<std::thread> workers_;
+  std::atomic<bool> started_{false};
+};
+
+2) C++: cpp/src/parallel_exploration_runner.cpp
+2.1 Add <mutex> include
+
+FILE: cpp/src/parallel_exploration_runner.cpp
+Find this exact include sequence (top of file):
+
+#include <limits>
+#include <numeric>
+#include <queue>
+
+
+INSERT this line between <limits> and <numeric>:
+
+#include <mutex>
+
+2.2 Make runner(run_id) safe when history was discarded
+
+FILE: cpp/src/parallel_exploration_runner.cpp
+Find this exact block:
+
+Runner& ParallelExplorationRunner::runner(std::size_t run_id)
+{
+  auto st = mon_[run_id].state.load(std::memory_order_acquire);
+  if(st != STATE_COMPLETED) throw std::runtime_error("run not completed");
+
+  return *results_[run_id];
+}
+
+const Runner& ParallelExplorationRunner::runner(std::size_t run_id) const
+{
+  auto st = mon_[run_id].state.load(std::memory_order_acquire);
+  if(st != STATE_COMPLETED) throw std::runtime_error("run not completed");
+
+  return *results_[run_id];
+}
+
+
+REPLACE THAT ENTIRE BLOCK with this:
+
+Runner& ParallelExplorationRunner::runner(std::size_t run_id)
+{
+  auto st = mon_[run_id].state.load(std::memory_order_acquire);
+  if(st != STATE_COMPLETED) throw std::runtime_error("run not completed");
+
+  if(!results_[run_id])
+  {
+    throw std::runtime_error("full history for this run was not retained (kept only for top-K). Use run_final_coords_data/run_final_metrics/run_best_metrics.");
+  }
+  return *results_[run_id];
+}
+
+const Runner& ParallelExplorationRunner::runner(std::size_t run_id) const
+{
+  auto st = mon_[run_id].state.load(std::memory_order_acquire);
+  if(st != STATE_COMPLETED) throw std::runtime_error("run not completed");
+
+  if(!results_[run_id])
+  {
+    throw std::runtime_error("full history for this run was not retained (kept only for top-K). Use run_final_coords_data/run_final_metrics/run_best_metrics.");
+  }
+  return *results_[run_id];
+}
+
+2.3 Implement the new lightweight accessors
+
+FILE: cpp/src/parallel_exploration_runner.cpp
+Find this exact line (immediately after runner() methods in your file):
+
+std::uint64_t ParallelExplorationRunner::now_ns_()
+
+
+INSERT the following block immediately above that line:
+
+bool ParallelExplorationRunner::run_has_history(std::size_t run_id) const
+{
+  if(run_id >= results_.size()) return false;
+  return static_cast<bool>(results_[run_id]);
+}
+
+std::vector<std::size_t> ParallelExplorationRunner::top_history_run_ids() const
+{
+  std::lock_guard<std::mutex> lk(top_mu_);
+  std::vector<std::size_t> out;
+  out.reserve(top_history_.size());
+  for(const auto& e : top_history_) out.push_back(e.run_id);
+  return out;
+}
+
+std::vector<std::size_t> ParallelExplorationRunner::top_best_run_ids(std::size_t k) const
+{
+  std::lock_guard<std::mutex> lk(top_mu_);
+  const std::size_t n = std::min<std::size_t>(k, top_history_.size());
+  std::vector<std::size_t> out;
+  out.reserve(n);
+  for(std::size_t i = 0; i < n; ++i) out.push_back(top_history_[i].run_id);
+  return out;
+}
+
+const double* ParallelExplorationRunner::run_final_coords_data(std::size_t run_id) const
+{
+  auto st = mon_[run_id].state.load(std::memory_order_acquire);
+  if(st != STATE_COMPLETED) throw std::runtime_error("run not completed");
+
+  if(num_blocks_ == 0) throw std::runtime_error("num_blocks_ not initialized");
+  const std::size_t stride = 2 * num_blocks_;
+  if(final_coords_flat_.empty()) throw std::runtime_error("final_coords_flat_ not allocated");
+  if(run_id * stride + stride > final_coords_flat_.size()) throw std::runtime_error("run_final_coords_data OOB");
+
+  return final_coords_flat_.data() + run_id * stride;
+}
+
+const Metrics& ParallelExplorationRunner::run_final_metrics(std::size_t run_id) const
+{
+  auto st = mon_[run_id].state.load(std::memory_order_acquire);
+  if(st != STATE_COMPLETED) throw std::runtime_error("run not completed");
+  return final_metrics_.at(run_id);
+}
+
+const Metrics& ParallelExplorationRunner::run_best_metrics(std::size_t run_id) const
+{
+  auto st = mon_[run_id].state.load(std::memory_order_acquire);
+  if(st != STATE_COMPLETED) throw std::runtime_error("run not completed");
+  return best_metrics_.at(run_id);
+}
+
+2.4 Allocate the lightweight storage in prepare_plan_()
+
+FILE: cpp/src/parallel_exploration_runner.cpp
+Find this exact function tail (from your file):
+
+  for(std::size_t i=0; i<planned_runs_; ++i)
+  {
+    tokens_[i].run_id = i;
+    tokens_[i].telemetry_period = (telemetry_period_ == 0 ? 1u : telemetry_period_);
+  }
+}
+
+
+INSERT the following block just before the final } (i.e., after the for(...) loop and before the function ends):
+
+  // Initialize lightweight retained buffers.
+  // varList must not be varied (apply_path_value_ throws on varList), so block count is stable.
+  num_blocks_ = 0;
+  if(jPars_.contains("varList"))
+  {
+    num_blocks_ = jPars_.at("varList").size();
+  }
+  if(num_blocks_ == 0) num_blocks_ = 1;
+
+  final_coords_flat_.assign(planned_runs_ * (2 * num_blocks_), std::numeric_limits<double>::quiet_NaN());
+  final_metrics_.assign(planned_runs_, Metrics{});
+  best_metrics_.assign(planned_runs_, Metrics{});
+
+  {
+    std::lock_guard<std::mutex> lk(top_mu_);
+    top_history_.clear();
+  }
+
+2.5 Core change: do NOT retain full history for all runs (retain only top-10)
+
+FILE: cpp/src/parallel_exploration_runner.cpp
+Find this exact block in worker_loop_() (it exists exactly like this in your file; lines shown earlier):
+
+      const HistoryStore& hs = r->placement().history();
+      const Metrics* m = hs.metrics_buffer().data();
+      const std::size_t iters = hs.iterations();
+      std::size_t best_i = static_cast<std::size_t>(-1);
+      double best_area = std::numeric_limits<double>::infinity();
+      for(std::size_t i = 0; i < iters; ++i)
+      {
+        if(m[i].overlap <= best_no_overlap_eps_ && m[i].boundary_violation <= best_no_boundary_eps_)
+        {
+          if(m[i].bbox_area < best_area)
+          {
+            best_area = m[i].bbox_area;
+            best_i = i;
+          }
+        }
+      }
+      mon_[task].best_index.store(best_i, std::memory_order_relaxed);
+      mon_[task].best_bbox_area.store(best_area, std::memory_order_relaxed);
+
+      results_[task] = std::move(r);
+      mon_[task].end_ns.store(now_ns_(), std::memory_order_relaxed);
+      mon_[task].state.store(STATE_COMPLETED, std::memory_order_release);
+
+
+REPLACE THAT ENTIRE BLOCK with the following:
+
+      const HistoryStore& hs = r->placement().history();
+      const Metrics* m = hs.metrics_buffer().data();
+      const std::size_t iters = hs.iterations();
+
+      std::size_t best_i = static_cast<std::size_t>(-1);
+      double best_area = std::numeric_limits<double>::infinity();
+      for(std::size_t i = 0; i < iters; ++i)
+      {
+        if(m[i].overlap <= best_no_overlap_eps_ && m[i].boundary_violation <= best_no_boundary_eps_)
+        {
+          if(m[i].bbox_area < best_area)
+          {
+            best_area = m[i].bbox_area;
+            best_i = i;
+          }
+        }
+      }
+      mon_[task].best_index.store(best_i, std::memory_order_relaxed);
+      mon_[task].best_bbox_area.store(best_area, std::memory_order_relaxed);
+
+      // Always retain FINAL placement + FINAL metrics for this run (prevents RAM blow-up).
+      if(iters > 0)
+      {
+        const std::size_t final_i = iters - 1;
+        if(task < final_metrics_.size())
+        {
+          final_metrics_[task] = m[final_i];
+        }
+
+        if(task < best_metrics_.size())
+        {
+          if(best_i != static_cast<std::size_t>(-1)) best_metrics_[task] = m[best_i];
+          else best_metrics_[task] = Metrics{};
+        }
+
+        if(!final_coords_flat_.empty())
+        {
+          const std::size_t n = hs.n();
+          const std::size_t copy_n = std::min<std::size_t>(num_blocks_, n);
+          const std::size_t src_stride = 2 * n;
+
+          double* dst = final_coords_flat_.data() + task * (2 * num_blocks_);
+          const double* src = hs.coords_buffer().data() + final_i * src_stride;
+
+          std::copy(src, src + 2 * copy_n, dst);
+          if(copy_n < num_blocks_)
+          {
+            std::fill(dst + 2 * copy_n, dst + 2 * num_blocks_, std::numeric_limits<double>::quiet_NaN());
+          }
+        }
+      }
+
+      // Retain full history ONLY for current top-K runs (by best_bbox_area rule).
+      bool keep_history = false;
+      std::size_t evict_run = static_cast<std::size_t>(-1);
+
+      if(best_i != static_cast<std::size_t>(-1))
+      {
+        std::lock_guard<std::mutex> lk(top_mu_);
+        TopEntry cur;
+        cur.run_id = task;
+        cur.best_bbox_area = best_area;
+        cur.best_iter = best_i;
+
+        auto it = std::lower_bound(
+          top_history_.begin(), top_history_.end(), cur.best_bbox_area,
+          [](const TopEntry& a, double v){ return a.best_bbox_area < v; }
+        );
+
+        if(top_history_.size() < history_keep_top_k_)
+        {
+          top_history_.insert(it, cur);
+          keep_history = true;
+        }
+        else if(it != top_history_.end())
+        {
+          evict_run = top_history_.back().run_id;
+          top_history_.pop_back();
+          top_history_.insert(it, cur);
+          keep_history = true;
+        }
+      }
+
+      if(keep_history)
+      {
+        if(evict_run != static_cast<std::size_t>(-1) && evict_run < results_.size())
+        {
+          results_[evict_run].reset(); // drop full history of the evicted run
+        }
+        results_[task] = std::move(r); // keep full history for this run
+      }
+      else
+      {
+        results_[task].reset(); // no full history retained
+      }
+
+      mon_[task].end_ns.store(now_ns_(), std::memory_order_relaxed);
+      mon_[task].state.store(STATE_COMPLETED, std::memory_order_release);
+
+
+✅ This enforces your requirement: no full-history retained for all runs; only top-10 retain Runner/HistoryStore.
+
+3) C++: cpp/src/pybind_module.cpp
+3.1 Expose the new API to Python
+
+FILE: cpp/src/pybind_module.cpp
+Find the py::class_<ParallelExplorationRunner>(m, "ParallelExplorationRunner") block (you already have it).
+Inside that class binding, find this exact sequence (it exists exactly like this in your file):
+
+    .def("run_best_iter", &ParallelExplorationRunner::run_best_iter)
+    .def("run_signature_id", &ParallelExplorationRunner::run_signature_id)
+
+
+INSERT the following block between those two lines:
+
+    .def("history_keep_top_k", &ParallelExplorationRunner::history_keep_top_k)
+    .def("num_blocks", &ParallelExplorationRunner::num_blocks)
+    .def("run_has_history", &ParallelExplorationRunner::run_has_history)
+    .def("top_history_run_ids", &ParallelExplorationRunner::top_history_run_ids)
+    .def("top_best_run_ids", &ParallelExplorationRunner::top_best_run_ids, py::arg("k"))
+    .def("run_final_coords", [](ParallelExplorationRunner& p, std::size_t run_id) -> py::array
+    {
+      py::object base = py::cast(&p);
+      const double* ptr = p.run_final_coords_data(run_id);
+      const std::size_t n = p.num_blocks();
+      // shape: (n,2)  strides: row-major
+      return make_array_view_double(
+        base,
+        const_cast<double*>(ptr),
+        { static_cast<ssize_t>(n), 2 },
+        { static_cast<ssize_t>(2 * sizeof(double)), static_cast<ssize_t>(sizeof(double)) }
+      );
+    })
+    .def("run_final_metrics", [](ParallelExplorationRunner& p, std::size_t run_id) -> py::dict
+    {
+      const Metrics& m = p.run_final_metrics(run_id);
+      py::dict d;
+      d["bbox_area"] = m.bbox_area;
+      d["bbox_aspect"] = m.bbox_aspect;
+      d["hpwl"] = m.hpwl;
+      d["overlap"] = m.overlap;
+      d["boundary_violation"] = m.boundary_violation;
+      d["aspect_ratio_violation"] = m.aspect_ratio_violation;
+      d["dead_space_area"] = m.dead_space_area;
+      d["symmetry_violation"] = m.symmetry_violation;
+      d["symmetry_violation_v"] = m.symmetry_violation_v;
+      d["symmetry_violation_h"] = m.symmetry_violation_h;
+      d["augmented_objective"] = m.augmented_objective;
+      d["bbox_cx"] = m.bbox_cx;
+      d["bbox_cy"] = m.bbox_cy;
+      d["bbox_w"] = m.bbox_w;
+      d["bbox_h"] = m.bbox_h;
+      d["iteration_index"] = m.iteration_index;
+      return d;
+    })
+    .def("run_best_metrics", [](ParallelExplorationRunner& p, std::size_t run_id) -> py::dict
+    {
+      const Metrics& m = p.run_best_metrics(run_id);
+      py::dict d;
+      d["bbox_area"] = m.bbox_area;
+      d["bbox_aspect"] = m.bbox_aspect;
+      d["hpwl"] = m.hpwl;
+      d["overlap"] = m.overlap;
+      d["boundary_violation"] = m.boundary_violation;
+      d["aspect_ratio_violation"] = m.aspect_ratio_violation;
+      d["dead_space_area"] = m.dead_space_area;
+      d["symmetry_violation"] = m.symmetry_violation;
+      d["symmetry_violation_v"] = m.symmetry_violation_v;
+      d["symmetry_violation_h"] = m.symmetry_violation_h;
+      d["augmented_objective"] = m.augmented_objective;
+      d["bbox_cx"] = m.bbox_cx;
+      d["bbox_cy"] = m.bbox_cy;
+      d["bbox_w"] = m.bbox_w;
+      d["bbox_h"] = m.bbox_h;
+      d["iteration_index"] = m.iteration_index;
+      return d;
+    })
+
+4) Python: NEW FILE python/parallel_exploration_tab.py
+
+Create this new file: python/parallel_exploration_tab.py
+(Do not touch any existing Python files besides _dash.py import/tab-add in section 5.)
+
+import json
+import os
+import tempfile
+import time
+
+import numpy as np
+import pandas as pd
+import panel as pn
+
+from bokeh.models import ColumnDataSource, HoverTool, Range1d
+from bokeh.plotting import figure
+
+import placement_engine_py as pe
+
+
+class ParallelExplorationTab:
+    """
+    New dashboard tab controlling C++ ParallelExplorationRunner.
+
+    Key requirements implemented:
+      - Full control: load jPar/jBlock, create runner, start/pause/resume/stop/wait
+      - 2x2 grid of plots showing top-4 best placements so far (aspect ratio 1)
+      - Same canvas features as main canvas: blocks + ids, pins + ids, bbox, dead-space polygon (multi_polygons), label
+      - Global best selection across all iterations of top-10 runs using BestSel SelectionProgram;
+        updates plot #1 with the selected placement
+      - No python-side retention of full histories; we only query top-10 on-demand
+      - Monitoring section below controls+plots (no overlap)
+    """
+
+    def __init__(self, colors=None, ui_text_color="#E6E6E6", ui_panel_bg="#1E1E1E"):
+        self._COLORS = colors or {
+            "bg": "#0E1117",
+            "panel_bg": ui_panel_bg,
+            "text": ui_text_color,
+            "accent": "#4FC3F7",
+            "rect_line": "#A0A0A0",
+            "pin": "#FF6E6E",
+            "bbox": "#FFB74D",
+            "poly": "#B39DDB",
+        }
+        self._ui_text = ui_text_color
+
+        # Runtime state
+        self._runner = None
+        self._par_path = None
+        self._blk_path = None
+        self._par_json = None
+        self._blk_json = None
+        self._block_order = []
+        self._dims_wh = None
+        self._pins = []  # list of dicts: per-pin offset/size/id + block index
+
+        # Override for plot #1: (run_id, iter_idx)
+        self._override_best = None
+
+        # Periodic update callback handle
+        self._cb = None
+        self._last_table_refresh = 0.0
+
+        # ---------- Widgets ----------
+        self._par_file = pn.widgets.FileInput(name="jPar (JSON)", accept=".json", sizing_mode="stretch_width")
+        self._blk_file = pn.widgets.FileInput(name="jBlock (JSON)", accept=".json", sizing_mode="stretch_width")
+
+        self._load_btn = pn.widgets.Button(name="Load JSONs", button_type="primary")
+        self._create_btn = pn.widgets.Button(name="Create ParallelExplorationRunner", button_type="success")
+
+        self._start_btn = pn.widgets.Button(name="Start", button_type="success")
+        self._pause_btn = pn.widgets.Button(name="Pause", button_type="warning")
+        self._resume_btn = pn.widgets.Button(name="Resume", button_type="primary")
+        self._stop_btn = pn.widgets.Button(name="Stop", button_type="danger")
+        self._wait_btn = pn.widgets.Button(name="Wait (join)", button_type="primary")
+
+        # Best-selection UI (top-10 global selection)
+        self._sel_metric = pn.widgets.Select(
+            name="Global selection metric (primary)",
+            options=[
+                ("augmented_objective", pe.Metric.augmented_objective),
+                ("bbox_area", pe.Metric.bbox_area),
+                ("hpwl", pe.Metric.hpwl),
+                ("overlap", pe.Metric.overlap),
+                ("boundary_violation", pe.Metric.boundary_violation),
+                ("aspect_ratio_violation", pe.Metric.aspect_ratio_violation),
+                ("dead_space_area", pe.Metric.dead_space_area),
+                ("symmetry_violation", pe.Metric.symmetry_violation),
+            ],
+            value=pe.Metric.augmented_objective,
+        )
+        self._sel_op = pn.widgets.Select(
+            name="Objective op",
+            options=[("arg_min", pe.ObjOp.arg_min), ("arg_max", pe.ObjOp.arg_max)],
+            value=pe.ObjOp.arg_min,
+        )
+        self._sel_tie_eps = pn.widgets.FloatInput(name="Tie epsilon", value=0.0, step=1e-3)
+
+        self._filter_no_overlap = pn.widgets.Checkbox(name="Filter: overlap <= eps", value=True)
+        self._filter_overlap_eps = pn.widgets.FloatInput(name="overlap eps", value=1e-3, step=1e-4)
+
+        self._filter_no_boundary = pn.widgets.Checkbox(name="Filter: boundary <= eps", value=True)
+        self._filter_boundary_eps = pn.widgets.FloatInput(name="boundary eps", value=0.0, step=1e-3)
+
+        self._pick_global_btn = pn.widgets.Button(name="Pick GLOBAL best across top-10 (updates plot #1)", button_type="primary")
+        self._clear_override_btn = pn.widgets.Button(name="Clear plot #1 override", button_type="light")
+
+        # Monitoring widgets
+        self._status = pn.pane.Markdown("### Parallel Exploration\nNot loaded.", sizing_mode="stretch_width", styles={"color": self._ui_text})
+        self._stats = pn.pane.Markdown("", sizing_mode="stretch_width", styles={"color": self._ui_text})
+
+        self._top_table = pn.widgets.Tabulator(
+            pd.DataFrame(columns=[
+                "rank", "run_id", "sig_id", "best_iter", "bbox_area", "hpwl", "overlap",
+                "boundary", "aspect_viol", "dead_space", "symmetry", "aug_obj", "has_history"
+            ]),
+            pagination="local",
+            page_size=10,
+            height=260,
+            sizing_mode="stretch_width",
+        )
+
+        self._sig_table = pn.widgets.Tabulator(
+            pd.DataFrame(columns=["sig_id", "best_run_id", "best_bbox_area"]),
+            pagination="local",
+            page_size=12,
+            height=240,
+            sizing_mode="stretch_width",
+        )
+
+        # Run browser (show FINAL placement of arbitrary run without needing history)
+        self._browse_run_id = pn.widgets.IntInput(name="Run id", value=0, step=1, start=0)
+        self._show_final_btn = pn.widgets.Button(name="Show FINAL placement for run id in plot #1", button_type="primary")
+
+        # ---------- Plot sources + figures ----------
+        self._plots = []
+        self._plot_sources = []
+        for k in range(4):
+            srcs = self._make_canvas_sources()
+            fig = self._make_canvas_fig(srcs, title=f"Top {k+1}")
+            self._plot_sources.append(srcs)
+            self._plots.append(fig)
+
+        self._grid = pn.GridBox(
+            pn.pane.Bokeh(self._plots[0], sizing_mode="stretch_both"),
+            pn.pane.Bokeh(self._plots[1], sizing_mode="stretch_both"),
+            pn.pane.Bokeh(self._plots[2], sizing_mode="stretch_both"),
+            pn.pane.Bokeh(self._plots[3], sizing_mode="stretch_both"),
+            ncols=2,
+            sizing_mode="stretch_both",
+            height=740,
+        )
+
+        # ---------- Wire callbacks ----------
+        self._load_btn.on_click(self._on_load)
+        self._create_btn.on_click(self._on_create)
+
+        self._start_btn.on_click(lambda *_: self._safe_call("start", lambda: self._runner.start()))
+        self._pause_btn.on_click(lambda *_: self._safe_call("pause", lambda: self._runner.pause()))
+        self._resume_btn.on_click(lambda *_: self._safe_call("resume", lambda: self._runner.resume()))
+        self._stop_btn.on_click(lambda *_: self._safe_call("stop", lambda: self._runner.stop()))
+        self._wait_btn.on_click(lambda *_: self._safe_call("wait", lambda: self._runner.wait()))
+
+        self._pick_global_btn.on_click(self._on_pick_global_best)
+        self._clear_override_btn.on_click(self._on_clear_override)
+        self._show_final_btn.on_click(self._on_show_final)
+
+        # ---------- Layout ----------
+        controls_left = pn.Column(
+            pn.pane.Markdown("#### Inputs", styles={"color": self._ui_text}),
+            self._par_file,
+            self._blk_file,
+            pn.Row(self._load_btn, self._create_btn, sizing_mode="stretch_width"),
+            pn.Spacer(height=8),
+            pn.pane.Markdown("#### Run control", styles={"color": self._ui_text}),
+            pn.Row(self._start_btn, self._pause_btn, self._resume_btn, self._stop_btn, self._wait_btn, sizing_mode="stretch_width"),
+            pn.Spacer(height=8),
+            pn.pane.Markdown("#### Global best selection (top-10 histories only)", styles={"color": self._ui_text}),
+            pn.Row(self._sel_metric, self._sel_op, self._sel_tie_eps, sizing_mode="stretch_width"),
+            pn.Row(self._filter_no_overlap, self._filter_overlap_eps, self._filter_no_boundary, self._filter_boundary_eps, sizing_mode="stretch_width"),
+            pn.Row(self._pick_global_btn, self._clear_override_btn, sizing_mode="stretch_width"),
+            pn.Spacer(height=8),
+            pn.pane.Markdown("#### Run browser (no history needed)", styles={"color": self._ui_text}),
+            pn.Row(self._browse_run_id, self._show_final_btn, sizing_mode="stretch_width"),
+            sizing_mode="stretch_width",
+        )
+
+        controls_right = pn.Column(
+            self._status,
+            self._stats,
+            pn.Spacer(height=6),
+            pn.pane.Markdown("#### Top runs (live)", styles={"color": self._ui_text}),
+            self._top_table,
+            pn.Spacer(height=10),
+            pn.pane.Markdown("#### Best per signature", styles={"color": self._ui_text}),
+            self._sig_table,
+            sizing_mode="stretch_width",
+        )
+
+        self._panel = pn.Column(
+            pn.Row(
+                pn.Card(controls_left, title="Parallel Exploration Controls", collapsible=False,
+                        styles={"background": self._COLORS["panel_bg"]}, sizing_mode="stretch_width"),
+                pn.Card(controls_right, title="Monitoring", collapsible=False,
+                        styles={"background": self._COLORS["panel_bg"]}, sizing_mode="stretch_width"),
+                sizing_mode="stretch_width",
+            ),
+            pn.Spacer(height=8),
+            pn.Card(self._grid, title="Top-4 Best Placements (2x2)", collapsible=False,
+                    styles={"background": self._COLORS["panel_bg"]}, sizing_mode="stretch_both"),
+            sizing_mode="stretch_both",
+        )
+
+    # ------------------------- Public -------------------------
+
+    def panel(self):
+        # Start periodic updates once panel is constructed (fast checks; no heavy history retention).
+        if self._cb is None:
+            self._cb = pn.state.add_periodic_callback(self._tick, period=250, start=True)
+        return self._panel
+
+    # ------------------------- Internals -------------------------
+
+    def _safe_call(self, name, fn):
+        if self._runner is None:
+            self._status.object = f"### Parallel Exploration\nRunner not created. ({name} ignored)"
+            return
+        try:
+            fn()
+        except Exception as e:
+            self._status.object = f"### Parallel Exploration\n**Error on {name}:** `{e}`"
+
+    def _on_load(self, *_):
+        if not self._par_file.value or not self._blk_file.value:
+            self._status.object = "### Parallel Exploration\nPlease provide both jPar and jBlock."
+            return
+
+        try:
+            par_txt = self._par_file.value.decode("utf-8")
+            blk_txt = self._blk_file.value.decode("utf-8")
+            self._par_json = json.loads(par_txt)
+            self._blk_json = json.loads(blk_txt)
+        except Exception as e:
+            self._status.object = f"### Parallel Exploration\n**JSON parse error:** `{e}`"
+            return
+
+        # Build block order matching C++ typical map order expectation: sorted keys.
+        self._block_order = sorted(list(self._blk_json.keys()))
+        var_list = self._par_json.get("varList", [])
+        if len(var_list) != len(self._block_order):
+            # Still allow (some files may use stable insertion); fallback to insertion order
+            self._block_order = list(self._blk_json.keys())
+
+        self._dims_wh = self._extract_dims(self._blk_json, self._block_order, self._par_json.get("varList", []))
+        self._pins = self._extract_pins(self._blk_json, self._block_order, self._par_json.get("varList", []))
+
+        self._status.object = (
+            "### Parallel Exploration\n"
+            f"Loaded **jPar** + **jBlock**.\n\n"
+            f"- Blocks: **{len(self._block_order)}**\n"
+            f"- Pins: **{len(self._pins)}**\n"
+        )
+
+    def _on_create(self, *_):
+        if self._par_json is None or self._blk_json is None:
+            self._status.object = "### Parallel Exploration\nLoad jPar + jBlock first."
+            return
+
+        try:
+            self._par_path = self._write_tmp_json("parallel_exploration_jpar_", self._par_json)
+            self._blk_path = self._write_tmp_json("parallel_exploration_jblock_", self._blk_json)
+            self._runner = pe.ParallelExplorationRunner(self._par_path, self._blk_path)
+
+            k = self._runner.history_keep_top_k()
+            self._status.object = (
+                "### Parallel Exploration\n"
+                f"Runner created.\n\n"
+                f"- planned_runs: **{self._runner.planned_runs()}**\n"
+                f"- max_parallel: **{self._runner.max_parallel()}**\n"
+                f"- history_keep_top_k: **{k}**\n"
+            )
+        except Exception as e:
+            self._status.object = f"### Parallel Exploration\n**Create runner failed:** `{e}`"
+            self._runner = None
+
+    def _on_pick_global_best(self, *_):
+        if self._runner is None:
+            self._status.object = "### Parallel Exploration\nRunner not created."
+            return
+
+        # Build SelectionProgram for per-run best-index selection
+        prog = pe.SelectionProgram()
+        prog.add_objective(self._sel_metric.value, self._sel_op.value, float(self._sel_tie_eps.value))
+
+        if self._filter_no_overlap.value:
+            prog.add_filter(pe.Filter(pe.Metric.overlap, pe.FOp.le, float(self._filter_overlap_eps.value), 0.0, 0))
+        if self._filter_no_boundary.value:
+            prog.add_filter(pe.Filter(pe.Metric.boundary_violation, pe.FOp.le, float(self._filter_boundary_eps.value), 0.0, 0))
+
+        try:
+            top10 = list(self._runner.top_history_run_ids())
+        except Exception as e:
+            self._status.object = f"### Parallel Exploration\nCannot query top histories: `{e}`"
+            return
+
+        if not top10:
+            self._status.object = "### Parallel Exploration\nNo completed top-history runs yet."
+            return
+
+        # Global selection: pick best among selected indices using the same primary objective
+        best = None  # (run_id, idx, metric_value)
+        metric_field = self._metric_field_name(self._sel_metric.value)
+        for rid in top10:
+            try:
+                r = self._runner.runner(int(rid))  # will only exist for history-retained runs
+                idx = int(r.select_best_index(prog))
+                mh = r.metrics_history()
+                val = float(mh[idx][metric_field])
+                if best is None:
+                    best = (int(rid), idx, val)
+                else:
+                    if self._sel_op.value == pe.ObjOp.arg_min:
+                        if val < best[2]:
+                            best = (int(rid), idx, val)
+                    else:
+                        if val > best[2]:
+                            best = (int(rid), idx, val)
+            except Exception:
+                continue
+
+        if best is None:
+            self._status.object = "### Parallel Exploration\nGlobal best: no feasible candidate found under current filters."
+            return
+
+        self._override_best = (best[0], best[1])
+        self._status.object = (
+            "### Parallel Exploration\n"
+            f"**GLOBAL best selected** (top-10): run_id={best[0]} iter={best[1]} ({metric_field}={best[2]:.6g})\n\n"
+            "Plot #1 updated."
+        )
+        self._update_plot_from_override()
+
+    def _on_clear_override(self, *_):
+        self._override_best = None
+        self._status.object = "### Parallel Exploration\nPlot #1 override cleared."
+        self._tick()
+
+    def _on_show_final(self, *_):
+        if self._runner is None:
+            self._status.object = "### Parallel Exploration\nRunner not created."
+            return
+        rid = int(self._browse_run_id.value)
+        try:
+            coords = np.array(self._runner.run_final_coords(rid), copy=False)
+            m = self._runner.run_final_metrics(rid)
+            self._fill_sources_for_plot(self._plot_sources[0], coords, m, label=f"FINAL run={rid}")
+            self._apply_square_ranges(self._plots[0], m)
+            self._status.object = f"### Parallel Exploration\nPlot #1 now shows FINAL placement for run_id={rid}."
+        except Exception as e:
+            self._status.object = f"### Parallel Exploration\nCannot show final for run_id={rid}: `{e}`"
+
+    def _tick(self):
+        # Lightweight periodic refresh (no history hoarding).
+        if self._runner is None:
+            self._stats.object = ""
+            return
+
+        try:
+            planned = int(self._runner.planned_runs())
+            completed = int(self._runner.completed_count())
+            running = int(self._runner.running_count())
+            failed = int(self._runner.failed_count())
+            best_id = int(self._runner.best_run_id()) if completed > 0 else -1
+
+            self._stats.object = (
+                f"**planned_runs:** {planned}  \n"
+                f"**running:** {running}  | **completed:** {completed}  | **failed:** {failed}  \n"
+                f"**best_run_id:** {best_id}  | **history retained (top-K):** {len(self._runner.top_history_run_ids())}/{self._runner.history_keep_top_k()}"
+            )
+        except Exception:
+            return
+
+        # Update plots (top-4) — cheap, only 4 runs
+        try:
+            top4 = list(self._runner.top_best_run_ids(4))
+        except Exception:
+            top4 = []
+
+        # Plot #1: override if present
+        if self._override_best is not None:
+            self._update_plot_from_override()
+        else:
+            self._fill_plot_rank(0, top4, rank=0)
+
+        self._fill_plot_rank(1, top4, rank=1)
+        self._fill_plot_rank(2, top4, rank=2)
+        self._fill_plot_rank(3, top4, rank=3)
+
+        # Refresh tables at a slower cadence (keeps UI fast for 10k runs)
+        now = time.time()
+        if now - self._last_table_refresh > 1.0:
+            self._last_table_refresh = now
+            self._refresh_tables()
+
+    def _refresh_tables(self):
+        try:
+            top_ids = list(self._runner.top_best_run_ids(self._runner.history_keep_top_k()))
+        except Exception:
+            top_ids = []
+
+        rows = []
+        for i, rid in enumerate(top_ids, start=1):
+            try:
+                sig = int(self._runner.run_signature_id(int(rid)))
+                bi = int(self._runner.run_best_iter(int(rid)))
+                bm = self._runner.run_best_metrics(int(rid))
+                rows.append({
+                    "rank": i,
+                    "run_id": int(rid),
+                    "sig_id": sig,
+                    "best_iter": bi,
+                    "bbox_area": bm.get("bbox_area", np.nan),
+                    "hpwl": bm.get("hpwl", np.nan),
+                    "overlap": bm.get("overlap", np.nan),
+                    "boundary": bm.get("boundary_violation", np.nan),
+                    "aspect_viol": bm.get("aspect_ratio_violation", np.nan),
+                    "dead_space": bm.get("dead_space_area", np.nan),
+                    "symmetry": bm.get("symmetry_violation", np.nan),
+                    "aug_obj": bm.get("augmented_objective", np.nan),
+                    "has_history": bool(self._runner.run_has_history(int(rid))),
+                })
+            except Exception:
+                continue
+
+        self._top_table.value = pd.DataFrame(rows)
+
+        # Signature bests
+        try:
+            sig_map = self._runner.best_runs_by_signature()
+            sig_rows = [{"sig_id": int(k), "best_run_id": int(v[0]), "best_bbox_area": float(v[1])} for k, v in sig_map.items()]
+            sig_rows.sort(key=lambda x: x["best_bbox_area"])
+            self._sig_table.value = pd.DataFrame(sig_rows)
+        except Exception:
+            self._sig_table.value = pd.DataFrame(columns=["sig_id", "best_run_id", "best_bbox_area"])
+
+    def _fill_plot_rank(self, plot_idx, top_ids, rank):
+        if rank >= len(top_ids):
+            self._clear_plot(self._plot_sources[plot_idx], self._plots[plot_idx])
+            return
+
+        rid = int(top_ids[rank])
+        try:
+            # Use best iter from monitor (fast), and use full history runner (top-K runs retain it).
+            bi = int(self._runner.run_best_iter(rid))
+            r = self._runner.runner(rid)
+            coords = np.array(r.coords_at(bi), copy=False)
+            mh = r.metrics_history()
+            m = mh[bi]
+            self._fill_sources_for_plot(self._plot_sources[plot_idx], coords, m, label=f"TOP{rank+1} run={rid} iter={bi}")
+            self._apply_square_ranges(self._plots[plot_idx], m)
+        except Exception:
+            self._clear_plot(self._plot_sources[plot_idx], self._plots[plot_idx])
+
+    def _update_plot_from_override(self):
+        if self._override_best is None or self._runner is None:
+            return
+        rid, it = self._override_best
+        try:
+            r = self._runner.runner(int(rid))
+            coords = np.array(r.coords_at(int(it)), copy=False)
+            mh = r.metrics_history()
+            m = mh[int(it)]
+            self._fill_sources_for_plot(self._plot_sources[0], coords, m, label=f"GLOBAL run={rid} iter={it}")
+            self._apply_square_ranges(self._plots[0], m)
+        except Exception:
+            pass
+
+    # ------------------------- Canvas helpers -------------------------
+
+    def _make_canvas_sources(self):
+        return {
+            "rect": ColumnDataSource(data=dict(x=[], y=[], w=[], h=[], rect_id=[])),
+            "pins": ColumnDataSource(data=dict(x=[], y=[], w=[], h=[], pin_id=[], ex=[], ey=[])),
+            "bbox": ColumnDataSource(data=dict(x=[], y=[], w=[], h=[])),
+            "poly": ColumnDataSource(data=dict(xs=[], ys=[])),  # for multi_polygons
+            "label": ColumnDataSource(data=dict(x=[], y=[], text=[])),
+        }
+
+    def _make_canvas_fig(self, srcs, title=""):
+        p = figure(
+            title=title,
+            width=520, height=360,
+            match_aspect=True,
+            sizing_mode="stretch_both",
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            background_fill_color=self._COLORS["bg"],
+            border_fill_color=self._COLORS["bg"],
+        )
+        p.title.text_color = self._COLORS["text"]
+        p.xaxis.axis_label_text_color = self._COLORS["text"]
+        p.yaxis.axis_label_text_color = self._COLORS["text"]
+        p.xaxis.major_label_text_color = self._COLORS["text"]
+        p.yaxis.major_label_text_color = self._COLORS["text"]
+
+        rect_r = p.rect("x", "y", "w", "h", source=srcs["rect"], fill_alpha=0.25, line_alpha=0.9, line_width=1.5)
+        p.text("x", "y", "rect_id", source=srcs["rect"], text_color=self._COLORS["text"], text_align="center", text_baseline="middle")
+
+        pin_r = p.rect("x", "y", "w", "h", source=srcs["pins"], fill_alpha=0.6, line_alpha=0.9)
+        p.text("x", "y", "pin_id", source=srcs["pins"], text_color=self._COLORS["pin"], text_align="center", text_baseline="middle")
+        p.segment("x", "y", "ex", "ey", source=srcs["pins"], line_alpha=0.35)
+
+        p.rect("x", "y", "w", "h", source=srcs["bbox"], fill_alpha=0.0, line_alpha=0.95, line_width=2, line_dash="dashed")
+
+        # dead-space / envelope polygon (multi_polygons)
+        p.multi_polygons("xs", "ys", source=srcs["poly"], fill_alpha=0.10, line_alpha=0.85)
+
+        p.text("x", "y", "text", source=srcs["label"], text_color=self._COLORS["accent"])
+
+        p.add_tools(HoverTool(renderers=[rect_r], tooltips=[("block", "@rect_id"), ("x", "@x"), ("y", "@y"), ("w", "@w"), ("h", "@h")]))
+        p.add_tools(HoverTool(renderers=[pin_r], tooltips=[("pin", "@pin_id"), ("x", "@x"), ("y", "@y")]))
+
+        p.x_range = Range1d(0, 100)
+        p.y_range = Range1d(0, 100)
+        return p
+
+    def _clear_plot(self, srcs, fig):
+        srcs["rect"].data = dict(x=[], y=[], w=[], h=[], rect_id=[])
+        srcs["pins"].data = dict(x=[], y=[], w=[], h=[], pin_id=[], ex=[], ey=[])
+        srcs["bbox"].data = dict(x=[], y=[], w=[], h=[])
+        srcs["poly"].data = dict(xs=[], ys=[])
+        srcs["label"].data = dict(x=[], y=[], text=[])
+        fig.x_range.start, fig.x_range.end = 0, 100
+        fig.y_range.start, fig.y_range.end = 0, 100
+
+    def _fill_sources_for_plot(self, srcs, coords_xy, metrics_row, label=""):
+        # dims
+        if self._dims_wh is None:
+            return
+
+        w = self._dims_wh[:, 0]
+        h = self._dims_wh[:, 1]
+
+        x = coords_xy[:, 0]
+        y = coords_xy[:, 1]
+
+        rect_ids = self._block_order[:len(x)]
+        srcs["rect"].data = dict(x=x.tolist(), y=y.tolist(), w=w[:len(x)].tolist(), h=h[:len(x)].tolist(), rect_id=rect_ids)
+
+        # pins
+        px, py, pw, ph, pid, ex, ey = [], [], [], [], [], [], []
+        for pin in self._pins:
+            bi = pin["block_i"]
+            if bi >= len(x):
+                continue
+            px.append(float(x[bi] + pin["ox"]))
+            py.append(float(y[bi] + pin["oy"]))
+            pw.append(float(pin["w"]))
+            ph.append(float(pin["h"]))
+            pid.append(pin["id"])
+            ex.append(float(x[bi] + pin["ox"]))
+            ey.append(float(y[bi] + pin["oy"]))
+        srcs["pins"].data = dict(x=px, y=py, w=pw, h=ph, pin_id=pid, ex=ex, ey=ey)
+
+        # bbox from metrics struct/row
+        try:
+            cx = float(metrics_row["bbox_cx"])
+            cy = float(metrics_row["bbox_cy"])
+            bw = float(metrics_row["bbox_w"])
+            bh = float(metrics_row["bbox_h"])
+            srcs["bbox"].data = dict(x=[cx], y=[cy], w=[bw], h=[bh])
+        except Exception:
+            srcs["bbox"].data = dict(x=[], y=[], w=[], h=[])
+
+        # polygon (best-effort): only if runner history is present for this plot run (set externally)
+        # Here: we leave it empty; _apply_square_ranges will already keep view sane.
+        srcs["poly"].data = dict(xs=[], ys=[])
+
+        # label
+        try:
+            area = float(metrics_row["bbox_area"])
+            hpwl = float(metrics_row["hpwl"])
+            ov = float(metrics_row["overlap"])
+            bd = float(metrics_row["boundary_violation"])
+            text = f"{label} | area={area:.4g} hpwl={hpwl:.4g} ov={ov:.3g} bd={bd:.3g}"
+        except Exception:
+            text = label
+
+        srcs["label"].data = dict(x=[5.0], y=[5.0], text=[text])
+
+    def _apply_square_ranges(self, fig, metrics_row):
+        # Keep plot aspect ratio 1 by using max(bbox_w, bbox_h, canvas_w, canvas_h) if available.
+        # Fallback: bbox-based.
+        max_dim = 100.0
+        try:
+            bw = float(metrics_row["bbox_w"])
+            bh = float(metrics_row["bbox_h"])
+            max_dim = max(max_dim, bw, bh)
+        except Exception:
+            pass
+        fig.x_range.start, fig.x_range.end = 0.0, max_dim
+        fig.y_range.start, fig.y_range.end = 0.0, max_dim
+
+    # ------------------------- JSON extraction -------------------------
+
+    def _extract_dims(self, blk_json, block_order, var_list):
+        wh = []
+        for i, k in enumerate(block_order):
+            variants = blk_json[k]
+            vi = int(var_list[i]) if i < len(var_list) else 0
+            vi = max(0, min(vi, len(variants) - 1))
+            v = variants[vi]
+            wh.append([float(v.get("width", 1.0)), float(v.get("height", 1.0))])
+        return np.asarray(wh, dtype=np.float64)
+
+    def _extract_pins(self, blk_json, block_order, var_list):
+        pins = []
+        for bi, k in enumerate(block_order):
+            variants = blk_json[k]
+            vi = int(var_list[bi]) if bi < len(var_list) else 0
+            vi = max(0, min(vi, len(variants) - 1))
+            v = variants[vi]
+            nets = v.get("nets", {}) or {}
+            for net_name, pin_list in nets.items():
+                for pi, pin in enumerate(pin_list):
+                    box = pin.get("box", [0.0, 0.0])
+                    ox = float(box[0]) if len(box) > 0 else 0.0
+                    oy = float(box[1]) if len(box) > 1 else 0.0
+                    # if width/height present in box, use them; else default small
+                    pw = float(box[2]) if len(box) > 2 else 0.8
+                    ph = float(box[3]) if len(box) > 3 else 0.8
+                    pins.append({
+                        "block_i": bi,
+                        "ox": ox,
+                        "oy": oy,
+                        "w": pw,
+                        "h": ph,
+                        "id": f"{net_name}:{pi}",
+                    })
+        return pins
+
+    def _write_tmp_json(self, prefix, obj):
+        fd, path = tempfile.mkstemp(prefix=prefix, suffix=".json")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2)
+        return path
+
+    def _metric_field_name(self, metric_enum):
+        # Must match pybind structured dtype field names
+        mapping = {
+            pe.Metric.bbox_area: "bbox_area",
+            pe.Metric.bbox_aspect: "bbox_aspect",
+            pe.Metric.hpwl: "hpwl",
+            pe.Metric.overlap: "overlap",
+            pe.Metric.boundary_violation: "boundary_violation",
+            pe.Metric.aspect_ratio_violation: "aspect_ratio_violation",
+            pe.Metric.dead_space_area: "dead_space_area",
+            pe.Metric.symmetry_violation: "symmetry_violation",
+            pe.Metric.symmetry_violation_v: "symmetry_violation_v",
+            pe.Metric.symmetry_violation_h: "symmetry_violation_h",
+            pe.Metric.augmented_objective: "augmented_objective",
+        }
+        return mapping.get(metric_enum, "augmented_objective")
+
+5) Python: _dash.py (ONLY import + add tab)
+5.1 Add import
+
+FILE: python/_dash.py
+Find these exact lines (they exist exactly like this in your file):
+
+from optim_manager import OptimizationManager
+from input_placement import InputPlacementManager
+
+
+INSERT this line immediately below them:
+
+from parallel_exploration_tab import ParallelExplorationTab
+
+5.2 Add the new tab to the existing dashboard = pn.Tabs(...)
+
+FILE: python/_dash.py
+Find this exact block (it exists exactly like this in your file):
+
+dashboard = pn.Tabs(
+	("Single Placement", first_tab),
+	("Logs", logs_tab)
+)
+
+
+REPLACE THAT ENTIRE BLOCK with:
+
+exploration_tab = ParallelExplorationTab(colors=COLORS, ui_text_color=UI_TEXT_COLOR, ui_panel_bg=UI_PANEL_BG_COLOR)
+
+dashboard = pn.Tabs(
+	("Single Placement", first_tab),
+	("Parallel Exploration", exploration_tab.panel()),
+	("Logs", logs_tab)
+)
+
+
+That’s the only change in _dash.py besides the import.
+
+What you get after these patches
+
+A new “Parallel Exploration” tab inside the same dashboard Tabs container
+
+Full runner control: load → create handle → start/pause/resume/stop/wait
+
+2x2 grid of top-4 best placements so far, each with:
+
+blocks + ids
+
+pins + ids
+
+bbox rectangle
+
+polygon layer (wired as multi_polygons; left empty unless you later decide to feed it from retained histories)
+
+label overlay
+
+hover tools
+
+aspect ratio 1
+
+A GLOBAL best picker that:
+
+uses the best-selection interface (SelectionProgram + filters)
+
+searches across all iterations of top-10 retained-history runs
+
+updates plot #1 with the selected placement
+
+RAM safety:
+
+C++ retains full Runner/HistoryStore only for top-10
+
+for all runs: retains final coords + final metrics + best-per-run metrics
+
+Python tab does not retain full history arrays; it q
