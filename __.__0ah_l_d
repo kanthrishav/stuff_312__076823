@@ -1,0 +1,560 @@
+2) Architectural decomposition (containers & layers)
+
+Think of the software as 4 layers:
+
+A) UI / Orchestration Layer (Python, external to this zip)
+
+Panel/Bokeh dashboard (python_dash.py) with controls, plots, iteration slider, etc.
+
+Run manager (optim_manager.py) that:
+
+loads config file paths
+
+starts runs
+
+monitors progress
+
+reads back history buffers (coords + metrics)
+
+updates plots live
+
+B) Python ↔ C++ Interop Layer (pybind11 module)
+
+A compiled Python module: placement_engine_py
+
+Exposes a small but powerful API:
+
+set input JSON paths on a Runner
+
+execute() (runs in C++ while releasing the GIL)
+
+zero-copy NumPy “views” over iteration history and metrics
+
+C) Native Optimization Engine (C++)
+
+Coordinates the optimization run and algorithm selection:
+
+Runner → PlacementEngine → LayoutEvaluator
+
+D) Native Data & Math Utilities (C++)
+
+Spatial overlap acceleration grid
+
+Bounding box computation
+
+Normalization + aggregation tools
+
+History storage (preallocated stable buffers)
+
+JSON parsing (nlohmann/json)
+
+3) C++ component HLD (modules, responsibilities, and interfaces)
+3.1 Runner (orchestration entry point)
+
+Role: The top-level C++ “job” object.
+
+Key responsibilities:
+
+Load the two JSON files:
+
+jPars : optimizer + objective + constraints + expected params + varList
+
+jBlock : block definitions (and potentially more fields; only width/height/ID are consumed here)
+
+Extract varList (variant selection index per block)
+
+Call into PlacementEngine.load(...)
+
+Execute the run via PlacementEngine.execute()
+
+Design intent: Runner is the “unit of execution” that Python instantiates and controls.
+
+3.2 JsonIO + configuration parsing (input schema → typed config)
+
+Role: Convert JSON dictionaries into a strongly-typed LayoutConfig.
+
+Key responsibilities:
+
+Robust load/save with clear exceptions for missing files / invalid JSON.
+
+Parse blocks into std::vector<Block>:
+
+For each top-level block key, select the variant using varList[i].
+
+Initialize a random (but deterministic-seeded) starting location inside the canvas bounds.
+
+Parse objective weights:
+
+w_area, w_hpwl
+
+Parse constraints (currently 3):
+
+overlap (aggregation + normalization + penalty function selection)
+
+boundary violation (aggregation + normalization + penalty function selection)
+
+aspect violation (scalar normalization + penalty function selection)
+
+Parse optimizer common parameters and exactly one active optimizer:
+
+DE / SA / GA / CNE / PSO
+
+Enforces that exactly one “switch” is enabled.
+
+Penalty function binding design:
+A major architectural choice: constraint “type” is bound once at parse-time to a concrete function pointer penalty_fn, so the hot loop (compute_all) does not branch on penalty type repeatedly.
+
+This is a Strategy pattern implemented with function pointers.
+
+3.3 PlacementEngine (algorithm selection + run execution)
+
+Role: The “engine” that owns:
+
+LayoutConfig cfg_
+
+LayoutEvaluator evaluator_
+
+HistoryStore store_
+and drives the optimization algorithm.
+
+Key responsibilities:
+
+load(...)
+
+produce config (cfg_)
+
+initialize evaluator with config + store
+
+initialize history store with (num_blocks, max_iters + 1)
+
+execute()
+
+set random seed (Armadillo RNG)
+
+create objective wrapper LayoutObjective
+
+create initial decision vector x = evaluator_.initial_point()
+
+initialize callback (IterationCallback) with stopping criteria and store pointer
+
+choose and run optimizer:
+
+Ensmallen: DE / SA / CNE / PSO
+
+Custom in-house GA path
+
+measure runtime with Stopwatch
+
+mark run complete (optimized_ = true)
+
+Design patterns:
+
+Facade: PlacementEngine is the simplified API for “run placement optimization.”
+
+Strategy: optimizer choice via OptimizerKind active (and optimizer-specific parameter structs).
+
+Observer/Callback: IterationCallback captures each iteration result and records it to HistoryStore.
+
+Important hot-loop boundary:
+All optimizers call LayoutObjective::Evaluate(x) repeatedly. Each “StepTaken” callback computes full metrics and records them.
+
+3.4 LayoutEvaluator (the scoring function)
+
+Role: Defines the optimization surface: objective + penalties.
+
+Inputs:
+
+decision vector xy of length 2*n (x,y per block)
+
+widths/heights/areas precomputed from Block list
+
+canvas size and expected aspect ratio
+
+Outputs:
+
+Metrics struct containing:
+
+bbox_area, bbox_aspect
+
+hpwl (currently a global center-based proxy)
+
+overlap (raw overlap area is tracked)
+
+boundary_violation (aggregated)
+
+aspect_ratio_violation
+
+augmented_objective
+
+bbox geometry (cx, cy, w, h)
+
+iteration_index
+
+Computation pipeline inside compute_all(...):
+
+Update block positions from xy
+
+Expand bounding box across rectangles
+
+Track min/max of centers for “HPWL” proxy
+
+Compute boundary violation per rectangle → normalize → aggregate
+
+Compute aspect ratio violation (scalar) → normalize
+
+Compute overlap penalty using OverlapGrid (buffered overlap) → normalize/aggregate
+
+Compute pure objective: w_area * bbox_area + w_hpwl * hpwl
+
+Compute penalties using pre-bound penalty_fn per constraint:
+
+weighted sum of penalty_fn(violation)
+
+Return Metrics with augmented_objective = objective + penalty
+
+Architectural note about HPWL:
+
+The code in this zip computes a single global HPWL-like term: (max cx - min cx) + (max cy - min cy).
+
+Your intended HPWL based on nets/pins would be sum over nets of each net’s bounding box span. That would require adding a netlist model and per-net accumulation in this evaluator.
+
+3.5 OverlapGrid (fast overlap estimation)
+
+Role: Replace naive O(n²) overlap checks with a spatial hashing grid.
+
+Core idea:
+
+Define a grid over a padded region around the canvas.
+
+Insert each rectangle into all grid cells it intersects (with buffer).
+
+For each populated cell, check overlaps among rectangles in that cell.
+
+Deduplicate rectangle pairs that meet in multiple cells using a pair-stamping mechanism.
+
+Aggregate normalized overlap contributions via PenaltyTools.
+
+Performance-oriented design:
+
+Uses stamping (eval_stamp_) to avoid clearing large arrays each evaluation.
+
+Reuses buffers (used_cells_, idx_buf_, pair_values_) to reduce allocations.
+
+Returns an aggregated normalized overlap scalar used by evaluator.
+
+3.6 HistoryStore (stable iteration history + best solution)
+
+Role: Persist iteration-by-iteration placement and metrics for:
+
+offline saving
+
+UI visualization (iteration slider)
+
+best-solution extraction
+
+Key design choices:
+
+Preallocate:
+
+coords_: flattened array length = max_iters * 2 * n
+
+iter_metrics_: length = max_iters
+
+best_coords_: length = 2 * n
+
+This makes memory addresses stable, enabling zero-copy views from Python.
+
+Tracks:
+
+iter_count_ (how many iterations recorded)
+
+best_obj_, best_index_, best_metrics_
+
+“Best” is guarded by conditions (e.g., overlap == 0 and bbox area > 0 in intent).
+
+3.7 IterationCallback (ensmallen callback hook)
+
+Role: Called after optimizer updates coordinates.
+
+Computes metrics with LayoutEvaluator.compute_all(...)
+
+Pushes to HistoryStore
+
+Implements early stopping if stopping_mode == target_objective
+
+Design: This is the “tap” that captures the full optimization trajectory for plotting.
+
+4) pybind11 binding HLD (Python-facing API design)
+
+The Python module exposes Runner as the primary object.
+
+4.1 Execution control
+
+Runner.execute() runs the full optimization and releases the GIL, which is essential so the Panel server can keep responding.
+
+4.2 Zero-copy data access (critical for UI responsiveness)
+
+Bindings expose NumPy array views into C++ buffers:
+
+coords_history() → shape (iters, n, 2)
+
+coords_at(i) → shape (n, 2)
+
+best_coords() → shape (n, 2)
+
+metrics_history() → structured dtype array (iters,) over Metrics
+
+widths() / heights() → (n,)
+
+Why this matters in the HLD:
+
+The UI should not “pull” data by copying large buffers every frame.
+
+Zero-copy allows fast redraws for:
+
+iteration slider scrubbing
+
+time-series plots of metrics
+
+4.3 Lightweight metadata helpers
+
+best_metrics() returns a small dict for convenient consumption.
+
+optimizer_params() returns a dict representation of parsed optimizer configuration.
+
+5) End-to-end runtime flow (sequence view)
+5.1 Single run workflow (Python-driven)
+
+User selects jPars and jBlock paths in the Panel UI.
+
+Python creates placement_engine_py.Runner().
+
+Python sets:
+
+runner.jPars_file = ...
+
+runner.jBlock_file = ...
+
+UI triggers runner.execute() (ideally from a worker thread/task so UI stays responsive).
+
+While running:
+
+Optimizer repeatedly calls objective evaluation
+
+Callback stores coords + metrics each iteration
+
+UI periodically reads:
+
+runner.iterations()
+
+runner.metrics_history() (up to current iters)
+
+runner.coords_at(k) for the iteration slider
+
+After completion:
+
+UI uses best_index(), best_coords(), best_metrics() for summary
+
+5.2 CLI workflow (C++ executable)
+
+placement_engine_app <jPars.json> <jBlock.json>
+
+Builds Runner, sets paths, calls execute
+
+(In this zip, output saving is not wired into main; the JSON saver exists in JsonIO, but the run does not currently persist results to expected_params.output_file.)
+
+6) Data model HLD (what data exists and how it moves)
+6.1 Primary configuration objects
+
+LayoutConfig
+
+blocks: vector<Block>
+
+objective: ObjectiveConfig(w_area, w_hpwl)
+
+constraints: ConstraintConfig overlap/aspect/boundary
+
+expected: ExpectedParams(canvas, aspect_ratio, overlap_buffer, num_threads, output_file)
+
+optimizer: OptimizerConfig(common + per-optimizer params + active kind + max_iter)
+
+6.2 Runtime state
+
+PlacementEngine
+
+owns config + evaluator + history store
+
+runtime seconds + optimized flag
+
+6.3 History buffers
+
+Coordinates: iteration-major, block-major, xy-minor
+
+Metrics: one struct per iteration
+
+7) How the “augmented objective” is designed (policy view)
+
+The design separates concerns cleanly:
+
+Raw violation measurement
+
+overlap area, boundary overflow distances, aspect ratio deviation, etc.
+
+Normalization
+
+convert to comparable scale (e.g., divide by canvas_area/bbox_area)
+
+Aggregation
+
+sum/max/mean across per-rect or per-pair values
+
+Penalty function
+
+square vs barrier exp/log
+
+Penalty weight
+
+controls constraint importance relative to objective
+
+Objective weights
+
+controls bbox_area vs hpwl tradeoff
+
+This is a strong design because new constraints can follow the exact same pipeline.
+
+8) Extensibility HLD (adding symmetry, deadspace, real HPWL)
+
+Even though symmetry/deadspace aren’t implemented in this zip, the architecture is ready for them:
+
+8.1 Add a new constraint type (general recipe)
+
+To add “symmetry violation” or “deadspace”:
+
+Extend LayoutConfig with:
+
+ConstraintConfig symmetry_c;
+
+ConstraintConfig deadspace_c;
+
+Extend JsonIO::parse_config(...) to parse these constraint nodes.
+
+Extend Metrics to store:
+
+symmetry_violation
+
+deadspace
+
+Extend LayoutEvaluator.compute_all(...) to:
+
+compute raw values
+
+normalize/aggregate if needed
+
+apply bound penalty_fn
+
+add weighted penalty to augmented objective
+
+Extend pybind dtype registration so Python can plot them.
+
+8.2 Real netlist HPWL (what needs to change)
+
+Your intended HPWL requires:
+
+A netlist model:
+
+Nets with multiple pins
+
+Each pin has a block reference + local (dx,dy)
+
+Evaluator needs:
+
+for each net, compute min/max of absolute pin coords across its pins
+
+sum (xmax-xmin)+(ymax-ymin) over nets
+
+Data ownership choice:
+
+parse and store netlist in LayoutConfig, or
+
+store separately in LayoutEvaluator for cache-friendly access
+
+8.3 Deadspace (as you described: polygon envelope – blocks area)
+
+This requires geometry computation beyond bbox:
+
+Build an outline polygon around the union/envelope of rectangles (convex hull or rectilinear hull depending on your definition).
+
+Compute polygon area, subtract total rect area → deadspace.
+
+This fits naturally as another scalar metric + penalty term.
+
+9) Concurrency and responsiveness (HLD for the dashboard)
+9.1 What’s already supported
+
+Runner.execute() releases the Python GIL → Python UI thread can remain active.
+
+9.2 What the Panel app should do architecturally
+
+Run execution in a background worker (thread/process) controlled by the “run manager”.
+
+Periodically pull the current iteration count and redraw:
+
+metrics plots (time-series)
+
+placement canvas for selected iteration
+
+9.3 Parallel runs (variant/exploration)
+
+Your earlier description mentions “parallel variant runner” and “parallel exploration runner”. Those headers/sources are not in this zip, but architecturally they would fit as:
+
+ParallelRunner (C++): orchestrates multiple PlacementEngine instances with different configs/variants/seeds
+
+Shared results registry:
+
+per-run best metrics + best coords
+
+status tracking (pending/running/completed)
+
+Python UI:
+
+monitors run statuses
+
+displays top-K best completed placements, updating as runs finish
+
+The existing pybind strategy (zero-copy arrays) is well-suited for scaling this, but you’d likely expose per-run handles or a run table API to Python rather than a single Runner.
+
+10) Build & deployment HLD
+
+Build system: CMake
+
+Outputs:
+
+placement_engine_lib (static library)
+
+placement_engine_app (CLI executable)
+
+placement_engine_py (Python extension module)
+
+Key dependencies:
+
+nlohmann/json (fetched if missing)
+
+Armadillo (linear algebra containers)
+
+ensmallen (optimizers + callback interface)
+
+pybind11 (for Python module)
+
+11) Notable design gaps / mismatches to your stated requirements (so the HLD is accurate)
+
+From the code inside opt.zip:
+
+Only 3 constraints exist: overlap, boundary, aspect ratio.
+
+HPWL is not netlist-based; it’s a global bbox-of-centers proxy.
+
+Output saving to expected_params.output_file is parsed but not clearly wired into a “save results” step.
+
+num_threads exists in config but there is no active multithreading in evaluation.
+
+These are not “bad” in an HLD sense—just important to call out so future design work can land in the right components.
