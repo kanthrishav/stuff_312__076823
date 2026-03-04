@@ -1,0 +1,54 @@
+float evaluate_hpwl(const float* xy) {
+  const std::uint32_t b_count = static_cast<std::uint32_t>(blocks_.size());
+  if (b_count == 0) return 0.0f;
+
+  // Persistent buffers (no per-iteration allocations after first sizing).
+  // NOTE: function-static inside an inline header method -> one set per TU.
+  static std::vector<float> tmp_center_x;
+  static std::vector<float> tmp_center_y;
+  static std::vector<std::uint16_t> tmp_selected_variant;
+
+  if (tmp_center_x.size() != b_count) {
+    tmp_center_x.resize(b_count);
+    tmp_center_y.resize(b_count);
+    tmp_selected_variant.resize(b_count);
+  }
+
+  // Fast sigmoid approximation in [0,1]:
+  // s(z) = 0.5 * ( z / (1 + |z|) ) + 0.5
+  // Very fast (no exp), monotonic, saturates for large |z|.
+  auto fast_sigmoid_01 = [](float z) noexcept -> float {
+    if (!std::isfinite(z)) z = 0.0f;
+    const float az = std::fabs(z);
+    const float t = z / (1.0f + az);        // in (-1,1)
+    return 0.5f * t + 0.5f;                 // in (0,1)
+  };
+
+  // Gather x/y and decode z -> variant index for each block
+  for (std::uint32_t b = 0; b < b_count; ++b) {
+    const float x = xy[3u * b + 0u];
+    const float y = xy[3u * b + 1u];
+    const float z = xy[3u * b + 2u];
+
+    tmp_center_x[b] = x;
+    tmp_center_y[b] = y;
+
+    const std::uint32_t k = static_cast<std::uint32_t>(blocks_[b].variant_count);
+    if (k <= 1u) {
+      tmp_selected_variant[b] = 0u;
+      continue;
+    }
+
+    const float s = fast_sigmoid_01(z);                 // [0,1]
+    const float t = s * static_cast<float>(k);          // [0,k]
+    std::uint32_t idx = static_cast<std::uint32_t>(t);  // fast floor since t>=0
+
+    if (idx >= k) idx = k - 1u;                         // clamp
+    tmp_selected_variant[b] = static_cast<std::uint16_t>(idx);
+  }
+
+  return compute_hpwl_hot_path(
+      tmp_center_x.data(),
+      tmp_center_y.data(),
+      tmp_selected_variant.data());
+}
