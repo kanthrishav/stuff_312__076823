@@ -52,3 +52,115 @@ float evaluate_hpwl(const float* xy) {
       tmp_center_y.data(),
       tmp_selected_variant.data());
 }
+
+
+
+
+
+
+
+// --- float16 alias (uses native half if available) ---
+#if defined(__FLT16_MANT_DIG__)          // GCC/Clang: _Float16
+using float16 = _Float16;
+#elif defined(__ARM_FP16_FORMAT_IEEE)    // some ARM toolchains: __fp16
+using float16 = __fp16;
+#else
+#error "No native float16 type available on this compiler; use a half implementation or store as float."
+#endif
+
+// ----------------------------------------------------
+// PREPROCESSING: store width/height per *global variant index*
+// (same order you push variants_ / variant_meta)
+// ----------------------------------------------------
+std::vector<float16> variant_width_fp16;
+std::vector<float16> variant_height_fp16;
+
+// ... before parsing variants:
+variant_width_fp16.reserve(estimated_total_variants);
+variant_height_fp16.reserve(estimated_total_variants);
+
+// ... inside your per-variant loop, right before variants.push_back(vm):
+const float w = var.at("width").get<float>();
+const float h = var.at("height").get<float>();
+variant_width_fp16.push_back(static_cast<float16>(w));
+variant_height_fp16.push_back(static_cast<float16>(h));
+
+// ----------------------------------------------------
+// RUNTIME ACCESS: width/height by (block_idx, variant_local_idx)
+// ----------------------------------------------------
+inline float get_variant_width(uint32_t block_idx, uint16_t variant_local_idx) const noexcept {
+  const uint32_t v_global = blocks_[block_idx].variant_begin + static_cast<uint32_t>(variant_local_idx);
+  return static_cast<float>(variant_width_fp16_[v_global]);
+}
+
+inline float get_variant_height(uint32_t block_idx, uint16_t variant_local_idx) const noexcept {
+  const uint32_t v_global = blocks_[block_idx].variant_begin + static_cast<uint32_t>(variant_local_idx);
+  return static_cast<float>(variant_height_fp16_[v_global]);
+}
+
+
+
+
+
+#pragma once
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+
+enum class variant_sort_criteria {
+  area_asc,
+  aspect_ratio_asc
+};
+
+// Returns a sortable key for a single variant (no allocations).
+// Missing/invalid width/height -> +inf (pushed to the end).
+static inline double variant_sort_key(const nlohmann::json& variant,
+                                      variant_sort_criteria crit) noexcept {
+  auto bad = []() noexcept {
+    return std::numeric_limits<double>::infinity();
+  };
+
+  if (!variant.is_object()) return bad();
+  if (!variant.contains("width") || !variant.contains("height")) return bad();
+  if (!variant["width"].is_number() || !variant["height"].is_number()) return bad();
+
+  const double w = variant["width"].get<double>();
+  const double h = variant["height"].get<double>();
+  if (!(w > 0.0) || !(h > 0.0)) return bad();
+
+  if (crit == variant_sort_criteria::area_asc) {
+    return w * h;
+  }
+
+  // aspect_ratio_asc: always >= 1.0
+  const double r1 = w / h;
+  const double r2 = h / w;
+  return (r1 > r2) ? r1 : r2;
+}
+
+// In-place: modifies j_block by reordering variant arrays.
+// No new JSON containers are created.
+static inline void sort_variants_inplace(nlohmann::json& j_block,
+                                         variant_sort_criteria crit) {
+  if (!j_block.is_object()) {
+    throw std::runtime_error("sort_variants_inplace: top-level JSON must be an object");
+  }
+
+  for (auto it = j_block.begin(); it != j_block.end(); ++it) {
+    auto& variants = it.value();
+    if (!variants.is_array() || variants.size() <= 1) continue;
+
+    std::sort(variants.begin(), variants.end(),
+      [&](const nlohmann::json& a, const nlohmann::json& b) noexcept {
+        const double ka = variant_sort_key(a, crit);
+        const double kb = variant_sort_key(b, crit);
+
+        // Put "bad" (inf) at the end; otherwise ascending.
+        if (ka == kb) return false;
+        return ka < kb;
+      }
+    );
+  }
+}
