@@ -1,4 +1,35 @@
 private:
+	PE_ALWAYS_INLINE static double stable_sigmoid_01_(double z) noexcept
+	{
+		if(!std::isfinite(z)) z = 0.0;
+		if(z >= 0.0)
+		{
+			const double e = std::exp(-z);
+			return 1.0 / (1.0 + e);
+		}
+		const double e = std::exp(z);
+		return e / (1.0 + e);
+	}
+
+	PE_ALWAYS_INLINE static std::uint32_t decode_variant_index_(const double z, const std::uint32_t k_limit) noexcept
+	{
+		if(k_limit <= 1u) return 0u;
+		const double s = stable_sigmoid_01_(z);
+		std::uint32_t idx = static_cast<std::uint32_t>(s * static_cast<double>(k_limit));
+		if(idx >= k_limit) idx = k_limit - 1u;
+		return idx;
+	}
+
+
+
+
+
+
+
+
+
+
+private:
 	bool de_should_stop_() const noexcept
 	{
 		return run_token_ && run_token_->control && run_token_->control->stop_requested();
