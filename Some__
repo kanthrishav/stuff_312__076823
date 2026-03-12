@@ -1,191 +1,829 @@
+I am not touching any core optimization code (Runner, PlacementEngine, evaluator, history store, pybind, parallel variant/exploration runners). The new multi-usecase path is a header-only CLI wrapper that sits beside the current CLI path and uses the existing Runner interface exactly as-is.
+
+Two important behavior notes:
+
+The new batch path is fully independent per usecase: each worker thread owns its own Runner, parsed JSON objects, output streams, and history buffers. There are no locks, no shared Runner state, no shared history state. Work dispatch is one atomic fetch_add.
+
+The run is not tied to any GUI/screen state. On Windows, screen-off / screen-lock does not stop the process as long as the machine stays awake and does not enter sleep / hibernate.
+
+1) Create a new file
+File to create
+
+cpp/include/multi_usecase_runner.h
+
+Full file contents
+#pragma once
+
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+#include <algorithm>
+
+#include "runner.h"
+
+namespace BatchCLI
+{
+
+class MultiUsecaseRunner
+{
+public:
+    // Immutable batch-run options parsed once in main.cpp and then shared read-only by all workers.
+    struct Options
+    {
+        std::filesystem::path input_dir;
+        std::filesystem::path output_dir;
+        std::size_t max_parallel_jobs = 1;
+        double overlap_threshold = 1e-28;
+    };
+
+    explicit MultiUsecaseRunner(Options options)
+        : options_(std::move(options))
+    {
+    }
+
+    // Discover all paired usecases, fan them out across N independent worker threads,
+    // and fail only after all workers have been joined so successful outputs are preserved.
+    void execute() const
+    {
+        namespace fs = std::filesystem;
+
+        if(options_.input_dir.empty())
+        {
+            throw std::runtime_error("Batch run error: --input-dir is empty.");
+        }
+        if(options_.output_dir.empty())
+        {
+            throw std::runtime_error("Batch run error: --output-dir is empty.");
+        }
+        if(options_.max_parallel_jobs == 0)
+        {
+            throw std::runtime_error("Batch run error: --max-parallel must be >= 1.");
+        }
+
+        const std::vector<UsecaseSpec> usecases = discover_usecases_(options_.input_dir);
+        if(usecases.empty())
+        {
+            throw std::runtime_error(
+                std::string("Batch run error: no paired usecases were found in directory: ") +
+                options_.input_dir.string());
+        }
+
+        std::error_code ec;
+        fs::create_directories(options_.output_dir, ec);
+        if(ec)
+        {
+            throw std::runtime_error(
+                std::string("Batch run error: cannot create output directory '") +
+                options_.output_dir.string() + "': " + ec.message());
+        }
+
+        const std::size_t worker_count = std::min<std::size_t>(options_.max_parallel_jobs, usecases.size());
+        std::atomic<std::size_t> next_index{0};
+        std::vector<std::thread> workers;
+        std::vector<std::string> errors(usecases.size());
+        std::vector<unsigned char> failed(usecases.size(), 0u);
+
+        workers.reserve(worker_count);
+
+        // Lock-free task scheduling: each worker claims the next case with one atomic fetch_add.
+        // Each run owns its Runner, JSON objects, output streams and history buffers completely independently.
+        for(std::size_t worker_id = 0; worker_id < worker_count; ++worker_id)
+        {
+            (void)worker_id;
+            workers.emplace_back([&usecases, &next_index, &errors, &failed, this]()
+            {
+                for(;;)
+                {
+                    const std::size_t task_index = next_index.fetch_add(1, std::memory_order_relaxed);
+                    if(task_index >= usecases.size())
+                    {
+                        break;
+                    }
+
+                    try
+                    {
+                        run_one_usecase_(usecases[task_index], options_);
+                    }
+                    catch(const std::exception& e)
+                    {
+                        failed[task_index] = 1u;
+                        errors[task_index] = e.what();
+                    }
+                    catch(...)
+                    {
+                        failed[task_index] = 1u;
+                        errors[task_index] = "unknown exception";
+                    }
+                }
+            });
+        }
+
+        for(std::thread& t : workers)
+        {
+            t.join();
+        }
+
+        std::string failure_report;
+        for(std::size_t i = 0; i < usecases.size(); ++i)
+        {
+            if(failed[i] != 0u)
+            {
+                if(failure_report.empty())
+                {
+                    failure_report = "Batch run completed with failures:";
+                }
+                failure_report += "\n  - ";
+                failure_report += usecases[i].name;
+                failure_report += ": ";
+                failure_report += errors[i];
+            }
+        }
+
+        if(!failure_report.empty())
+        {
+            throw std::runtime_error(failure_report);
+        }
+    }
+
 private:
-	PE_ALWAYS_INLINE static double stable_sigmoid_01_(double z) noexcept
-	{
-		if(!std::isfinite(z)) z = 0.0;
-		if(z >= 0.0)
-		{
-			const double e = std::exp(-z);
-			return 1.0 / (1.0 + e);
-		}
-		const double e = std::exp(z);
-		return e / (1.0 + e);
-	}
+    struct UsecaseSpec
+    {
+        std::string name;
+        std::filesystem::path jPar_path;
+        std::filesystem::path jBlock_path;
+    };
 
-	PE_ALWAYS_INLINE static std::uint32_t decode_variant_index_(const double z, const std::uint32_t k_limit) noexcept
-	{
-		if(k_limit <= 1u) return 0u;
-		const double s = stable_sigmoid_01_(z);
-		std::uint32_t idx = static_cast<std::uint32_t>(s * static_cast<double>(k_limit));
-		if(idx >= k_limit) idx = k_limit - 1u;
-		return idx;
-	}
+    struct InputCounts
+    {
+        std::size_t number_of_blocks = 0;
+        std::size_t number_of_nets = 0;
+        std::size_t number_of_pins = 0;
+        std::size_t max_number_of_variants_per_block = 0;
+        std::size_t total_number_of_variants = 0;
+    };
 
+    static bool ends_with_(const std::string& value, const std::string& suffix)
+    {
+        return value.size() >= suffix.size() &&
+               value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
 
+    static std::string sanitize_token_(const std::string& value)
+    {
+        std::string out;
+        out.reserve(value.size());
+        for(const char ch : value)
+        {
+            const unsigned char uch = static_cast<unsigned char>(ch);
+            if(std::isalnum(uch) != 0u)
+            {
+                out.push_back(static_cast<char>(uch));
+            }
+            else
+            {
+                out.push_back('_');
+            }
+        }
+        return out;
+    }
 
+    static void append_csv_double_(std::string& dst, const double value)
+    {
+        char buf[64];
+        const int written = std::snprintf(buf, sizeof(buf), "%.17g", value);
+        if(written < 0)
+        {
+            throw std::runtime_error("CSV formatting error for double value.");
+        }
+        dst.append(buf, static_cast<std::size_t>(written));
+    }
 
+    static void append_csv_size_t_(std::string& dst, const std::size_t value)
+    {
+        dst += std::to_string(static_cast<unsigned long long>(value));
+    }
 
+    static void append_csv_int_(std::string& dst, const int value)
+    {
+        dst += std::to_string(value);
+    }
 
+    // Pair <usecase>_jPar.json with <usecase>.json from the same directory.
+    static std::vector<UsecaseSpec> discover_usecases_(const std::filesystem::path& input_dir)
+    {
+        namespace fs = std::filesystem;
 
+        std::error_code ec;
+        if(!fs::exists(input_dir, ec) || !fs::is_directory(input_dir, ec))
+        {
+            throw std::runtime_error(
+                std::string("Batch run error: input directory does not exist or is not a directory: ") +
+                input_dir.string());
+        }
 
+        std::vector<UsecaseSpec> usecases;
+        for(const fs::directory_entry& entry : fs::directory_iterator(input_dir))
+        {
+            if(!entry.is_regular_file())
+            {
+                continue;
+            }
 
+            const fs::path p = entry.path();
+            const std::string filename = p.filename().string();
+            if(!ends_with_(filename, "_jPar.json"))
+            {
+                continue;
+            }
+
+            const std::string stem = p.stem().string();
+            const std::string suffix = "_jPar";
+            if(!ends_with_(stem, suffix))
+            {
+                continue;
+            }
+
+            const std::string usecase_name = stem.substr(0, stem.size() - suffix.size());
+            const fs::path jblock_path = input_dir / (usecase_name + ".json");
+            if(!fs::exists(jblock_path, ec) || !fs::is_regular_file(jblock_path, ec))
+            {
+                throw std::runtime_error(
+                    std::string("Batch run pairing error: missing jBlock JSON for usecase '") +
+                    usecase_name + "'. Expected file: " + jblock_path.string());
+            }
+
+            usecases.push_back(UsecaseSpec{usecase_name, p, jblock_path});
+        }
+
+        std::sort(usecases.begin(), usecases.end(), [](const UsecaseSpec& a, const UsecaseSpec& b)
+        {
+            return a.name < b.name;
+        });
+
+        for(std::size_t i = 1; i < usecases.size(); ++i)
+        {
+            if(usecases[i - 1].name == usecases[i].name)
+            {
+                throw std::runtime_error(
+                    std::string("Batch run pairing error: duplicate usecase name detected: ") +
+                    usecases[i].name);
+            }
+        }
+
+        return usecases;
+    }
+
+    static InputCounts analyze_input_counts_(const json& jBlock)
+    {
+        if(!jBlock.is_object())
+        {
+            throw std::runtime_error("Batch run error: jBlock JSON top level must be an object.");
+        }
+
+        InputCounts counts;
+        counts.number_of_blocks = jBlock.size();
+
+        std::unordered_set<std::string> unique_nets;
+        unique_nets.reserve(jBlock.size() * 64u + 1u);
+
+        for(auto it = jBlock.begin(); it != jBlock.end(); ++it)
+        {
+            const json& variants = it.value();
+            if(!variants.is_array())
+            {
+                throw std::runtime_error(
+                    std::string("Batch run error: block '") + it.key() + "' must map to an array of variants.");
+            }
+
+            counts.max_number_of_variants_per_block =
+                std::max<std::size_t>(counts.max_number_of_variants_per_block, variants.size());
+            counts.total_number_of_variants += variants.size();
+
+            for(const auto& variant : variants)
+            {
+                if(!variant.is_object() || !variant.contains("nets"))
+                {
+                    continue;
+                }
+
+                const json& nets = variant.at("nets");
+                if(!nets.is_object())
+                {
+                    continue;
+                }
+
+                for(auto nit = nets.begin(); nit != nets.end(); ++nit)
+                {
+                    unique_nets.insert(nit.key());
+                    const json& pins = nit.value();
+                    if(!pins.is_array())
+                    {
+                        continue;
+                    }
+
+                    for(const auto& pin : pins)
+                    {
+                        if(!pin.is_object())
+                        {
+                            continue;
+                        }
+
+                        bool valid_pin = false;
+                        if(pin.contains("box"))
+                        {
+                            const json& box = pin.at("box");
+                            valid_pin = box.is_array() && box.size() >= 2u;
+                        }
+                        else if(pin.contains("__x"))
+                        {
+                            const json& box = pin.at("__x");
+                            valid_pin = box.is_array() && box.size() >= 2u;
+                        }
+
+                        if(valid_pin)
+                        {
+                            ++counts.number_of_pins;
+                        }
+                    }
+                }
+            }
+        }
+
+        counts.number_of_nets = unique_nets.size();
+        return counts;
+    }
+
+    static double compute_pure_objective_(const LayoutConfig& cfg, const Metrics& m) noexcept
+    {
+        return (cfg.objective.w_area * m.bbox_area) + (cfg.objective.w_hpwl * m.hpwl);
+    }
+
+    static bool select_best_iteration_(
+        const HistoryStore& hs,
+        const double overlap_threshold,
+        std::size_t& best_index_out)
+    {
+        bool found = false;
+        double best_augmented = std::numeric_limits<double>::infinity();
+        best_index_out = 0;
+
+        for(std::size_t i = 0; i < hs.iterations(); ++i)
+        {
+            const Metrics& m = hs.metrics_at(i);
+            if(m.overlap < overlap_threshold && m.augmented_objective < best_augmented)
+            {
+                best_augmented = m.augmented_objective;
+                best_index_out = i;
+                found = true;
+            }
+        }
+
+        return found;
+    }
+
+    static std::vector<std::string> build_block_labels_(const LayoutConfig& cfg)
+    {
+        std::vector<std::string> labels;
+        labels.reserve(cfg.blocks.size());
+        for(std::size_t i = 0; i < cfg.blocks.size(); ++i)
+        {
+            std::string base = sanitize_token_(cfg.blocks[i].name());
+            if(base.empty())
+            {
+                base = "block";
+            }
+            labels.push_back(base + "_" + std::to_string(static_cast<unsigned long long>(i)));
+        }
+        return labels;
+    }
+
+    // Dump the full iteration history in one flat CSV row per iteration.
+    // Columns are fixed metrics first, then per-block x/y/variant/width/height fields.
+    static void write_history_csv_(
+        const std::filesystem::path& history_csv_path,
+        const LayoutConfig& cfg,
+        const HistoryStore& hs)
+    {
+        std::ofstream ofs(history_csv_path, std::ios::binary | std::ios::trunc);
+        if(!ofs)
+        {
+            throw std::runtime_error(
+                std::string("Batch run error: cannot open history CSV for writing: ") +
+                history_csv_path.string());
+        }
+
+        std::vector<char> io_buffer(8u * 1024u * 1024u, '\0');
+        ofs.rdbuf()->pubsetbuf(io_buffer.data(), static_cast<std::streamsize>(io_buffer.size()));
+
+        const std::size_t n = hs.n();
+        const std::vector<std::string> labels = build_block_labels_(cfg);
+
+        std::string header;
+        header.reserve(512u + n * 64u);
+        header += "iteration_index,bbox_area,bbox_aspect,hpwl,overlap,boundary_violation,aspect_ratio_violation,";
+        header += "symmetry_violation,symmetry_violation_v,symmetry_violation_h,";
+        header += "dead_space_area,dead_space_polygon_area,dead_space_rect_union_area,";
+        header += "augmented_objective,bbox_cx,bbox_cy,bbox_w,bbox_h";
+        for(std::size_t i = 0; i < n; ++i)
+        {
+            header += "," + labels[i] + "_x";
+            header += "," + labels[i] + "_y";
+            header += "," + labels[i] + "_variant";
+            header += "," + labels[i] + "_width";
+            header += "," + labels[i] + "_height";
+        }
+        header.push_back('\n');
+        ofs.write(header.data(), static_cast<std::streamsize>(header.size()));
+
+        const auto& coords = hs.coords_buffer();
+        const auto& variants = hs.variants_buffer();
+        const auto& widths = hs.widths_buffer();
+        const auto& heights = hs.heights_buffer();
+
+        std::string line;
+        line.reserve(512u + n * 96u);
+
+        for(std::size_t iter = 0; iter < hs.iterations(); ++iter)
+        {
+            const Metrics& m = hs.metrics_at(iter);
+            const std::size_t coord_off = iter * (2u * n);
+            const std::size_t dim_off = iter * n;
+
+            line.clear();
+            append_csv_size_t_(line, m.iteration_index); line.push_back(',');
+            append_csv_double_(line, m.bbox_area); line.push_back(',');
+            append_csv_double_(line, m.bbox_aspect); line.push_back(',');
+            append_csv_double_(line, m.hpwl); line.push_back(',');
+            append_csv_double_(line, m.overlap); line.push_back(',');
+            append_csv_double_(line, m.boundary_violation); line.push_back(',');
+            append_csv_double_(line, m.aspect_ratio_violation); line.push_back(',');
+            append_csv_double_(line, m.symmetry_violation); line.push_back(',');
+            append_csv_double_(line, m.symmetry_violation_v); line.push_back(',');
+            append_csv_double_(line, m.symmetry_violation_h); line.push_back(',');
+            append_csv_double_(line, m.dead_space_area); line.push_back(',');
+            append_csv_double_(line, m.dead_space_polygon_area); line.push_back(',');
+            append_csv_double_(line, m.dead_space_rect_union_area); line.push_back(',');
+            append_csv_double_(line, m.augmented_objective); line.push_back(',');
+            append_csv_double_(line, m.bbox_cx); line.push_back(',');
+            append_csv_double_(line, m.bbox_cy); line.push_back(',');
+            append_csv_double_(line, m.bbox_w); line.push_back(',');
+            append_csv_double_(line, m.bbox_h);
+
+            for(std::size_t i = 0; i < n; ++i)
+            {
+                line.push_back(','); append_csv_double_(line, coords[coord_off + (2u * i) + 0u]);
+                line.push_back(','); append_csv_double_(line, coords[coord_off + (2u * i) + 1u]);
+                line.push_back(','); append_csv_int_(line, variants[dim_off + i]);
+                line.push_back(','); append_csv_double_(line, widths[dim_off + i]);
+                line.push_back(','); append_csv_double_(line, heights[dim_off + i]);
+            }
+
+            line.push_back('\n');
+            ofs.write(line.data(), static_cast<std::streamsize>(line.size()));
+        }
+    }
+
+    // Dump one compact summary JSON for the overlap-filtered best solution requested by the CLI contract.
+    static void write_summary_json_(
+        const std::filesystem::path& summary_json_path,
+        const UsecaseSpec& usecase,
+        const InputCounts& counts,
+        const LayoutConfig& cfg,
+        const HistoryStore& hs,
+        const double runtime_seconds,
+        const double engine_runtime_seconds,
+        const double overlap_threshold)
+    {
+        json out;
+        out["usecase_name"] = usecase.name;
+        out["runtime_seconds"] = runtime_seconds;
+        out["engine_runtime_seconds"] = engine_runtime_seconds;
+        out["number_of_blocks"] = counts.number_of_blocks;
+        out["number_of_nets"] = counts.number_of_nets;
+        out["number_of_pins"] = counts.number_of_pins;
+        out["max_number_of_variants_per_block"] = counts.max_number_of_variants_per_block;
+        out["total_number_of_variants"] = counts.total_number_of_variants;
+        out["overlap_threshold_for_best_selection"] = overlap_threshold;
+
+        std::size_t best_index = 0;
+        const bool found = select_best_iteration_(hs, overlap_threshold, best_index);
+        out["best_solution_found_under_overlap_threshold"] = found;
+
+        if(found)
+        {
+            const Metrics& m = hs.metrics_at(best_index);
+            const std::size_t n = hs.n();
+            const std::size_t coord_off = best_index * (2u * n);
+            const std::size_t dim_off = best_index * n;
+            const auto& coords = hs.coords_buffer();
+            const auto& variants = hs.variants_buffer();
+            const auto& widths = hs.widths_buffer();
+            const auto& heights = hs.heights_buffer();
+
+            json best;
+            best["iteration_index"] = m.iteration_index;
+            best["pure_objective"] = compute_pure_objective_(cfg, m);
+            best["bbox_area"] = m.bbox_area;
+            best["bbox_aspect"] = m.bbox_aspect;
+            best["hpwl"] = m.hpwl;
+            best["overlap"] = m.overlap;
+            best["boundary_violation"] = m.boundary_violation;
+            best["aspect_ratio_violation"] = m.aspect_ratio_violation;
+            best["symmetry_violation"] = m.symmetry_violation;
+            best["symmetry_violation_v"] = m.symmetry_violation_v;
+            best["symmetry_violation_h"] = m.symmetry_violation_h;
+            best["dead_space_area"] = m.dead_space_area;
+            best["dead_space_polygon_area"] = m.dead_space_polygon_area;
+            best["dead_space_rect_union_area"] = m.dead_space_rect_union_area;
+            best["augmented_objective"] = m.augmented_objective;
+            best["bbox_cx"] = m.bbox_cx;
+            best["bbox_cy"] = m.bbox_cy;
+            best["bbox_w"] = m.bbox_w;
+            best["bbox_h"] = m.bbox_h;
+
+            json block_names = json::array();
+            json coords_xy = json::array();
+            json variant_indices = json::array();
+            json widths_j = json::array();
+            json heights_j = json::array();
+
+            for(std::size_t i = 0; i < cfg.blocks.size(); ++i)
+            {
+                block_names.push_back(cfg.blocks[i].name());
+            }
+            for(std::size_t i = 0; i < n; ++i)
+            {
+                coords_xy.push_back(json::array({
+                    coords[coord_off + (2u * i) + 0u],
+                    coords[coord_off + (2u * i) + 1u]
+                }));
+                variant_indices.push_back(variants[dim_off + i]);
+                widths_j.push_back(widths[dim_off + i]);
+                heights_j.push_back(heights[dim_off + i]);
+            }
+
+            best["block_names"] = std::move(block_names);
+            best["coords_xy"] = std::move(coords_xy);
+            best["variant_indices"] = std::move(variant_indices);
+            best["widths"] = std::move(widths_j);
+            best["heights"] = std::move(heights_j);
+
+            out["best_solution"] = std::move(best);
+        }
+        else
+        {
+            out["best_solution"] = nullptr;
+        }
+
+        JsonIO::save(summary_json_path.string(), out);
+    }
+
+    // End-to-end execution for exactly one usecase.
+    // All large allocations die at end-of-scope so RAM is released before the worker claims another task.
+    static void run_one_usecase_(const UsecaseSpec& usecase, const Options& options)
+    {
+        const auto wall_begin = std::chrono::steady_clock::now();
+
+        json jPars = JsonIO::load(usecase.jPar_path);
+        json jBlock = JsonIO::load(usecase.jBlock_path);
+
+        if(!jPars.contains("varList"))
+        {
+            throw std::runtime_error(
+                std::string("Batch run error: missing top-level 'varList' in ") +
+                usecase.jPar_path.string());
+        }
+
+        std::vector<int> varList = jPars.at("varList").get<std::vector<int>>();
+        const InputCounts counts = analyze_input_counts_(jBlock);
+
+        // Pure CLI/background execution path: no GUI, no screen dependency, no cross-run shared state.
+        // On Windows, screen-off / lock does not stop this work as long as the machine stays awake.
+        Runner runner;
+        runner.execute_with_json(jPars, jBlock, varList, nullptr);
+
+        const PlacementEngine& placement = runner.placement();
+        const LayoutConfig& cfg = placement.config();
+        const HistoryStore& hs = placement.history();
+
+        const std::filesystem::path history_csv_path =
+            options.output_dir / (usecase.name + "_history.csv");
+        const std::filesystem::path summary_json_path =
+            options.output_dir / (usecase.name + "_summary.json");
+
+        write_history_csv_(history_csv_path, cfg, hs);
+        const std::chrono::duration<double> wall_elapsed =
+            std::chrono::steady_clock::now() - wall_begin;
+
+        write_summary_json_(
+            summary_json_path,
+            usecase,
+            counts,
+            cfg,
+            hs,
+            wall_elapsed.count(),
+            placement.runtime_seconds(),
+            options.overlap_threshold);
+    }
 
 private:
-	bool de_should_stop_() const noexcept
-	{
-		return run_token_ && run_token_->control && run_token_->control->stop_requested();
-	}
+    Options options_;
+};
 
-	void de_control_gate_() const
-	{
-		if(run_token_ && run_token_->control)
-		{
-			run_token_->control->wait_if_paused();
-		}
-	}
 
-	void de_publish_telemetry_(const std::size_t gen, const Metrics& m) const noexcept
+
+
+} // namespace BatchCLI
+2) main.cpp include insertions
+File
+
+cpp/src/main.cpp
+
+Insert below this exact current line
+#include "runner.h"
+This new line
+#include "multi_usecase_runner.h"
+Insert below this exact current line
+#include <fstream>
+This new line
+#include <sstream>
+3) main.cpp main-function replacement
+File
+
+cpp/src/main.cpp
+
+Replace this exact current block
+int main(int argc, char** argv){
+
+	const std::string pathPars = (argc >= 2) ? std::string(argv[1]) : std::string("");
+	const std::string pathQgen = (argc >= 2) ? std::string(argv[2]) : std::string("");	
+	Runner run;
+	run.set_jPars_file(pathPars);
+	run.set_jQgen_file(pathQgen);
+
+	run.execute();
+
+	return 0 ;
+}
+
+With this block
+
+int main(int argc, char** argv){
+
+	try
 	{
-		if(run_token_ && run_token_->iter_counter && run_token_->telemetry_period != 0)
+		if(argc >= 2 && std::string(argv[1]) == "--multi-usecase")
 		{
-			if((gen % run_token_->telemetry_period) == 0)
+			BatchCLI::MultiUsecaseRunner::Options opts;
+
+			for(int i = 2; i < argc; ++i)
 			{
-				run_token_->iter_counter->store(static_cast<std::uint32_t>(gen), std::memory_order_relaxed);
-
-				if(run_token_->last_bbox_area) run_token_->last_bbox_area->store(m.bbox_area, std::memory_order_relaxed);
-				if(run_token_->last_hpwl) run_token_->last_hpwl->store(m.hpwl, std::memory_order_relaxed);
-				if(run_token_->last_overlap) run_token_->last_overlap->store(m.overlap, std::memory_order_relaxed);
-				if(run_token_->last_boundary_violation) run_token_->last_boundary_violation->store(m.boundary_violation, std::memory_order_relaxed);
-				if(run_token_->last_aspect_violation) run_token_->last_aspect_violation->store(m.aspect_ratio_violation, std::memory_order_relaxed);
-				if(run_token_->last_dead_space) run_token_->last_dead_space->store(m.dead_space_area, std::memory_order_relaxed);
-				if(run_token_->last_symmetry) run_token_->last_symmetry->store(m.symmetry_violation, std::memory_order_relaxed);
-				if(run_token_->last_objective) run_token_->last_objective->store(m.augmented_objective, std::memory_order_relaxed);
-			}
-		}
-	}
-
-	void de_store_generation_best_(const arma::subview_col<double>& best, const std::size_t gen)
-	{
-		const arma::mat best_copy = best;
-		const double* best_ptr = best_copy.memptr();
-		const Metrics m = evaluator_.compute_all(best_ptr, gen);
-
-		if(!cfg_.expected.enable_variant_optimization)
-		{
-			store_.push_raw_xy(best_ptr, m, evaluator_.last_polygon_xy(), evaluator_.last_polygon_n(),
-				evaluator_.w_, evaluator_.h_, cfg_.varList, false);
-		}
-		else
-		{
-			store_.push_raw_xy(best_ptr, m, evaluator_.last_polygon_xy(), evaluator_.last_polygon_n(),
-				evaluator_.w_, evaluator_.h_, evaluator_.selected_variant, true);
-		}
-
-		de_publish_telemetry_(gen, m);
-	}
-
-	void run_de_optimized_(LayoutObjective& obj, arma::mat& x)
-	{
-		const auto& p = cfg_.optimizer.de;
-
-		if(p.popsize < 3)
-		{
-			throw std::logic_error("DE::Optimize(): population size should be at least 3!");
-		}
-
-		const arma::uword dim = x.n_elem;
-
-		arma::mat population(dim, p.popsize);
-		arma::rowvec fitnessValues(p.popsize);
-
-		// Match ensmallen DE population initialization: randn() around the starting point.
-		arma::mat noise(dim, p.popsize);
-		noise.randn();
-		population.each_col() = x;
-		population += noise;
-
-		std::size_t bestIndex = 0;
-		double bestFitness = std::numeric_limits<double>::infinity();
-
-		for(std::size_t i = 0; i < p.popsize; ++i)
-		{
-			fitnessValues(i) = obj.Evaluate(population.col(i));
-			if(fitnessValues(i) < bestFitness)
-			{
-				bestFitness = fitnessValues(i);
-				bestIndex = i;
-			}
-		}
-
-		// History semantics for DE: exactly one best candidate per generation.
-		de_store_generation_best_(population.col(bestIndex), 0);
-		x = population.col(bestIndex);
-
-		double lastBestFitness = bestFitness;
-		arma::mat bestElement = population.col(bestIndex);
-		arma::mat mutant(dim, 1);
-		arma::mat cr(dim, 1);
-
-		for(std::size_t gen = 0; gen < p.maxgen; ++gen)
-		{
-			if(de_should_stop_()) break;
-			de_control_gate_();
-			if(de_should_stop_()) break;
-
-			// Freeze generation champion for /best/1/bin, matching ensmallen's generation-level best usage.
-			const arma::mat genBestElement = bestElement;
-
-			for(std::size_t member = 0; member < p.popsize; ++member)
-			{
-				std::size_t l = 0, m = 0;
-				do { l = arma::randi<arma::uword>(arma::distr_param(0, arma::uword(p.popsize - 1))); } while(l == member);
-				do { m = arma::randi<arma::uword>(arma::distr_param(0, arma::uword(p.popsize - 1))); } while(m == member && m == l);
-
-				mutant = genBestElement + p.differential_weight * (population.col(l) - population.col(m));
-
-				cr.randu();
-				for(arma::uword it = 0; it < dim; ++it)
+				const std::string arg(argv[i]);
+				auto require_value = [&](const char* flag_name) -> std::string
 				{
-					if(cr[it] >= p.crossover_rate)
+					if((i + 1) >= argc)
 					{
-						mutant[it] = population(it, member);
+						throw std::runtime_error(std::string("Missing value for argument: ") + flag_name);
 					}
-				}
+					++i;
+					return std::string(argv[i]);
+				};
 
-				const double mutantValue = obj.Evaluate(mutant);
-
-				if(mutantValue < fitnessValues(member))
+				if(arg == "--input-dir")
 				{
-					population.col(member) = mutant;
-					fitnessValues(member) = mutantValue;
+					opts.input_dir = require_value("--input-dir");
 				}
-			}
-
-			bestIndex = 0;
-			bestFitness = fitnessValues(0);
-			for(std::size_t i = 1; i < p.popsize; ++i)
-			{
-				if(fitnessValues(i) < bestFitness)
+				else if(arg == "--output-dir")
 				{
-					bestFitness = fitnessValues(i);
-					bestIndex = i;
+					opts.output_dir = require_value("--output-dir");
+				}
+				else if(arg == "--max-parallel")
+				{
+					opts.max_parallel_jobs = static_cast<std::size_t>(std::stoull(require_value("--max-parallel")));
+				}
+				else if(arg == "--overlap-threshold")
+				{
+					opts.overlap_threshold = std::stod(require_value("--overlap-threshold"));
+				}
+				else
+				{
+					throw std::runtime_error(std::string("Unknown batch argument: ") + arg);
 				}
 			}
 
-			bestElement = population.col(bestIndex);
-			de_store_generation_best_(population.col(bestIndex), gen + 1);
-			x = population.col(bestIndex);
-
-			if(cfg_.optimizer.common.stopping_criteria == "target_objective" &&
-			   bestFitness <= cfg_.optimizer.common.stopping_criteria_value)
-			{
-				break;
-			}
-
-			if(std::abs(lastBestFitness - bestFitness) < p.tolerance)
-			{
-				break;
-			}
-
-			lastBestFitness = bestFitness;
+			BatchCLI::MultiUsecaseRunner batch_runner(std::move(opts));
+			batch_runner.execute();
+			return 0;
 		}
+
+		if(argc < 3)
+		{
+			std::cerr
+				<< "Usage:\n"
+				<< "  Single usecase : placement_engine_app <jPar.json> <jBlock.json>\n"
+				<< "  Multi usecase  : placement_engine_app --multi-usecase --input-dir <dir> --output-dir <dir> --max-parallel <N> [--overlap-threshold <value>]\n";
+			return 1;
+		}
+
+		const std::string pathPars = std::string(argv[1]);
+		const std::string pathQgen = std::string(argv[2]);
+		Runner run;
+		run.set_jPars_file(pathPars);
+		run.set_jQgen_file(pathQgen);
+
+		run.execute();
+		return 0;
 	}
+	catch(const std::exception& e)
+	{
+		std::cerr << e.what() << std::endl;
+		return 1;
+	}
+}
+4) No other files need to change
+
+No function signature was modified.
+No class interface was modified.
+No object creation sites elsewhere need updates.
+No pybind call sites need updates.
+No core backend code needs updates.
+No CMake change is required because:
+
+the wrapper is header-only
+
+placement_engine_app already compiles main.cpp
+
+cpp/include is already in the include path
+
+5) CLI usage
+
+Single-usecase path remains:
+
+placement_engine_app <jPar.json> <jBlock.json>
+
+New multi-usecase CLI path:
+
+placement_engine_app --multi-usecase --input-dir <usecase_dir> --output-dir <output_dir> --max-parallel <N>
+
+Example:
+
+placement_engine_app --multi-usecase --input-dir D:\opt_cases --output-dir D:\opt_out --max-parallel 8
+
+Optional explicit overlap threshold for summary selection:
+
+placement_engine_app --multi-usecase --input-dir D:\opt_cases --output-dir D:\opt_out --max-parallel 8 --overlap-threshold 1e-28
+6) What this patch gives you
+
+For every paired usecase:
+
+input pair:
+
+<usecase>.json
+
+<usecase>_jPar.json
+
+output files:
+
+<usecase>_history.csv
+
+<usecase>_summary.json
+
+history.csv contains:
+
+all stored metrics already exposed by pybind history
+
+per-iteration x/y
+
+per-iteration variant index
+
+per-iteration width/height
+
+summary.json contains:
+
+runtime
+
+engine runtime
+
+overlap-threshold-based best solution
+
+corresponding area / hpwl / overlap / boundary / aspect / symmetry / deadspace / augmented / pure objective
+
+counts for blocks / nets / pins / max variants per block / total variants
+
+If no iteration satisfies overlap < 1e-28, the summary does not silently fall back to another solution; it writes:
+
+"best_solution_found_under_overlap_threshold": false
+
+"best_solution": null
+
+That keeps the output faithful to your stated selection rule.
