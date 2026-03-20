@@ -1,3 +1,37 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Generate one Plotly multi-tab HTML dashboard per study JSON file.
+
+What this script does
+---------------------
+1. Reads all JSON files from a provided directory.
+2. Treats each JSON filename (without extension) as the study name.
+3. For each JSON file, creates one HTML file in the same directory.
+4. Each HTML contains one tab per input parameter key.
+5. Each tab contains:
+   - a 4x3 subplot grid of augObj vs that input parameter for all usecases,
+   - a 4x3 text grid with blocks / nets / pins / maxVarPerBlock / variants,
+   - a 4x3 best-input grid using the priority:
+       overlap == 0  --> highest priority
+       then lowest augObj
+       then lowest boundary
+6. Blank/empty usecases remain blank except for the heading.
+
+Dependency
+----------
+pip install plotly
+
+Usage
+-----
+Option 1: Set INPUT_STUDY_DIR below and run:
+    python generate_study_dashboards.py
+
+Option 2: Pass the directory at runtime:
+    python generate_study_dashboards.py "D:/path/to/study_jsons"
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -5,71 +39,93 @@ import html
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 
 
-# ============================================================
-# USER CONTROLS
-# ============================================================
-DEFAULT_STUDY_DIR = r"./studies"        # Can be overridden by --study_dir
-JSON_GLOB = "*.json"
-INCLUDE_PLOTLYJS = "cdn"                # True | False | "cdn"
+# ======================================================================================
+# USER CONTROLS / STYLING CONTROLS
+# ======================================================================================
 
-GRID_COLUMNS = 4
-GRID_ROWS = 3
+# Input directory. Can be overridden from command line.
+INPUT_STUDY_DIR = r""
 
-PAGE_TITLE_SUFFIX = " - Multi-tab Study Dashboard"
+# File scanning
+JSON_GLOB_PATTERN = "*.json"
+OUTPUT_HTML_SUFFIX = ".html"  # final file will be <study_name>.html
 
-PAGE_BACKGROUND_COLOR = "#061a40"      # dark blue
-PAGE_TEXT_COLOR = "#d4a017"            # mustard yellow
-CARD_BACKGROUND_COLOR = "#0b234f"
-CARD_BORDER_COLOR = "#1f3d7a"
-PLOT_BACKGROUND_COLOR = "#061a40"
-PAPER_BACKGROUND_COLOR = "#061a40"
-AXIS_GRID_COLOR = "#234a84"
-TAB_ACTIVE_BACKGROUND = "#13336b"
-TAB_INACTIVE_BACKGROUND = "#0b234f"
-TAB_BORDER_COLOR = "#294f8b"
+# Grid controls
+GRID_ROWS = 4
+GRID_COLS = 3
+EXPECTED_USECASE_COUNT = 12  # informational only; script still works if count differs
 
-FONT_FAMILY = "Arial, Helvetica, sans-serif"
-PAGE_TITLE_FONT_SIZE = 22
-TAB_FONT_SIZE = 15
-CARD_TITLE_FONT_SIZE = 15
-CARD_BODY_FONT_SIZE = 13
-PLOT_FONT_SIZE = 12
-
-PLOT_CELL_HEIGHT = 300                 # per subplot row
-PLOT_TOP_MARGIN = 85
-PLOT_BOTTOM_MARGIN = 45
-PLOT_LEFT_MARGIN = 55
-PLOT_RIGHT_MARGIN = 35
+# Plot sizing controls
+FIGURE_HEIGHT_PER_ROW_PX = 300
+FIGURE_TOP_MARGIN_PX = 70
+FIGURE_BOTTOM_MARGIN_PX = 50
+FIGURE_LEFT_MARGIN_PX = 55
+FIGURE_RIGHT_MARGIN_PX = 40
 SUBPLOT_HORIZONTAL_SPACING = 0.05
 SUBPLOT_VERTICAL_SPACING = 0.10
 
-SCATTER_SIZE = 6
-LINE_WIDTH = 1.2
-LINE_DASH = "dot"
-LINE_COLOR = "#d4a017"
-COLORSCALE = "Viridis"
+# Page / theme controls
+PAGE_BACKGROUND_COLOR = "#041B4A"       # dark blue
+PANEL_BACKGROUND_COLOR = "#08285E"
+CARD_BACKGROUND_COLOR = "#0B3172"
+PLOT_PAPER_BACKGROUND_COLOR = "#041B4A"
+PLOT_AREA_BACKGROUND_COLOR = "#08285E"
+FONT_COLOR = "#D4A017"                  # mustard yellow
+SUBTEXT_COLOR = "#E2C15A"
+BORDER_COLOR = "#D4A017"
+GRID_LINE_COLOR = "#365B9B"
+AXIS_LINE_COLOR = "#A78200"
+HOVER_BACKGROUND_COLOR = "#143A7B"
 
+# Font controls
+FONT_FAMILY = "Arial, Helvetica, sans-serif"
+BASE_FONT_SIZE = 13
+TAB_FONT_SIZE = 14
+PAGE_TITLE_FONT_SIZE = 24
+SECTION_TITLE_FONT_SIZE = 18
+SUBPLOT_TITLE_FONT_SIZE = 13
+CARD_TITLE_FONT_SIZE = 14
+CARD_BODY_FONT_SIZE = 12
+
+# Scatter controls
+SCATTER_MARKER_SIZE = 6
+SCATTER_LINE_WIDTH = 1
+SCATTER_LINE_DASH = "dot"
+SCATTER_LINE_COLOR = "#E2C15A"
+COLOR_SCALE = "Viridis"  # change here if you want another Plotly colorscale
+
+# Text grid controls
 TEXT_GRID_GAP_PX = 14
-CARD_PADDING_PX = 12
-CARD_BORDER_RADIUS_PX = 10
-SECTION_MARGIN_TOP_PX = 18
+CARD_PADDING_PX = 10
+CARD_MIN_HEIGHT_PX = 110
+BEST_CARD_MIN_HEIGHT_PX = 150
 
-SHOW_AXIS_TITLES = True
-SHOW_LEGEND = False
+# HTML / Plotly controls
+PLOTLY_INCLUDE_JS = "cdn"
+DISPLAY_MODE_BAR = True
+SHOW_PLOTLY_LOGO = False
+RESPONSIVE_PLOT = True
 
-ZERO_OVERLAP_TOL = 1e-12
+# Numeric formatting
+FLOAT_PRECISION = 6
 
-# ============================================================
-# CONSTANTS
-# ============================================================
-OUTPUT_META_KEYS = ["blocks", "nets", "pins", "maxVarPerBlock", "variants"]
-OUTPUT_SERIES_KEYS = [
+# ======================================================================================
+# EXPECTED KEYS
+# ======================================================================================
+
+EXPECTED_OUTPUT_KEYS = [
+    "blocks",
+    "nets",
+    "pins",
+    "maxVarPerBlock",
+    "variants",
     "pureObj",
     "area",
     "aspect",
@@ -80,209 +136,413 @@ OUTPUT_SERIES_KEYS = [
     "augObj",
     "runtime",
 ]
-HOVER_OUTPUT_KEYS = ["area", "hpwl", "overlap", "boundary", "aspectViol", "pureObj", "runtime"]
+
+HOVER_OUTPUT_KEYS = [
+    "augObj",
+    "area",
+    "hpwl",
+    "overlap",
+    "boundary",
+    "aspectViol",
+    "pureObj",
+    "runtime",
+]
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Build one multi-tab Plotly HTML dashboard per study JSON file."
-    )
-    parser.add_argument(
-        "--study_dir",
-        type=str,
-        default=DEFAULT_STUDY_DIR,
-        help="Directory containing study JSON files.",
-    )
-    return parser.parse_args()
+# ======================================================================================
+# HELPERS
+# ======================================================================================
+
+def ensure_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if value is None:
+        return []
+    return [value]
 
 
-def as_list(value: Any) -> List[Any]:
-    return list(value) if isinstance(value, list) else []
+def safe_get(dct: Dict[str, Any], key: str, default: Any) -> Any:
+    return dct[key] if isinstance(dct, dict) and key in dct else default
 
 
-def is_number(value: Any) -> bool:
+def value_at(seq: Sequence[Any], idx: int, default: Any = None) -> Any:
     try:
-        x = float(value)
-        return math.isfinite(x)
-    except (TypeError, ValueError):
-        return False
-
-
-def to_sort_float(value: Any, default: float = float("inf")) -> float:
-    try:
-        x = float(value)
-        return x if math.isfinite(x) else default
-    except (TypeError, ValueError):
+        return seq[idx]
+    except Exception:
         return default
 
 
-def format_value(value: Any) -> str:
+def to_float_or_nan(value: Any) -> float:
+    try:
+        x = float(value)
+        return x if math.isfinite(x) else math.nan
+    except Exception:
+        return math.nan
+
+
+def to_float_or_inf(value: Any) -> float:
+    try:
+        x = float(value)
+        return x if math.isfinite(x) else math.inf
+    except Exception:
+        return math.inf
+
+
+def is_effectively_empty_usecase(usecase_data: Dict[str, Any]) -> bool:
+    """
+    Blank if:
+    - all input lists are empty, and
+    - all output lists are empty, and
+    - all scalar output values are 0 / None / empty
+    """
+    if not isinstance(usecase_data, dict):
+        return True
+
+    input_dict = safe_get(usecase_data, "input", {})
+    output_dict = safe_get(usecase_data, "output", {})
+
+    input_has_data = any(len(ensure_list(v)) > 0 for v in input_dict.values()) if isinstance(input_dict, dict) else False
+
+    output_list_has_data = False
+    output_scalar_has_nonzero = False
+
+    if isinstance(output_dict, dict):
+        for val in output_dict.values():
+            if isinstance(val, list):
+                if len(val) > 0:
+                    output_list_has_data = True
+            else:
+                if val not in (0, 0.0, None, "", False):
+                    output_scalar_has_nonzero = True
+
+    return not (input_has_data or output_list_has_data or output_scalar_has_nonzero)
+
+
+def fmt_value(value: Any, precision: int = FLOAT_PRECISION) -> str:
     if value is None:
-        return "None"
+        return "NA"
     if isinstance(value, bool):
         return str(value)
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        if not math.isfinite(value):
-            return str(value)
-        return f"{value:.6g}"
-    if is_number(value):
-        value = float(value)
-        return f"{value:.6g}"
-    return str(value)
+        if math.isnan(value):
+            return "NA"
+        if math.isinf(value):
+            return "INF"
+        return f"{value:.{precision}g}"
+    try:
+        x = float(value)
+        if math.isnan(x):
+            return "NA"
+        if math.isinf(x):
+            return "INF"
+        if x.is_integer():
+            return str(int(x))
+        return f"{x:.{precision}g}"
+    except Exception:
+        return str(value)
 
 
 def html_escape(value: Any) -> str:
-    return html.escape(format_value(value))
+    return html.escape(str(value))
 
 
-def load_json_file(json_path: Path) -> Dict[str, Any]:
-    with json_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+def discover_input_keys(study_data: Dict[str, Any]) -> List[str]:
+    keys: List[str] = []
+    seen = set()
+    for _, usecase_block in study_data.items():
+        input_dict = safe_get(usecase_block, "input", {})
+        if not isinstance(input_dict, dict):
+            continue
+        for key in input_dict.keys():
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys
 
 
-def is_blank_usecase(usecase_data: Dict[str, Any]) -> bool:
-    input_dict = usecase_data.get("input", {})
-    output_dict = usecase_data.get("output", {})
-
-    input_empty = all(len(as_list(v)) == 0 for v in input_dict.values()) if input_dict else True
-    scalar_zero = all(to_sort_float(output_dict.get(k, 0), default=0.0) == 0.0 for k in OUTPUT_META_KEYS)
-    output_lists_empty = all(len(as_list(output_dict.get(k, []))) == 0 for k in OUTPUT_SERIES_KEYS)
-
-    return input_empty and scalar_zero and output_lists_empty
+def get_usecase_order(study_data: Dict[str, Any]) -> List[str]:
+    return list(study_data.keys())
 
 
-def first_input_keys(study_data: Dict[str, Any]) -> List[str]:
-    for usecase_data in study_data.values():
-        input_dict = usecase_data.get("input", {})
-        if isinstance(input_dict, dict):
-            return list(input_dict.keys())
-    return []
+def compute_tab_runtime_bounds(
+    study_data: Dict[str, Any],
+    usecase_order: List[str],
+    param_key: str
+) -> Tuple[float, float]:
+    vals: List[float] = []
+    for uc_name in usecase_order:
+        uc_block = study_data.get(uc_name, {})
+        if is_effectively_empty_usecase(uc_block):
+            continue
+        output_dict = safe_get(uc_block, "output", {})
+        runtime_list = ensure_list(safe_get(output_dict, "runtime", []))
+        x_list = ensure_list(safe_get(safe_get(uc_block, "input", {}), param_key, []))
+        y_list = ensure_list(safe_get(output_dict, "augObj", []))
+        n = min(len(x_list), len(y_list))
+        for i in range(n):
+            val = to_float_or_nan(value_at(runtime_list, i))
+            if not math.isnan(val):
+                vals.append(val)
+
+    if not vals:
+        return (0.0, 1.0)
+
+    mn = min(vals)
+    mx = max(vals)
+    if mn == mx:
+        mx = mn + 1.0
+    return (mn, mx)
 
 
-def get_common_length(usecase_data: Dict[str, Any], param_name: str) -> int:
-    input_dict = usecase_data.get("input", {})
-    output_dict = usecase_data.get("output", {})
+def build_hover_texts(
+    usecase_name: str,
+    idx_count: int,
+    all_input_keys: List[str],
+    input_dict: Dict[str, Any],
+    output_dict: Dict[str, Any],
+) -> List[str]:
+    hover_texts: List[str] = []
+    for i in range(idx_count):
+        lines = [f"<b>{html_escape(usecase_name)}</b>", f"index: {i}"]
 
-    series_to_align = [as_list(input_dict.get(param_name, []))]
-    for key in HOVER_OUTPUT_KEYS + ["augObj"]:
-        series_to_align.append(as_list(output_dict.get(key, [])))
+        for inp_key in all_input_keys:
+            inp_val = value_at(ensure_list(safe_get(input_dict, inp_key, [])), i)
+            lines.append(f"{html_escape(inp_key)}: {html_escape(fmt_value(inp_val))}")
 
-    lengths = [len(s) for s in series_to_align]
-    return min(lengths) if lengths else 0
+        for out_key in HOVER_OUTPUT_KEYS:
+            out_val = value_at(ensure_list(safe_get(output_dict, out_key, [])), i)
+            lines.append(f"{html_escape(out_key)}: {html_escape(fmt_value(out_val))}")
 
-
-def get_best_common_length(usecase_data: Dict[str, Any], input_keys: Sequence[str]) -> int:
-    input_dict = usecase_data.get("input", {})
-    output_dict = usecase_data.get("output", {})
-
-    series_to_align: List[List[Any]] = [as_list(input_dict.get(k, [])) for k in input_keys]
-    for key in ["augObj", "overlap", "boundary", "runtime"]:
-        series_to_align.append(as_list(output_dict.get(key, [])))
-
-    lengths = [len(s) for s in series_to_align]
-    return min(lengths) if lengths else 0
-
-
-def collect_runtime_range(study_data: Dict[str, Any]) -> Tuple[float, float]:
-    runtime_values: List[float] = []
-    for usecase_data in study_data.values():
-        runtime_series = as_list(usecase_data.get("output", {}).get("runtime", []))
-        runtime_values.extend([float(v) for v in runtime_series if is_number(v)])
-
-    if not runtime_values:
-        return 0.0, 1.0
-
-    vmin = min(runtime_values)
-    vmax = max(runtime_values)
-    if math.isclose(vmin, vmax, rel_tol=0.0, abs_tol=1e-15):
-        vmax = vmin + 1.0
-    return vmin, vmax
+        hover_texts.append("<br>".join(lines))
+    return hover_texts
 
 
-def build_hover_template(param_name: str) -> str:
-    return (
-        f"{html.escape(param_name)}=%{{x}}<br>"
-        f"augObj=%{{y}}<br>"
-        f"area=%{{customdata[0]}}<br>"
-        f"hpwl=%{{customdata[1]}}<br>"
-        f"overlap=%{{customdata[2]}}<br>"
-        f"boundary=%{{customdata[3]}}<br>"
-        f"aspectViol=%{{customdata[4]}}<br>"
-        f"pureObj=%{{customdata[5]}}<br>"
-        f"runtime=%{{customdata[6]}}"
-        f"<extra></extra>"
-    )
+def get_best_index(usecase_data: Dict[str, Any]) -> Optional[int]:
+    """
+    Selection priority:
+    1. overlap == 0
+    2. lowest augObj
+    3. lowest boundary
+    """
+    output_dict = safe_get(usecase_data, "output", {})
+    aug_list = ensure_list(safe_get(output_dict, "augObj", []))
+    overlap_list = ensure_list(safe_get(output_dict, "overlap", []))
+    boundary_list = ensure_list(safe_get(output_dict, "boundary", []))
+
+    if len(aug_list) == 0:
+        return None
+
+    def key_fn(i: int) -> Tuple[int, float, float, int]:
+        overlap_val = to_float_or_inf(value_at(overlap_list, i))
+        aug_val = to_float_or_inf(value_at(aug_list, i))
+        boundary_val = to_float_or_inf(value_at(boundary_list, i))
+        overlap_priority = 0 if overlap_val == 0 else 1
+        return (overlap_priority, aug_val, boundary_val, i)
+
+    return min(range(len(aug_list)), key=key_fn)
 
 
-def build_study_figure(
+def build_info_grid_html(
+    study_data: Dict[str, Any],
+    usecase_order: List[str],
+) -> str:
+    cards: List[str] = []
+
+    total_cells = max(len(usecase_order), GRID_ROWS * GRID_COLS)
+    padded_usecases = usecase_order + [""] * (total_cells - len(usecase_order))
+
+    for uc_name in padded_usecases:
+        if not uc_name:
+            cards.append(
+                f"""
+                <div class="grid-card">
+                    <div class="card-title">&nbsp;</div>
+                    <div class="card-body"></div>
+                </div>
+                """
+            )
+            continue
+
+        uc_block = study_data.get(uc_name, {})
+        output_dict = safe_get(uc_block, "output", {})
+
+        blocks = safe_get(output_dict, "blocks", 0)
+        nets = safe_get(output_dict, "nets", 0)
+        pins = safe_get(output_dict, "pins", 0)
+        max_var = safe_get(output_dict, "maxVarPerBlock", 0)
+        variants = safe_get(output_dict, "variants", 0)
+
+        if is_effectively_empty_usecase(uc_block):
+            body = ""
+        else:
+            body = (
+                f"blocks: {html_escape(fmt_value(blocks))}<br>"
+                f"nets: {html_escape(fmt_value(nets))}<br>"
+                f"pins: {html_escape(fmt_value(pins))}<br>"
+                f"maxVarPerBlock: {html_escape(fmt_value(max_var))}<br>"
+                f"variants: {html_escape(fmt_value(variants))}"
+            )
+
+        cards.append(
+            f"""
+            <div class="grid-card">
+                <div class="card-title">{html_escape(uc_name)}</div>
+                <div class="card-body">{body}</div>
+            </div>
+            """
+        )
+
+    return f"""
+    <div class="section-title">Usecase summary</div>
+    <div class="text-grid">
+        {''.join(cards)}
+    </div>
+    """
+
+
+def build_best_grid_html(
+    study_data: Dict[str, Any],
+    usecase_order: List[str],
+    all_input_keys: List[str],
+) -> str:
+    cards: List[str] = []
+
+    total_cells = max(len(usecase_order), GRID_ROWS * GRID_COLS)
+    padded_usecases = usecase_order + [""] * (total_cells - len(usecase_order))
+
+    for uc_name in padded_usecases:
+        if not uc_name:
+            cards.append(
+                f"""
+                <div class="grid-card best-card">
+                    <div class="card-title">&nbsp;</div>
+                    <div class="card-body"></div>
+                </div>
+                """
+            )
+            continue
+
+        uc_block = study_data.get(uc_name, {})
+        if is_effectively_empty_usecase(uc_block):
+            body = ""
+        else:
+            best_idx = get_best_index(uc_block)
+            if best_idx is None:
+                body = ""
+            else:
+                input_dict = safe_get(uc_block, "input", {})
+                output_dict = safe_get(uc_block, "output", {})
+
+                lines = [f"selected index: {best_idx}"]
+
+                for inp_key in all_input_keys:
+                    inp_val = value_at(ensure_list(safe_get(input_dict, inp_key, [])), best_idx)
+                    lines.append(f"{inp_key}: {fmt_value(inp_val)}")
+
+                lines.extend([
+                    f"augObj: {fmt_value(value_at(ensure_list(safe_get(output_dict, 'augObj', [])), best_idx))}",
+                    f"overlap: {fmt_value(value_at(ensure_list(safe_get(output_dict, 'overlap', [])), best_idx))}",
+                    f"boundary: {fmt_value(value_at(ensure_list(safe_get(output_dict, 'boundary', [])), best_idx))}",
+                    f"runtime: {fmt_value(value_at(ensure_list(safe_get(output_dict, 'runtime', [])), best_idx))}",
+                ])
+                body = "<br>".join(html_escape(line) for line in lines)
+
+        cards.append(
+            f"""
+            <div class="grid-card best-card">
+                <div class="card-title">{html_escape(uc_name)}</div>
+                <div class="card-body">{body}</div>
+            </div>
+            """
+        )
+
+    return f"""
+    <div class="section-title">Best input set per usecase</div>
+    <div class="section-note">
+        Priority used: overlap == 0 &rarr; lowest augObj &rarr; lowest boundary
+    </div>
+    <div class="text-grid">
+        {''.join(cards)}
+    </div>
+    """
+
+
+def build_param_figure(
     study_name: str,
     study_data: Dict[str, Any],
-    usecase_names: Sequence[str],
-    param_name: str,
-    runtime_range: Tuple[float, float],
+    usecase_order: List[str],
+    all_input_keys: List[str],
+    param_key: str,
 ) -> go.Figure:
-    subplot_titles = [html.escape(name) for name in usecase_names]
+
+    total_cells = max(len(usecase_order), GRID_ROWS * GRID_COLS)
+    padded_usecases = usecase_order + [""] * (total_cells - len(usecase_order))
+
+    subplot_titles = [uc if uc else "" for uc in padded_usecases]
+
     fig = make_subplots(
         rows=GRID_ROWS,
-        cols=GRID_COLUMNS,
+        cols=GRID_COLS,
         subplot_titles=subplot_titles,
         horizontal_spacing=SUBPLOT_HORIZONTAL_SPACING,
         vertical_spacing=SUBPLOT_VERTICAL_SPACING,
     )
 
-    runtime_min, runtime_max = runtime_range
+    cmin, cmax = compute_tab_runtime_bounds(study_data, usecase_order, param_key)
 
-    for idx, usecase_name in enumerate(usecase_names):
-        row = (idx // GRID_COLUMNS) + 1
-        col = (idx % GRID_COLUMNS) + 1
+    for idx, uc_name in enumerate(padded_usecases):
+        row = idx // GRID_COLS + 1
+        col = idx % GRID_COLS + 1
 
-        usecase_data = study_data[usecase_name]
-        if is_blank_usecase(usecase_data):
+        if not uc_name:
             fig.update_xaxes(visible=False, row=row, col=col)
             fig.update_yaxes(visible=False, row=row, col=col)
             continue
 
-        n = get_common_length(usecase_data, param_name)
-        if n <= 0:
+        uc_block = study_data.get(uc_name, {})
+        input_dict = safe_get(uc_block, "input", {})
+        output_dict = safe_get(uc_block, "output", {})
+
+        x_list = ensure_list(safe_get(input_dict, param_key, []))
+        aug_list = ensure_list(safe_get(output_dict, "augObj", []))
+        n = min(len(x_list), len(aug_list))
+
+        if is_effectively_empty_usecase(uc_block) or n == 0:
             fig.update_xaxes(visible=False, row=row, col=col)
             fig.update_yaxes(visible=False, row=row, col=col)
             continue
 
-        input_dict = usecase_data.get("input", {})
-        output_dict = usecase_data.get("output", {})
-
-        x_vals = as_list(input_dict.get(param_name, []))[:n]
-        aug_vals = as_list(output_dict.get("augObj", []))[:n]
-        runtime_vals = as_list(output_dict.get("runtime", []))[:n]
-
-        customdata = list(
-            zip(
-                as_list(output_dict.get("area", []))[:n],
-                as_list(output_dict.get("hpwl", []))[:n],
-                as_list(output_dict.get("overlap", []))[:n],
-                as_list(output_dict.get("boundary", []))[:n],
-                as_list(output_dict.get("aspectViol", []))[:n],
-                as_list(output_dict.get("pureObj", []))[:n],
-                runtime_vals,
-            )
+        runtime_list = ensure_list(safe_get(output_dict, "runtime", []))
+        hover_texts = build_hover_texts(
+            usecase_name=uc_name,
+            idx_count=n,
+            all_input_keys=all_input_keys,
+            input_dict=input_dict,
+            output_dict=output_dict,
         )
+
+        marker_colors = [to_float_or_nan(value_at(runtime_list, i)) for i in range(n)]
 
         fig.add_trace(
             go.Scatter(
-                x=x_vals,
-                y=aug_vals,
+                x=[value_at(x_list, i) for i in range(n)],
+                y=[value_at(aug_list, i) for i in range(n)],
                 mode="lines+markers",
-                line=dict(color=LINE_COLOR, width=LINE_WIDTH, dash=LINE_DASH),
+                line=dict(
+                    width=SCATTER_LINE_WIDTH,
+                    dash=SCATTER_LINE_DASH,
+                    color=SCATTER_LINE_COLOR,
+                ),
                 marker=dict(
-                    size=SCATTER_SIZE,
-                    color=runtime_vals,
+                    size=SCATTER_MARKER_SIZE,
+                    color=marker_colors,
                     coloraxis="coloraxis",
                 ),
-                customdata=customdata,
-                hovertemplate=build_hover_template(param_name),
-                showlegend=SHOW_LEGEND,
+                text=hover_texts,
+                hovertemplate="%{text}<extra></extra>",
+                showlegend=False,
             ),
             row=row,
             col=col,
@@ -290,462 +550,442 @@ def build_study_figure(
 
         fig.update_xaxes(
             showgrid=True,
-            gridcolor=AXIS_GRID_COLOR,
+            gridcolor=GRID_LINE_COLOR,
+            linecolor=AXIS_LINE_COLOR,
             zeroline=False,
+            automargin=True,
+            tickfont=dict(color=FONT_COLOR, size=BASE_FONT_SIZE - 1, family=FONT_FAMILY),
             row=row,
             col=col,
         )
+
         fig.update_yaxes(
             showgrid=True,
-            gridcolor=AXIS_GRID_COLOR,
+            gridcolor=GRID_LINE_COLOR,
+            linecolor=AXIS_LINE_COLOR,
             zeroline=False,
+            automargin=True,
+            tickfont=dict(color=FONT_COLOR, size=BASE_FONT_SIZE - 1, family=FONT_FAMILY),
             row=row,
             col=col,
         )
 
-        if SHOW_AXIS_TITLES and row == GRID_ROWS:
-            fig.update_xaxes(title_text=param_name, row=row, col=col)
-        if SHOW_AXIS_TITLES and col == 1:
-            fig.update_yaxes(title_text="augObj", row=row, col=col)
+    # Put x-axis titles only on bottom row
+    for c in range(1, GRID_COLS + 1):
+        fig.update_xaxes(title_text=param_key, row=GRID_ROWS, col=c)
 
-    fig.update_layout(
-        title=dict(text=f"{html.escape(study_name)} — augObj vs {html.escape(param_name)}", x=0.5),
-        height=(GRID_ROWS * PLOT_CELL_HEIGHT) + PLOT_TOP_MARGIN + PLOT_BOTTOM_MARGIN,
-        margin=dict(
-            l=PLOT_LEFT_MARGIN,
-            r=PLOT_RIGHT_MARGIN,
-            t=PLOT_TOP_MARGIN,
-            b=PLOT_BOTTOM_MARGIN,
-        ),
-        paper_bgcolor=PAPER_BACKGROUND_COLOR,
-        plot_bgcolor=PLOT_BACKGROUND_COLOR,
+    # Put y-axis titles only on left column
+    for r in range(1, GRID_ROWS + 1):
+        fig.update_yaxes(title_text="augObj", row=r, col=1)
+
+    fig.update_annotations(
         font=dict(
             family=FONT_FAMILY,
-            size=PLOT_FONT_SIZE,
-            color=PAGE_TEXT_COLOR,
-        ),
-        coloraxis=dict(
-            colorscale=COLORSCALE,
-            cmin=runtime_min,
-            cmax=runtime_max,
-            colorbar=dict(
-                title=dict(text="runtime", font=dict(color=PAGE_TEXT_COLOR)),
-                tickfont=dict(color=PAGE_TEXT_COLOR),
-            ),
-        ),
+            size=SUBPLOT_TITLE_FONT_SIZE,
+            color=FONT_COLOR,
+        )
     )
 
-    for annotation in fig.layout.annotations:
-        annotation.font = dict(
+    fig.update_layout(
+        title=dict(
+            text=f"{study_name} : augObj vs {param_key}",
+            x=0.5,
+            xanchor="center",
+            font=dict(
+                family=FONT_FAMILY,
+                size=SECTION_TITLE_FONT_SIZE,
+                color=FONT_COLOR,
+            ),
+        ),
+        height=GRID_ROWS * FIGURE_HEIGHT_PER_ROW_PX + FIGURE_TOP_MARGIN_PX + FIGURE_BOTTOM_MARGIN_PX,
+        paper_bgcolor=PLOT_PAPER_BACKGROUND_COLOR,
+        plot_bgcolor=PLOT_AREA_BACKGROUND_COLOR,
+        font=dict(
             family=FONT_FAMILY,
-            size=CARD_TITLE_FONT_SIZE,
-            color=PAGE_TEXT_COLOR,
-        )
+            size=BASE_FONT_SIZE,
+            color=FONT_COLOR,
+        ),
+        margin=dict(
+            l=FIGURE_LEFT_MARGIN_PX,
+            r=FIGURE_RIGHT_MARGIN_PX,
+            t=FIGURE_TOP_MARGIN_PX,
+            b=FIGURE_BOTTOM_MARGIN_PX,
+        ),
+        showlegend=False,
+        coloraxis=dict(
+            colorscale=COLOR_SCALE,
+            cmin=cmin,
+            cmax=cmax,
+            colorbar=dict(
+                title="runtime",
+                titlefont=dict(color=FONT_COLOR, family=FONT_FAMILY, size=BASE_FONT_SIZE),
+                tickfont=dict(color=FONT_COLOR, family=FONT_FAMILY, size=BASE_FONT_SIZE - 1),
+                outlinecolor=BORDER_COLOR,
+                bgcolor=PANEL_BACKGROUND_COLOR,
+                thickness=14,
+            ),
+        ),
+        hoverlabel=dict(
+            bgcolor=HOVER_BACKGROUND_COLOR,
+            font=dict(color=FONT_COLOR, family=FONT_FAMILY, size=BASE_FONT_SIZE),
+        ),
+    )
 
     return fig
 
 
-def build_meta_grid_html(study_data: Dict[str, Any], usecase_names: Sequence[str]) -> str:
-    cards: List[str] = []
-    for usecase_name in usecase_names:
-        usecase_data = study_data[usecase_name]
-        body_lines: List[str] = []
-
-        if not is_blank_usecase(usecase_data):
-            output_dict = usecase_data.get("output", {})
-            for key in OUTPUT_META_KEYS:
-                body_lines.append(
-                    f'<div><span class="label">{html.escape(key)}:</span> '
-                    f'<span class="value">{html_escape(output_dict.get(key, ""))}</span></div>'
-                )
-
-        cards.append(
-            f"""
-            <div class="grid-card">
-                <div class="grid-card-title">{html.escape(usecase_name)}</div>
-                <div class="grid-card-body">
-                    {''.join(body_lines)}
-                </div>
-            </div>
-            """
-        )
-
-    return f"""
-    <div class="section-title">Usecase summary</div>
-    <div class="info-grid">
-        {''.join(cards)}
-    </div>
-    """
-
-
-def choose_best_index(usecase_data: Dict[str, Any], input_keys: Sequence[str]) -> Tuple[int | None, str]:
-    n = get_best_common_length(usecase_data, input_keys)
-    if n <= 0:
-        return None, ""
-
-    output_dict = usecase_data.get("output", {})
-    overlap = as_list(output_dict.get("overlap", []))[:n]
-    aug_obj = as_list(output_dict.get("augObj", []))[:n]
-    boundary = as_list(output_dict.get("boundary", []))[:n]
-
-    zero_overlap_indices = [
-        i for i, v in enumerate(overlap) if abs(to_sort_float(v, default=float("inf"))) <= ZERO_OVERLAP_TOL
-    ]
-
-    if zero_overlap_indices:
-        best_idx = min(
-            zero_overlap_indices,
-            key=lambda i: (
-                to_sort_float(aug_obj[i]),
-                to_sort_float(boundary[i]),
-                i,
-            ),
-        )
-        return best_idx, "overlap = 0 satisfied"
-
-    best_idx = min(
-        range(n),
-        key=lambda i: (
-            to_sort_float(overlap[i]),
-            to_sort_float(aug_obj[i]),
-            to_sort_float(boundary[i]),
-            i,
-        ),
-    )
-    return best_idx, "fallback used: no overlap = 0 point"
-
-
-def build_best_grid_html(
-    study_data: Dict[str, Any],
-    usecase_names: Sequence[str],
-    input_keys: Sequence[str],
-) -> str:
-    cards: List[str] = []
-
-    for usecase_name in usecase_names:
-        usecase_data = study_data[usecase_name]
-
-        if is_blank_usecase(usecase_data):
-            cards.append(
-                f"""
-                <div class="grid-card">
-                    <div class="grid-card-title">{html.escape(usecase_name)}</div>
-                    <div class="grid-card-body"></div>
-                </div>
-                """
-            )
-            continue
-
-        best_idx, reason = choose_best_index(usecase_data, input_keys)
-        if best_idx is None:
-            cards.append(
-                f"""
-                <div class="grid-card">
-                    <div class="grid-card-title">{html.escape(usecase_name)}</div>
-                    <div class="grid-card-body"></div>
-                </div>
-                """
-            )
-            continue
-
-        input_dict = usecase_data.get("input", {})
-        output_dict = usecase_data.get("output", {})
-
-        input_lines = []
-        for key in input_keys:
-            series = as_list(input_dict.get(key, []))
-            value = series[best_idx] if best_idx < len(series) else ""
-            input_lines.append(
-                f'<div><span class="label">{html.escape(key)}:</span> '
-                f'<span class="value">{html_escape(value)}</span></div>'
-            )
-
-        metric_lines = []
-        for key in ["augObj", "overlap", "boundary", "runtime", "area", "hpwl", "pureObj"]:
-            series = as_list(output_dict.get(key, []))
-            value = series[best_idx] if best_idx < len(series) else ""
-            metric_lines.append(
-                f'<div><span class="label">{html.escape(key)}:</span> '
-                f'<span class="value">{html_escape(value)}</span></div>'
-            )
-
-        cards.append(
-            f"""
-            <div class="grid-card">
-                <div class="grid-card-title">{html.escape(usecase_name)}</div>
-                <div class="grid-card-body">
-                    <div><span class="label">selection:</span> <span class="value">{html.escape(reason)}</span></div>
-                    <div><span class="label">index:</span> <span class="value">{best_idx}</span></div>
-                    <div class="subsection-title">inputs</div>
-                    {''.join(input_lines)}
-                    <div class="subsection-title">selected outputs</div>
-                    {''.join(metric_lines)}
-                </div>
-            </div>
-            """
-        )
-
-    return f"""
-    <div class="section-title">Best input set per usecase</div>
-    <div class="info-grid">
-        {''.join(cards)}
-    </div>
-    """
-
-
-def build_page_css() -> str:
-    return f"""
-    <style>
-        * {{
-            box-sizing: border-box;
-        }}
-        body {{
-            margin: 0;
-            background: {PAGE_BACKGROUND_COLOR};
-            color: {PAGE_TEXT_COLOR};
-            font-family: {FONT_FAMILY};
-        }}
-        .page {{
-            width: 100%;
-            padding: 18px 18px 28px 18px;
-        }}
-        .page-title {{
-            font-size: {PAGE_TITLE_FONT_SIZE}px;
-            font-weight: 700;
-            margin-bottom: 14px;
-        }}
-        .tabs {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin-bottom: 14px;
-        }}
-        .tab-button {{
-            background: {TAB_INACTIVE_BACKGROUND};
-            color: {PAGE_TEXT_COLOR};
-            border: 1px solid {TAB_BORDER_COLOR};
-            border-radius: 8px;
-            padding: 10px 14px;
-            cursor: pointer;
-            font-size: {TAB_FONT_SIZE}px;
-            font-family: {FONT_FAMILY};
-        }}
-        .tab-button.active {{
-            background: {TAB_ACTIVE_BACKGROUND};
-            font-weight: 700;
-        }}
-        .tab-content {{
-            display: none;
-            width: 100%;
-        }}
-        .tab-content.active {{
-            display: block;
-        }}
-        .plot-block {{
-            width: 100%;
-            overflow-x: hidden;
-            overflow-y: visible;
-        }}
-        .section-title {{
-            margin-top: {SECTION_MARGIN_TOP_PX}px;
-            margin-bottom: 10px;
-            font-size: {CARD_TITLE_FONT_SIZE + 1}px;
-            font-weight: 700;
-        }}
-        .info-grid {{
-            display: grid;
-            grid-template-columns: repeat({GRID_COLUMNS}, minmax(0, 1fr));
-            gap: {TEXT_GRID_GAP_PX}px;
-            width: 100%;
-        }}
-        .grid-card {{
-            background: {CARD_BACKGROUND_COLOR};
-            border: 1px solid {CARD_BORDER_COLOR};
-            border-radius: {CARD_BORDER_RADIUS_PX}px;
-            padding: {CARD_PADDING_PX}px;
-            min-height: 150px;
-            overflow: hidden;
-        }}
-        .grid-card-title {{
-            font-size: {CARD_TITLE_FONT_SIZE}px;
-            font-weight: 700;
-            margin-bottom: 8px;
-            word-break: break-word;
-        }}
-        .grid-card-body {{
-            font-size: {CARD_BODY_FONT_SIZE}px;
-            line-height: 1.45;
-            word-break: break-word;
-        }}
-        .subsection-title {{
-            margin-top: 8px;
-            margin-bottom: 4px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.3px;
-        }}
-        .label {{
-            font-weight: 700;
-        }}
-        .value {{
-            font-weight: 400;
-        }}
-        @media (max-width: 1300px) {{
-            .info-grid {{
-                grid-template-columns: repeat(3, minmax(0, 1fr));
-            }}
-        }}
-        @media (max-width: 980px) {{
-            .info-grid {{
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-            }}
-        }}
-        @media (max-width: 620px) {{
-            .info-grid {{
-                grid-template-columns: 1fr;
-            }}
-        }}
-    </style>
-    """
-
-
-def build_tab_script() -> str:
-    return """
-    <script>
-        function openTab(tabIndex) {
-            const buttons = document.querySelectorAll('.tab-button');
-            const contents = document.querySelectorAll('.tab-content');
-
-            buttons.forEach((btn, i) => {
-                btn.classList.toggle('active', i === tabIndex);
-            });
-
-            contents.forEach((content, i) => {
-                content.classList.toggle('active', i === tabIndex);
-            });
-
-            window.dispatchEvent(new Event('resize'));
-        }
-
-        document.addEventListener('DOMContentLoaded', function () {
-            openTab(0);
-        });
-    </script>
-    """
-
-
 def build_study_html(
     study_name: str,
-    tab_payloads: Sequence[Tuple[str, str]],
-    meta_grid_html: str,
-    best_grid_html: str,
+    study_data: Dict[str, Any],
 ) -> str:
-    tab_buttons = []
-    tab_contents = []
+    usecase_order = get_usecase_order(study_data)
+    input_keys = discover_input_keys(study_data)
 
-    for idx, (tab_name, fig_html) in enumerate(tab_payloads):
-        tab_buttons.append(
-            f'<button class="tab-button" onclick="openTab({idx})">{html.escape(tab_name)}</button>'
+    if len(input_keys) == 0:
+        raise ValueError(f"Study '{study_name}' has no input keys.")
+
+    info_grid_html = build_info_grid_html(study_data, usecase_order)
+    best_grid_html = build_best_grid_html(study_data, usecase_order, input_keys)
+
+    tab_buttons: List[str] = []
+    tab_contents: List[str] = []
+
+    plotly_js_included = False
+
+    for tab_idx, param_key in enumerate(input_keys):
+        fig = build_param_figure(
+            study_name=study_name,
+            study_data=study_data,
+            usecase_order=usecase_order,
+            all_input_keys=input_keys,
+            param_key=param_key,
         )
+
+        fig_html = pio.to_html(
+            fig,
+            include_plotlyjs=PLOTLY_INCLUDE_JS if not plotly_js_included else False,
+            full_html=False,
+            config={
+                "responsive": RESPONSIVE_PLOT,
+                "displaylogo": SHOW_PLOTLY_LOGO,
+                "displayModeBar": DISPLAY_MODE_BAR,
+            },
+        )
+        plotly_js_included = True
+
+        tab_id = f"tab_{tab_idx}"
+        active_cls = " active" if tab_idx == 0 else ""
+        display_style = "block" if tab_idx == 0 else "none"
+
+        tab_buttons.append(
+            f"""
+            <button class="tab-button{active_cls}" onclick="openTab(event, '{tab_id}')">
+                {html_escape(param_key)}
+            </button>
+            """
+        )
+
         tab_contents.append(
             f"""
-            <div class="tab-content">
-                <div class="plot-block">{fig_html}</div>
-                {meta_grid_html}
+            <div id="{tab_id}" class="tab-content" style="display:{display_style};">
+                <div class="plot-wrap">
+                    {fig_html}
+                </div>
+                {info_grid_html}
                 {best_grid_html}
             </div>
             """
         )
 
-    return f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="utf-8"/>
-        <meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <title>{html.escape(study_name)}{html.escape(PAGE_TITLE_SUFFIX)}</title>
-        {build_page_css()}
-    </head>
-    <body>
-        <div class="page">
-            <div class="page-title">{html.escape(study_name)}{html.escape(PAGE_TITLE_SUFFIX)}</div>
-            <div class="tabs">
-                {''.join(tab_buttons)}
-            </div>
-            {''.join(tab_contents)}
+    page_html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>{html_escape(study_name)}</title>
+    <style>
+        :root {{
+            --page-bg: {PAGE_BACKGROUND_COLOR};
+            --panel-bg: {PANEL_BACKGROUND_COLOR};
+            --card-bg: {CARD_BACKGROUND_COLOR};
+            --font-color: {FONT_COLOR};
+            --subtext-color: {SUBTEXT_COLOR};
+            --border-color: {BORDER_COLOR};
+            --font-family: {FONT_FAMILY};
+            --base-font-size: {BASE_FONT_SIZE}px;
+            --tab-font-size: {TAB_FONT_SIZE}px;
+            --page-title-font-size: {PAGE_TITLE_FONT_SIZE}px;
+            --section-title-font-size: {SECTION_TITLE_FONT_SIZE}px;
+            --card-title-font-size: {CARD_TITLE_FONT_SIZE}px;
+            --card-body-font-size: {CARD_BODY_FONT_SIZE}px;
+            --text-grid-gap: {TEXT_GRID_GAP_PX}px;
+            --card-padding: {CARD_PADDING_PX}px;
+            --card-min-height: {CARD_MIN_HEIGHT_PX}px;
+            --best-card-min-height: {BEST_CARD_MIN_HEIGHT_PX}px;
+        }}
+
+        * {{
+            box-sizing: border-box;
+        }}
+
+        body {{
+            margin: 0;
+            padding: 18px;
+            background: var(--page-bg);
+            color: var(--font-color);
+            font-family: var(--font-family);
+            font-size: var(--base-font-size);
+            overflow-y: auto;
+        }}
+
+        .page {{
+            width: 100%;
+            margin: 0 auto;
+        }}
+
+        .page-title {{
+            font-size: var(--page-title-font-size);
+            font-weight: 700;
+            color: var(--font-color);
+            margin: 0 0 12px 0;
+            text-align: center;
+        }}
+
+        .page-subtitle {{
+            color: var(--subtext-color);
+            margin: 0 0 18px 0;
+            text-align: center;
+        }}
+
+        .tabs {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 16px;
+        }}
+
+        .tab-button {{
+            background: var(--panel-bg);
+            color: var(--font-color);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px 16px;
+            cursor: pointer;
+            font-size: var(--tab-font-size);
+            font-family: var(--font-family);
+        }}
+
+        .tab-button.active {{
+            background: var(--card-bg);
+            font-weight: 700;
+        }}
+
+        .tab-content {{
+            width: 100%;
+        }}
+
+        .plot-wrap {{
+            width: 100%;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 8px;
+            margin-bottom: 18px;
+            overflow: hidden;
+        }}
+
+        .section-title {{
+            font-size: var(--section-title-font-size);
+            font-weight: 700;
+            margin: 18px 0 8px 0;
+            color: var(--font-color);
+        }}
+
+        .section-note {{
+            color: var(--subtext-color);
+            margin-bottom: 10px;
+        }}
+
+        .text-grid {{
+            display: grid;
+            grid-template-columns: repeat({GRID_COLS}, minmax(0, 1fr));
+            gap: var(--text-grid-gap);
+            width: 100%;
+            margin-bottom: 18px;
+        }}
+
+        .grid-card {{
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: var(--card-padding);
+            min-height: var(--card-min-height);
+            overflow-wrap: anywhere;
+        }}
+
+        .best-card {{
+            min-height: var(--best-card-min-height);
+        }}
+
+        .card-title {{
+            font-size: var(--card-title-font-size);
+            font-weight: 700;
+            color: var(--font-color);
+            margin-bottom: 8px;
+        }}
+
+        .card-body {{
+            font-size: var(--card-body-font-size);
+            color: var(--subtext-color);
+            line-height: 1.45;
+            white-space: normal;
+        }}
+
+        @media (max-width: 1200px) {{
+            .text-grid {{
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }}
+        }}
+
+        @media (max-width: 760px) {{
+            .text-grid {{
+                grid-template-columns: repeat(1, minmax(0, 1fr));
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="page">
+        <div class="page-title">{html_escape(study_name)}</div>
+        <div class="page-subtitle">
+            Multi-tab study dashboard | usecases found: {len(usecase_order)} | input keys found: {len(input_keys)}
         </div>
-        {build_tab_script()}
-    </body>
-    </html>
-    """
+
+        <div class="tabs">
+            {''.join(tab_buttons)}
+        </div>
+
+        {''.join(tab_contents)}
+    </div>
+
+    <script>
+        function resizeVisiblePlots(scopeElement) {{
+            if (!window.Plotly) return;
+            const roots = (scopeElement || document).querySelectorAll('.js-plotly-plot');
+            roots.forEach(function(gd) {{
+                try {{
+                    Plotly.Plots.resize(gd);
+                }} catch (e) {{}}
+            }});
+        }}
+
+        function openTab(evt, tabId) {{
+            const tabs = document.querySelectorAll('.tab-content');
+            const buttons = document.querySelectorAll('.tab-button');
+
+            tabs.forEach(function(tab) {{
+                tab.style.display = 'none';
+            }});
+
+            buttons.forEach(function(btn) {{
+                btn.classList.remove('active');
+            }});
+
+            const activeTab = document.getElementById(tabId);
+            if (activeTab) {{
+                activeTab.style.display = 'block';
+            }}
+
+            if (evt && evt.currentTarget) {{
+                evt.currentTarget.classList.add('active');
+            }}
+
+            setTimeout(function() {{
+                resizeVisiblePlots(activeTab || document);
+            }}, 120);
+        }}
+
+        window.addEventListener('load', function() {{
+            resizeVisiblePlots(document);
+        }});
+
+        window.addEventListener('resize', function() {{
+            resizeVisiblePlots(document);
+        }});
+    </script>
+</body>
+</html>
+"""
+    return page_html
 
 
-def process_study_file(json_path: Path) -> Path:
-    study_data = load_json_file(json_path)
-    if not isinstance(study_data, dict):
+def load_study_json(json_path: Path) -> Dict[str, Any]:
+    with json_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
         raise ValueError(f"{json_path.name} does not contain a top-level JSON object.")
+    return data
 
-    usecase_names = list(study_data.keys())
-    input_keys = first_input_keys(study_data)
-    runtime_range = collect_runtime_range(study_data)
 
-    meta_grid_html = build_meta_grid_html(study_data, usecase_names)
-    best_grid_html = build_best_grid_html(study_data, usecase_names, input_keys)
+def generate_html_for_study(json_path: Path) -> Path:
+    study_name = json_path.stem
+    study_data = load_study_json(json_path)
+    study_html = build_study_html(study_name, study_data)
+    out_path = json_path.with_suffix(OUTPUT_HTML_SUFFIX)
+    out_path.write_text(study_html, encoding="utf-8")
+    return out_path
 
-    tab_payloads: List[Tuple[str, str]] = []
-    for tab_idx, param_name in enumerate(input_keys):
-        fig = build_study_figure(
-            study_name=json_path.stem,
-            study_data=study_data,
-            usecase_names=usecase_names,
-            param_name=param_name,
-            runtime_range=runtime_range,
-        )
-        fig_html = fig.to_html(
-            full_html=False,
-            include_plotlyjs=INCLUDE_PLOTLYJS if tab_idx == 0 else False,
-            config={"responsive": True},
-        )
-        tab_payloads.append((param_name, fig_html))
 
-    if not tab_payloads:
-        empty_html = """
-        <div class="section-title">No input keys found</div>
-        """
-        tab_payloads.append(("No tabs", empty_html))
+def generate_all_dashboards(study_dir: Path) -> List[Path]:
+    if not study_dir.exists():
+        raise FileNotFoundError(f"Directory does not exist: {study_dir}")
+    if not study_dir.is_dir():
+        raise NotADirectoryError(f"Path is not a directory: {study_dir}")
 
-    final_html = build_study_html(
-        study_name=json_path.stem,
-        tab_payloads=tab_payloads,
-        meta_grid_html=meta_grid_html,
-        best_grid_html=best_grid_html,
+    json_files = sorted(study_dir.glob(JSON_GLOB_PATTERN))
+    if not json_files:
+        raise FileNotFoundError(f"No JSON files matching '{JSON_GLOB_PATTERN}' found in: {study_dir}")
+
+    generated: List[Path] = []
+    for json_file in json_files:
+        out_file = generate_html_for_study(json_file)
+        generated.append(out_file)
+        print(f"Generated: {out_file}")
+
+    return generated
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate Plotly multi-tab HTML dashboards from study JSON files."
     )
-
-    output_html_path = json_path.with_suffix(".html")
-    output_html_path.write_text(final_html, encoding="utf-8")
-    return output_html_path
+    parser.add_argument(
+        "study_dir",
+        nargs="?",
+        default=INPUT_STUDY_DIR,
+        help="Directory containing study JSON files. If omitted, INPUT_STUDY_DIR in the script is used.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    study_dir = Path(args.study_dir).expanduser().resolve()
+    study_dir_str = args.study_dir.strip() if isinstance(args.study_dir, str) else ""
 
-    if not study_dir.exists():
-        raise FileNotFoundError(f"Study directory not found: {study_dir}")
-    if not study_dir.is_dir():
-        raise NotADirectoryError(f"Path is not a directory: {study_dir}")
+    if not study_dir_str:
+        raise ValueError(
+            "No input directory provided. Either set INPUT_STUDY_DIR in the script "
+            "or pass the directory path as a command-line argument."
+        )
 
-    json_files = sorted(study_dir.glob(JSON_GLOB))
-    if not json_files:
-        raise FileNotFoundError(f"No JSON files found in: {study_dir}")
+    study_dir = Path(study_dir_str)
+    generated_files = generate_all_dashboards(study_dir)
 
-    generated_files: List[Path] = []
-    for json_file in json_files:
-        generated_files.append(process_study_file(json_file))
-
-    print("Generated HTML files:")
+    print("\nDone.")
+    print("HTML files written to the same directory as the JSON files:")
     for path in generated_files:
-        print(f"  {path}")
+        print(f"  - {path}")
 
 
 if __name__ == "__main__":
